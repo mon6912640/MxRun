@@ -1,0 +1,966 @@
+//! MxRun storage layer: redb (ACID embedded KV) + rolling backups.
+//!
+//! Design notes (vs AltRun's INI file):
+//! - All writes go through redb write transactions -> crash at any point
+//!   never leaves a half-written file.
+//! - On every launch, the db file is copied into `backups/` (rolling 10)
+//!   BEFORE the database is opened, so a corrupted db can always be rolled
+//!   back manually.
+//! - Everything can be exported to human-readable JSON.
+//!
+//! ## Item model (P0-1)
+//!
+//! The model follows `docs/命令模型设计.md`: classification runs along two
+//! orthogonal axes instead of AltRun's flat "command line + param type" tuple.
+//!
+//! - **Axis 1 — effect** (closed set): what the program can actually *do*.
+//!   `Open` / `Run` / `Builtin` / `Copy` / `Reveal`. New capabilities add a
+//!   verb, not a type.
+//! - **Axis 2 — source** (open set): where the item came from
+//!   (`provider` + `external_id`). Importers and query providers hang off
+//!   this, so adding one never touches the core enums.
+//!
+//! An item carries a *list* of actions (Enter runs the first); parameters are
+//! an attribute of the action, not a type of item.
+//!
+//! ## Migration safety
+//!
+//! Every struct/enum here is `#[serde(default)]`, so rows written by an older
+//! build still deserialize. On top of that, `open_at` migrates v1 rows
+//! (`Command`) into `Item`s, driven by the `schema_version` meta key. **Nothing
+//! is ever dropped silently**: every row that cannot be parsed is recorded in
+//! `Store::warnings` so `main` can write it to `mxrun.log`.
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const COMMANDS: TableDefinition<&str, &str> = TableDefinition::new("commands");
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+/// Written into the meta table; absent means "v1 (legacy `Command` rows)".
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+const SCHEMA_VERSION: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// The model
+// ---------------------------------------------------------------------------
+
+/// One selectable result. Static items live in the db; dynamic ones (e.g.
+/// Everything results) only exist for the current query.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Item {
+    /// Stable id. **Frecency is keyed by it — migration must never change it.**
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    /// Trigger words; the first one is the primary keyword.
+    pub keywords: Vec<String>,
+    /// At least one; the first is the default action (what Enter runs).
+    pub actions: Vec<Action>,
+    pub arg: ArgSpec,
+    pub launch: LaunchMode,
+    pub source: Source,
+    pub health: Health,
+}
+
+impl Item {
+    pub fn default_action(&self) -> Option<&Action> {
+        self.actions.first()
+    }
+
+    /// The string the shell icon is resolved from (used by the icon pipeline).
+    pub fn icon_target(&self) -> Option<&str> {
+        match &self.default_action()?.effect {
+            Effect::Open { target } => Some(target),
+            Effect::Run { line } => Some(line),
+            Effect::Reveal { path } => Some(path),
+            Effect::Builtin { .. } | Effect::Copy { .. } => None,
+        }
+    }
+
+    /// Everything that should be matchable by the fuzzy matcher.
+    pub fn haystack(&self) -> String {
+        let mut s = String::with_capacity(self.title.len() + self.subtitle.len() + 16);
+        s.push_str(&self.title);
+        if !self.subtitle.is_empty() {
+            s.push(' ');
+            s.push_str(&self.subtitle);
+        }
+        for kw in &self.keywords {
+            s.push(' ');
+            s.push_str(kw);
+        }
+        s
+    }
+
+    /// True when this item needs the user to *type* something before it can
+    /// run — drives the `*` marker. Clipboard and foreground-window sources
+    /// need no typing, so they must not be marked.
+    #[allow(dead_code)]
+    pub fn wants_input(&self) -> bool {
+        self.arg.source == ArgSource::Prompt
+    }
+}
+
+/// An action: an item may carry several (Enter = the first).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Action {
+    pub label: String,
+    pub effect: Effect,
+}
+
+impl Action {
+    pub fn open(target: impl Into<String>) -> Self {
+        Self { label: "打开".into(), effect: Effect::Open { target: target.into() } }
+    }
+    pub fn run(line: impl Into<String>) -> Self {
+        Self { label: "运行".into(), effect: Effect::Run { line: line.into() } }
+    }
+    /// Reserved: file-search results and the CRUD screen attach this (P1+).
+    #[allow(dead_code)]
+    pub fn reveal(path: impl Into<String>) -> Self {
+        Self { label: "打开所在目录".into(), effect: Effect::Reveal { path: path.into() } }
+    }
+    /// Reserved: used by file-search results and the CRUD screen (P1+).
+    #[allow(dead_code)]
+    pub fn copy(text: impl Into<String>) -> Self {
+        Self { label: "复制".into(), effect: Effect::Copy { text: text.into() } }
+    }
+    /// Reserved: the window-control / power verbs land in P0-2.
+    #[allow(dead_code)]
+    pub fn builtin(verb: BuiltinVerb) -> Self {
+        Self { label: verb.label().into(), effect: Effect::Builtin { verb } }
+    }
+}
+
+/// Axis 1: what actually happens. Closed set — extend with verbs, not types.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Effect {
+    /// Hand a target to the shell: program, file, folder, URL, protocol,
+    /// CLSID, `shell:` path — Windows itself does not distinguish these.
+    Open { target: String },
+    /// Run a command line (may carry arguments, expansion of `{p}`, etc).
+    Run { line: String },
+    /// Done in-process by MxRun itself.
+    Builtin { verb: BuiltinVerb },
+    /// Put text on the clipboard.
+    Copy { text: String },
+    /// Reveal a path in Explorer.
+    Reveal { path: String },
+    // Reserved seam: `Custom { provider, payload }` for plugins/scripts.
+}
+
+impl Effect {
+    /// Short category label shown in the result row.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Effect::Open { target } => {
+                let t = target.trim().to_ascii_lowercase();
+                if t.starts_with("http://") || t.starts_with("https://") {
+                    "网址"
+                } else if t.starts_with("::") || t.starts_with("shell:") {
+                    "系统"
+                } else if Path::new(target.trim_matches('"')).is_dir() {
+                    "目录"
+                } else {
+                    "应用"
+                }
+            }
+            Effect::Run { .. } => "命令",
+            Effect::Builtin { .. } => "动作",
+            Effect::Copy { .. } => "复制",
+            Effect::Reveal { .. } => "定位",
+        }
+    }
+
+    /// Emoji fallback when the shell gives us no icon.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Effect::Open { .. } => "🚀",
+            Effect::Run { .. } => "⌨",
+            Effect::Builtin { .. } => "⚙",
+            Effect::Copy { .. } => "📋",
+            Effect::Reveal { .. } => "📂",
+        }
+    }
+}
+
+/// In-process verbs (AltRun needed a bundled `WinCtl.exe` for these).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinVerb {
+    MinimizeAll,
+    ShowDesktop,
+    HideForegroundWindow,
+    ShowForegroundWindow,
+    /// AltRun's `ShowOnly`: keep the front window, get the rest out of the way.
+    HideOthers,
+    Shutdown,
+    Reboot,
+    /// AltRun's 「运行」: execute whatever the user typed (also the seam for a
+    /// future "no match -> run it" fallback).
+    RunInput,
+}
+
+impl BuiltinVerb {
+    /// Reserved: shown in the result list once the verbs are implemented (P0-2).
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            BuiltinVerb::MinimizeAll => "最小化全部窗口",
+            BuiltinVerb::ShowDesktop => "显示桌面",
+            BuiltinVerb::HideForegroundWindow => "隐藏当前窗口",
+            BuiltinVerb::ShowForegroundWindow => "恢复窗口",
+            BuiltinVerb::HideOthers => "只显示当前窗口",
+            BuiltinVerb::Shutdown => "关机",
+            BuiltinVerb::Reboot => "重启",
+            BuiltinVerb::RunInput => "运行",
+        }
+    }
+}
+
+/// How the target is shown when launched (replaces AltRun's `@+`/`@-`/`@`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMode {
+    #[default]
+    Normal,
+    Maximized,
+    Minimized,
+    Hidden,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Health {
+    #[default]
+    Unknown,
+    Ok,
+    Broken,
+}
+
+/// Argument specification: three independent facts.
+///
+/// AltRun collapsed all of this into one 4-valued `param_type` enum that also
+/// gated variable substitution (which is why its window-control items had to
+/// pretend to "take a parameter").
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ArgSpec {
+    /// Where the value comes from.
+    pub source: ArgSource,
+    /// How it is encoded before insertion.
+    pub encode: Encoder,
+    /// How it lands in the command.
+    pub insert: InsertMode,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgSource {
+    #[default]
+    None,
+    /// Ask the user (inline prompt; AltRun popped `frmParam`).
+    Prompt,
+    Clipboard,
+    ForegroundId,
+    ForegroundTitle,
+    ForegroundClass,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Encoder {
+    #[default]
+    Raw,
+    UrlQuery,
+    Utf8Percent,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertMode {
+    #[default]
+    None,
+    /// Replace the `{p}` marker in the target/line.
+    Replace,
+    /// Append to the end (how AltRun's search engines work).
+    Append,
+}
+
+/// Axis 2: provenance. Makes imports idempotent and keeps sources apart.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Source {
+    /// "seed" | "legacy" | "manual" | "shortcutlist" | "startmenu" | "everything" | ...
+    pub provider: String,
+    /// Unique within that provider: a line number, a .lnk path, a full path…
+    pub external_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct Frecency {
+    pub count: u32,
+    pub last_used: u64,
+}
+
+/// v1 row shape, kept only for migration.
+#[derive(Deserialize)]
+struct LegacyCommand {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    desc: String,
+}
+
+impl LegacyCommand {
+    /// v1 -> v2. The id is preserved because frecency is keyed by it.
+    fn into_item(self) -> Item {
+        let LegacyCommand { id, kind, path, name, desc } = self;
+        // v1 stored "run this command" as kind=cmd, everything else was a
+        // shell target (file/dir/url/CLSID).
+        let action = if kind == "cmd" {
+            Action::run(path.clone())
+        } else {
+            Action::open(path.clone())
+        };
+        let arg = if path.contains("{p}") {
+            ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace }
+        } else {
+            ArgSpec::default()
+        };
+        Item {
+            source: Source { provider: "legacy".into(), external_id: id.clone() },
+            id,
+            title: name,
+            subtitle: desc,
+            keywords: Vec::new(),
+            actions: vec![action],
+            arg,
+            launch: LaunchMode::Normal,
+            health: Health::Unknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+pub struct Store {
+    db: Database,
+    /// Data directory (backups / exports live here). Read by `export_json`.
+    #[allow(dead_code)]
+    pub data_dir: PathBuf,
+    /// Problems hit while opening/migrating/loading. `main` logs these: the
+    /// old code dropped unparseable rows without a word.
+    pub warnings: Vec<String>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `%APPDATA%\MxRun` (falls back to the current directory).
+pub fn default_data_dir() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("MxRun")
+}
+
+impl Store {
+    /// Open the database under `%APPDATA%\MxRun`, backing up any existing file
+    /// first and migrating old rows if needed.
+    pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_at(default_data_dir())
+    }
+
+    /// Same, at an explicit directory — so tests can use a temp dir.
+    pub fn open_at(data_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("mxrun.redb");
+
+        if db_path.exists() {
+            Self::rotate_backup(&data_dir, &db_path)?;
+        }
+
+        let db = Database::create(&db_path)?;
+        // Ensure tables exist.
+        let tx = db.begin_write()?;
+        {
+            let _ = tx.open_table(COMMANDS)?;
+            let _ = tx.open_table(META)?;
+        }
+        tx.commit()?;
+
+        let mut store = Self { db, data_dir, warnings: Vec::new() };
+        store.migrate_if_needed()?;
+
+        if store.load_items()?.is_empty() {
+            store.seed_defaults()?;
+        }
+        Ok(store)
+    }
+
+    fn rotate_backup(data_dir: &Path, db_path: &Path) -> std::io::Result<()> {
+        let backup_dir = data_dir.join("backups");
+        fs::create_dir_all(&backup_dir)?;
+
+        let stamp = {
+            let t = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{:06x}-{:08x}", t / 1_000_000, t % 1_000_000)
+        };
+        fs::copy(db_path, backup_dir.join(format!("mxrun-{stamp}.redb")))?;
+
+        // Keep only the newest 10 backups.
+        let mut files: Vec<_> = fs::read_dir(&backup_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "redb"))
+            .collect();
+        files.sort();
+        while files.len() > 10 {
+            let old = files.remove(0);
+            let _ = fs::remove_file(old);
+        }
+        Ok(())
+    }
+
+    // ----- meta helpers -------------------------------------------------
+
+    fn read_meta(&self, key: &str) -> Option<String> {
+        let tx = self.db.begin_read().ok()?;
+        let table = tx.open_table(META).ok()?;
+        let v = table.get(key).ok()??;
+        Some(v.value().to_string())
+    }
+
+    fn write_meta(&self, key: &str, value: &str) {
+        if let Ok(tx) = self.db.begin_write() {
+            {
+                if let Ok(mut table) = tx.open_table(META) {
+                    let _ = table.insert(key, value);
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    // ----- migration ----------------------------------------------------
+
+    /// Runs the v1 -> v2 conversion once, driven by the `schema_version` key.
+    ///
+    /// Rows are converted only here (never during a normal load), because a v1
+    /// row *does* deserialize into an `Item` once every field has a default —
+    /// it would silently turn into an empty item.
+    fn migrate_if_needed(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let current = self
+            .read_meta(SCHEMA_VERSION_KEY)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        if current >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        let mut converted: Vec<(String, String)> = Vec::new();
+        let mut broken: Vec<String> = Vec::new();
+        {
+            let tx = self.db.begin_read()?;
+            let table = tx.open_table(COMMANDS)?;
+            for row in table.iter()? {
+                let (k, v) = row?;
+                let id = k.value().to_string();
+                let raw = v.value().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<LegacyCommand>(&raw) {
+                    Ok(old) => converted.push((id, serde_json::to_string(&old.into_item())?)),
+                    // Keep the row untouched: never destroy data we cannot read.
+                    Err(_) => broken.push(id.clone()),
+                }
+            }
+        }
+
+        if !converted.is_empty() {
+            let tx = self.db.begin_write()?;
+            {
+                let mut table = tx.open_table(COMMANDS)?;
+                for (id, json) in &converted {
+                    table.insert(id.as_str(), json.as_str())?;
+                }
+            }
+            tx.commit()?;
+            self.warnings
+                .push(format!("migrate: v{current} -> v{SCHEMA_VERSION}, {} 条已转换", converted.len()));
+        }
+        for id in &broken {
+            self.warnings
+                .push(format!("migrate: 记录 id={id} 无法解析为旧结构，已保留原样（未删除）"));
+        }
+
+        self.write_meta(SCHEMA_VERSION_KEY, &SCHEMA_VERSION.to_string());
+        Ok(())
+    }
+
+    fn seed_defaults(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(COMMANDS)?;
+            for item in seed_items() {
+                table.insert(item.id.as_str(), serde_json::to_string(&item)?.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ----- item CRUD ----------------------------------------------------
+
+    /// Load every item. Unreadable rows are reported, never dropped silently.
+    pub fn load_items(&mut self) -> Result<Vec<Item>, Box<dyn std::error::Error>> {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        {
+            let tx = self.db.begin_read()?;
+            let table = tx.open_table(COMMANDS)?;
+            for row in table.iter()? {
+                let (k, v) = row?;
+                let id = k.value().to_string();
+                let raw = v.value();
+                match serde_json::from_str::<Item>(raw) {
+                    Ok(item) if !item.actions.is_empty() => out.push(item),
+                    Ok(_) => warnings.push(format!(
+                        "load: 跳过无动作的记录 id={id}（结构不完整）"
+                    )),
+                    Err(err) => {
+                        // Defensive: a row that migration did not reach but is
+                        // still in the v1 shape.
+                        if let Ok(old) = serde_json::from_str::<LegacyCommand>(raw) {
+                            out.push(old.into_item());
+                        } else {
+                            warnings.push(format!("load: 跳过无法解析的记录 id={id}（{err}）"));
+                        }
+                    }
+                }
+            }
+        }
+        self.warnings.append(&mut warnings);
+        Ok(out)
+    }
+
+    /// Insert or replace one item by its id.
+    /// Reserved for the CRUD screen; `upsert_from_source` builds on it.
+    #[allow(dead_code)]
+    pub fn upsert_item(&self, item: &Item) -> Result<(), Box<dyn std::error::Error>> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(COMMANDS)?;
+            table.insert(item.id.as_str(), serde_json::to_string(item)?.as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Import seam: store an item coming from a provider, keyed by
+    /// `(provider, external_id)` so re-importing updates instead of
+    /// duplicating — and so the local frecency (keyed by id) survives.
+    ///
+    /// Returns the id the item ended up under.
+    /// Reserved for the importers (P0-3); exercised by the unit tests.
+    #[allow(dead_code)]
+    pub fn upsert_from_source(&mut self, mut item: Item) -> Result<String, Box<dyn std::error::Error>> {
+        if item.source.provider.is_empty() {
+            return Err("upsert_from_source: 缺少 provider".into());
+        }
+        if !item.source.external_id.is_empty() {
+            for existing in self.load_items()? {
+                if existing.source == item.source {
+                    item.id = existing.id; // keep the id -> keep the frecency
+                    break;
+                }
+            }
+        }
+        if item.id.is_empty() {
+            item.id = format!("{}:{}", item.source.provider, item.source.external_id);
+        }
+        self.upsert_item(&item)?;
+        Ok(item.id)
+    }
+
+    /// Kept for the CRUD screen (P2) and used by the importer to clear demo
+    /// items once real data arrives.
+    pub fn delete_item(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(COMMANDS)?;
+            table.remove(id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ----- frecency -----------------------------------------------------
+
+    pub fn get_frecency(&self, id: &str) -> Frecency {
+        (|| -> Option<Frecency> {
+            let tx = self.db.begin_read().ok()?;
+            let table = tx.open_table(META).ok()?;
+            let v = table.get(format!("frec:{id}").as_str()).ok()??;
+            serde_json::from_str(v.value()).ok()
+        })()
+        .unwrap_or_default()
+    }
+
+    /// Record one use of an item (single small transaction).
+    pub fn bump_frecency(&self, id: &str) {
+        let mut f = self.get_frecency(id);
+        f.count = f.count.saturating_add(1);
+        f.last_used = now_secs();
+        if let Ok(json) = serde_json::to_string(&f) {
+            self.write_meta(&format!("frec:{id}"), &json);
+        }
+    }
+
+    // ----- config -------------------------------------------------------
+
+    /// Read a config value (meta table, `cfg:` prefix).
+    pub fn get_config(&self, key: &str) -> Option<String> {
+        self.read_meta(&format!("cfg:{key}"))
+    }
+
+    /// Write a config value.
+    pub fn set_config(&self, key: &str, value: &str) {
+        self.write_meta(&format!("cfg:{key}"), value);
+    }
+
+    /// Export every item to a human-readable JSON file next to the db.
+    /// Kept for the CRUD screen / debugging — no caller yet.
+    #[allow(dead_code)]
+    pub fn export_json(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let items = self.load_items()?;
+        let path = self.data_dir.join("mxrun-export.json");
+        fs::write(&path, serde_json::to_string_pretty(&items)?)?;
+        Ok(path)
+    }
+}
+
+/// The demo items created for a fresh database. Replaces v1's `seed_defaults`;
+/// keywords are filled in so they are reachable by typing, not only by title.
+pub fn seed_items() -> Vec<Item> {
+    let mk = |id: &str, title: &str, subtitle: &str, kw: &[&str], action: Action| Item {
+        id: id.to_string(),
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        keywords: kw.iter().map(|s| s.to_string()).collect(),
+        actions: vec![action],
+        arg: ArgSpec::default(),
+        launch: LaunchMode::Normal,
+        source: Source { provider: "seed".into(), external_id: id.to_string() },
+        health: Health::Unknown,
+    };
+    vec![
+        mk("seed-0", "计算器", "Windows 计算器", &["calc"], Action::run("calc.exe")),
+        mk("seed-1", "记事本", "Windows 记事本", &["notepad"], Action::run("notepad.exe")),
+        mk("seed-2", "命令提示符", "cmd 终端", &["cmd"], Action::run("cmd.exe")),
+        mk("seed-3", "文件资源管理器", "Windows Explorer", &["explorer"], Action::run("explorer.exe")),
+        mk("seed-4", "Bing", "搜索引擎", &["bing"], Action::open("https://www.bing.com")),
+        mk("seed-5", "GitHub", "代码托管平台", &["github"], Action::open("https://github.com")),
+    ]
+}
+
+/// Frecency bonus: frequency with ~14-day half-life decay.
+/// Returns a value roughly in 0..100 to be added on top of the match score.
+pub fn frecency_bonus(f: &Frecency) -> f64 {
+    if f.count == 0 {
+        return 0.0;
+    }
+    let age_days = now_secs().saturating_sub(f.last_used) as f64 / 86_400.0;
+    let decay = 0.5f64.powf(age_days / 14.0);
+    (f.count as f64).ln_1p() * 20.0 * decay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("mxrun-test-{tag}-{nanos}"));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn legacy_json(id: &str, kind: &str, path: &str, name: &str, desc: &str) -> String {
+        // Windows paths are full of backslashes: they must be escaped to be
+        // valid JSON.
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"{{"id":"{}","kind":"{}","path":"{}","name":"{}","desc":"{}"}}"#,
+            esc(id),
+            esc(kind),
+            esc(path),
+            esc(name),
+            esc(desc)
+        )
+    }
+
+    /// New shape must survive a serde round trip with every field populated.
+    #[test]
+    fn item_roundtrip_keeps_every_field() {
+        let item = Item {
+            id: "x1".into(),
+            title: "Dos窗口".into(),
+            subtitle: "命令行".into(),
+            keywords: vec!["cmd".into(), "dos".into()],
+            actions: vec![
+                Action::run("cmd /k {p}"),
+                Action::reveal(r"C:\Windows\System32"),
+            ],
+            arg: ArgSpec {
+                source: ArgSource::Prompt,
+                encode: Encoder::Raw,
+                insert: InsertMode::Replace,
+            },
+            launch: LaunchMode::Maximized,
+            source: Source { provider: "shortcutlist".into(), external_id: "line:7".into() },
+            health: Health::Ok,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: Item = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, back);
+        assert_eq!(back.default_action().unwrap().label, "运行");
+        assert!(back.wants_input());
+        assert_eq!(back.icon_target(), Some("cmd /k {p}"));
+    }
+
+    /// A v1 row is turned into an Item — and keeps its id, because frecency is
+    /// keyed by id.
+    #[test]
+    fn legacy_row_migrates_and_keeps_id() {
+        let item: Item = serde_json::from_str::<LegacyCommand>(&legacy_json(
+            "seed-2", "cmd", "cmd /k {p}", "Dos窗口", "终端",
+        ))
+        .unwrap()
+        .into_item();
+
+        assert_eq!(item.id, "seed-2", "id must survive: frecency is keyed by it");
+        assert_eq!(item.title, "Dos窗口");
+        assert_eq!(item.subtitle, "终端");
+        assert_eq!(item.source.provider, "legacy");
+        match &item.default_action().unwrap().effect {
+            Effect::Run { line } => assert_eq!(line, "cmd /k {p}"),
+            other => panic!("kind=cmd should migrate to Run, got {other:?}"),
+        }
+        // {p} in a v1 row implies "ask the user, no encoding, replace in place".
+        assert_eq!(item.arg.source, ArgSource::Prompt);
+        assert_eq!(item.arg.insert, InsertMode::Replace);
+    }
+
+    #[test]
+    fn legacy_url_opens_and_plain_kind_opens() {
+        let url: Item = serde_json::from_str::<LegacyCommand>(&legacy_json(
+            "seed-4", "url", "https://github.com", "GitHub", "",
+        ))
+        .unwrap()
+        .into_item();
+        assert!(matches!(url.default_action().unwrap().effect, Effect::Open { .. }));
+        assert_eq!(url.default_action().unwrap().effect.label(), "网址");
+
+        let dir: Item = serde_json::from_str::<LegacyCommand>(&legacy_json(
+            "seed-9", "dir", r"C:\Windows", "Windows", "",
+        ))
+        .unwrap()
+        .into_item();
+        assert_eq!(dir.default_action().unwrap().effect.label(), "目录");
+    }
+
+    /// Opening a real v1 database migrates it, keeps the rows, and records the
+    /// schema version.
+    #[test]
+    fn open_migrates_v1_database_in_place() {
+        let dir = temp_dir("migrate");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Build a v1-shaped database by hand: rows + no schema_version key.
+        {
+            let db = Database::create(dir.join("mxrun.redb")).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(COMMANDS).unwrap();
+                t.insert("seed-0", legacy_json("seed-0", "cmd", "calc.exe", "计算器", "Windows 计算器").as_str())
+                    .unwrap();
+                t.insert("u-1", legacy_json("u-1", "file", r"C:\Projects\demo", "demo", "").as_str())
+                    .unwrap();
+                t.insert("bad", "{not json at all").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut store = Store::open_at(dir.clone()).unwrap();
+
+        // Freqency written for seed-0 must still line up with the same id.
+        store.bump_frecency("seed-0");
+        assert_eq!(store.get_frecency("seed-0").count, 1);
+
+        let items = store.load_items().unwrap();
+        assert_eq!(items.len(), 2, "both readable rows survive");
+        assert!(items.iter().any(|i| i.title == "计算器"));
+        assert!(items.iter().any(|i| i.title == "demo"));
+
+        // The unreadable row is reported, not silently dropped.
+        assert!(
+            store.warnings.iter().any(|w| w.contains("bad")),
+            "unparseable row must be reported: {:?}",
+            store.warnings
+        );
+        assert_eq!(store.get_config("schema_version"), None, "config lives under cfg:");
+        assert_eq!(
+            store.read_meta(SCHEMA_VERSION_KEY).as_deref(),
+            Some("2"),
+            "migration must stamp the schema version"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-opening an already migrated database must not re-seed or duplicate.
+    #[test]
+    fn reopening_is_idempotent() {
+        let dir = temp_dir("reopen");
+        let mut store = Store::open_at(dir.clone()).unwrap();
+        let first = store.load_items().unwrap().len();
+        assert_eq!(first, seed_items().len(), "fresh db gets the demo items");
+        drop(store);
+
+        let mut store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(store.load_items().unwrap().len(), first, "no duplicates");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-importing from a provider updates in place instead of duplicating.
+    #[test]
+    fn upsert_from_source_is_idempotent_and_keeps_id() {
+        let dir = temp_dir("upsert");
+        let mut store = Store::open_at(dir.clone()).unwrap();
+
+        let mk = |title: &str| Item {
+            id: "whatever".into(),
+            title: title.into(),
+            keywords: vec!["steam".into()],
+            actions: vec![Action::run(r"C:\Program Files\Steam\Steam.exe -tcp")],
+            source: Source { provider: "shortcutlist".into(), external_id: "line:43".into() },
+            ..Default::default()
+        };
+
+        let id1 = store.upsert_from_source(mk("Steam")).unwrap();
+        store.bump_frecency(&id1);
+        let id2 = store.upsert_from_source(mk("Steam 客户端")).unwrap();
+
+        assert_eq!(id1, id2, "same source -> same id, so frecency survives");
+        assert_eq!(store.get_frecency(&id1).count, 1);
+        let items = store.load_items().unwrap();
+        let steam: Vec<_> = items.iter().filter(|i| i.source.provider == "shortcutlist").collect();
+        assert_eq!(steam.len(), 1, "no duplicate row");
+        assert_eq!(steam[0].title, "Steam 客户端", "second import wins");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Manual-check helper (not part of the normal run):
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture seed_profile_for_manual_check
+    /// APPDATA=<printed dir>  target\release\mxrun.exe
+    /// ```
+    ///
+    /// Keyboard interaction cannot be automated (CLAUDE.md pitfall list), so
+    /// this prepares a throwaway profile holding AltRun-shaped items that
+    /// exercise every P0-2 execution path, and prints where it is.
+    #[test]
+    #[ignore = "manual check helper: seeds a profile to try the executor by hand"]
+    fn seed_profile_for_manual_check() {
+        let dir = std::env::temp_dir().join("mxrun-p02-profile").join("MxRun");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+        let mut store = Store::open_at(dir.clone()).unwrap();
+
+        let mk = |title: &str,
+                  kw: &str,
+                  effect: crate::store::Effect,
+                  arg: ArgSpec,
+                  provider: &str,
+                  ext: &str| Item {
+            id: String::new(),
+            title: title.into(),
+            subtitle: String::new(),
+            keywords: vec![kw.into()],
+            actions: vec![Action { label: "默认".into(), effect }],
+            arg,
+            launch: LaunchMode::Normal,
+            source: Source { provider: provider.into(), external_id: ext.into() },
+            health: Health::Unknown,
+        };
+        let none = ArgSpec::default();
+        let items = vec![
+            // Env expansion + a system folder.
+            mk("Windows 目录", "windir", crate::store::Effect::Open { target: "%WINDIR%".into() }, none, "manual", "m1"),
+            // A whole command line, no argument.
+            mk("我的IP地址", "myip", crate::store::Effect::Run { line: "nslookup".into() }, none, "manual", "m2"),
+            // Argument required -> must show `*` and refuse to run.
+            mk(
+                "需要输入的示例",
+                "ask",
+                crate::store::Effect::Run { line: "cmd /k {p}".into() },
+                ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace },
+                "manual",
+                "m3",
+            ),
+            // Clipboard argument, no typing: baidu search of the clipboard.
+            mk(
+                "百度 搜索剪贴板",
+                "cb",
+                crate::store::Effect::Open { target: "http://www.baidu.com/s?wd={%c}".into() },
+                ArgSpec { source: ArgSource::Clipboard, encode: Encoder::Utf8Percent, insert: InsertMode::Replace },
+                "manual",
+                "m4",
+            ),
+            // Builtin verbs: window control and show-desktop.
+            mk("隐藏当前窗口", "hide", crate::store::Effect::Builtin { verb: BuiltinVerb::HideForegroundWindow }, none, "manual", "m5"),
+            mk("恢复窗口", "unhide", crate::store::Effect::Builtin { verb: BuiltinVerb::ShowForegroundWindow }, none, "manual", "m8"),
+            mk("显示桌面", "desk", crate::store::Effect::Builtin { verb: BuiltinVerb::MinimizeAll }, none, "manual", "m6"),
+            // App with arguments (the shape that used to fail silently).
+            mk(
+                "记事本(带参数)",
+                "npp",
+                crate::store::Effect::Run { line: "notepad.exe".into() },
+                none,
+                "manual",
+                "m7",
+            ),
+        ];
+        for item in items {
+            store.upsert_from_source(item).unwrap();
+        }
+        println!("\n样本档案已就绪：{}", dir.display());
+        println!("启动：  $env:APPDATA='{}'; .\\target\\release\\mxrun.exe", dir.parent().unwrap().display());
+        println!("可试：windir / myip / ask(应显示 *需要输入) / cb / hide→unhide / desk / npp\n");
+    }
+}

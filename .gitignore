@@ -1,0 +1,22 @@
+/target
+
+# Vision-tool scratch space (screenshots for verification runs).
+.dsh-vision-router/
+
+# ---------------------------------------------------------------------------
+# Machine-specific / personal data. Never publish these:
+# `local/` holds this machine's real paths (AltRun install, build toolchain,
+# the user's own command inventory) plus the word list the pre-commit hook
+# blocks on. Docs refer to placeholders and point here instead.
+# ---------------------------------------------------------------------------
+local/
+
+# Third-party code that must not be redistributed: another author's AHK rewrite
+# of AltRun. Kept on disk for reference, excluded from the repository.
+docs/ALTRun.ahk
+
+# Launcher data that may end up next to the repo during experiments.
+*.redb
+mxrun.log
+mxrun-export.json
+ShortCutList*.txt

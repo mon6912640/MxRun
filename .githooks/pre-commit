@@ -1,0 +1,55 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# Reject a commit that would publish personal or third-party content.
+#
+# Two layers:
+#   1. generic rules that hold for anyone (a real Windows user profile in a
+#      path, the bundled third-party AHK file)
+#   2. this machine's own words, read from `local/personal-patterns.txt`
+#      (gitignored, so the block list itself is never published)
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass deliberately (rare, and you accept the exposure): git commit --no-verify
+# ---------------------------------------------------------------------------
+set -u
+
+fail=0
+
+# --- 1. specific words from the local list ---------------------------------
+patterns_file="local/personal-patterns.txt"
+if [ -f "$patterns_file" ]; then
+    while IFS= read -r word; do
+        case "$word" in ''|'#'*) continue ;; esac
+        hits=$(git diff --cached -U0 -- . | grep -F -- "$word" | grep '^+' | head -n 3)
+        if [ -n "$hits" ]; then
+            echo "pre-commit: 拒绝提交 —— 命中本机敏感词：$word" >&2
+            echo "$hits" >&2
+            fail=1
+        fi
+    done < "$patterns_file"
+fi
+
+# --- 2. generic rules ------------------------------------------------------
+# A concrete Windows user profile (C:\Users\<name> or /c/Users/<name>): the
+# user name itself is personal, <user> placeholders are fine.
+if git diff --cached -U0 -- . | grep '^+' | grep -Eq 'Users[\\/][A-Za-z0-9._-]+'; then
+    if git diff --cached -U0 -- . | grep '^+' | grep -Ev 'Users[\\/]<' | grep -Eq 'Users[\\/][A-Za-z0-9._-]+'; then
+        echo "pre-commit: 拒绝提交 —— 出现了具体的 Windows 用户目录（请用 <用户> 占位）" >&2
+        git diff --cached -U0 -- . | grep '^+' | grep -Ev 'Users[\\/]<' | grep -E 'Users[\\/][A-Za-z0-9._-]+' | head -n 3 >&2
+        fail=1
+    fi
+fi
+
+# The bundled third-party AHK rewrite must never be redistributed.
+if git diff --cached --name-only | grep -q '^docs/ALTRun\.ahk$'; then
+    echo "pre-commit: 拒绝提交 —— docs/ALTRun.ahk 是他人代码，不得分发（见 .gitignore）" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "如果你确认这些内容可以公开，用 git commit --no-verify 跳过。" >&2
+    echo "想调整拦截词：编辑 local/personal-patterns.txt" >&2
+    exit 1
+fi
+exit 0
