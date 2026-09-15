@@ -37,7 +37,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use store::{Item, Store, frecency_bonus};
+use store::{Action, BuiltinVerb, Effect, Item, PARAM_HISTORY_LIMIT, Store, frecency_bonus};
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem},
@@ -1012,6 +1012,103 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Parameter prompt (P1-1)
+// ---------------------------------------------------------------------------
+
+/// An open parameter prompt.
+///
+/// AltRun popped a modal dialog here (`frmParam`: a combobox holding the
+/// parameter history). MxRun keeps the two stages — pick the command, then say
+/// what to give it — but not the second window: the top box *becomes* the
+/// parameter field and the list becomes the suggestion list, so the window
+/// never changes size and nothing steals focus (see `docs/开发进度.md` §4).
+struct Prompt {
+    /// The command being launched, cloned: while the prompt is open the result
+    /// list is no longer what is on screen, so an index into it would be a trap.
+    item: Item,
+    action: Action,
+    /// Parameter history for this item, `(value, uses)`, already sorted by use
+    /// count. Loaded once when the prompt opens, so typing never touches the
+    /// database.
+    history: Vec<(String, u32)>,
+    /// Indices into `history` matching what is typed right now.
+    suggestions: Vec<usize>,
+    /// Highlighted suggestion (Up/Down). `None` = "use what I typed".
+    cursor: Option<usize>,
+    /// What the user typed.
+    text: String,
+    /// True when the text *is* the command line ([`BuiltinVerb::RunInput`]).
+    run_line: bool,
+}
+
+impl Prompt {
+    fn new(item: Item, action: Action, history: Vec<(String, u32)>) -> Self {
+        let run_line = matches!(
+            action.effect,
+            Effect::Builtin { verb: BuiltinVerb::RunInput }
+        );
+        let mut prompt = Self {
+            item,
+            action,
+            history,
+            suggestions: Vec::new(),
+            cursor: None,
+            text: String::new(),
+            run_line,
+        };
+        prompt.refilter();
+        prompt
+    }
+
+    /// Recompute the suggestions after the text changed. Typing also drops the
+    /// highlight: it means "I want my own text, not a remembered one".
+    fn refilter(&mut self) {
+        self.suggestions = filter_history(&self.history, &self.text);
+        self.cursor = None;
+    }
+
+    /// What Enter will use: the highlighted suggestion, else the typed text.
+    fn value(&self) -> String {
+        match self.cursor.and_then(|i| self.suggestions.get(i)) {
+            Some(&h) => self.history[h].0.clone(),
+            None => self.text.trim().to_string(),
+        }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if self.suggestions.is_empty() {
+            self.cursor = None;
+            return;
+        }
+        let last = self.suggestions.len() as isize - 1;
+        self.cursor = Some(match self.cursor {
+            None => 0,
+            Some(i) => (i as isize + delta).clamp(0, last) as usize,
+        });
+    }
+
+    fn empty_hint(&self) -> &'static str {
+        if self.run_line {
+            "输入要运行的命令（Esc 返回）"
+        } else {
+            "请输入参数（Esc 返回）"
+        }
+    }
+}
+
+/// Indices of the history entries containing `query`, case-insensitively.
+/// An empty query keeps everything (the store already sorted by use count).
+fn filter_history(history: &[(String, u32)], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, (value, _))| q.is_empty() || value.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 struct MxRunApp {
     store: Store,
     items: Vec<Indexed>,
@@ -1021,6 +1118,8 @@ struct MxRunApp {
     matcher: Matcher,
     input: String,
     results: Vec<Scored>,
+    /// Open parameter prompt (P1-1); replaces the search box while it lives.
+    prompt: Option<Prompt>,
     calc_result: Option<String>,
     selected: usize,
     /// E2 spike: card opacity, `MXRUN_CARD_ALPHA` (0-255, default 235).
@@ -1153,6 +1252,7 @@ impl MxRunApp {
             matcher: Matcher::new(Config::DEFAULT),
             input: String::new(),
             results: Vec::new(),
+            prompt: None,
             calc_result: None,
             selected: 0,
             card_alpha: std::env::var("MXRUN_CARD_ALPHA")
@@ -1226,6 +1326,25 @@ impl MxRunApp {
                 log_line("selftest: executing first row");
                 app.execute_selected(&ctx);
                 log_line(&format!("selftest: status={:?}", app.status));
+                // `MXRUN_SELFTEST_PARAM` drives the parameter prompt as well:
+                // the only way to exercise "typed parameter -> real command"
+                // with no keyboard. It **does** run the command for real.
+                if let Ok(param) = std::env::var("MXRUN_SELFTEST_PARAM") {
+                    match app.prompt.as_mut() {
+                        Some(p) => {
+                            p.text = param;
+                            p.refilter();
+                            log_line(&format!(
+                                "selftest: prompt open, history={} suggestions={}",
+                                p.history.len(),
+                                p.suggestions.len()
+                            ));
+                        }
+                        None => log_line("selftest: MXRUN_SELFTEST_PARAM set, but no prompt opened"),
+                    }
+                    app.finish_prompt(&ctx);
+                    log_line(&format!("selftest: after parameter status={:?}", app.status));
+                }
             }
         }
         Ok(app)
@@ -1418,16 +1537,120 @@ impl MxRunApp {
                 self.refresh_search();
                 hide_window(ctx);
             }
-            // No prompt UI yet (P1-1): say so instead of running the marker.
+            // The item wants a typed argument: open the parameter prompt rather
+            // than reporting a dead end (P1-1).
             exec::Outcome::NeedsInput => {
-                log_line(&format!("execute: needs input: {}", item.title));
-                self.status = format!("「{}」需要先输入参数（输入功能在下一步加入）", item.title);
+                self.open_prompt(item, action);
             }
             exec::Outcome::Failed(why) => {
                 log_line(&format!("execute: failed: {} -> {why}", item.title));
                 self.status = format!("执行失败：{} —— {why}", item.title);
             }
         }
+    }
+
+    /// Open the parameter prompt for an item (`NeedsInput` came back from the
+    /// executor). AltRun's `frmParam`, inline.
+    fn open_prompt(&mut self, item: Item, action: Action) {
+        let history = self.store.param_history(&item.id, PARAM_HISTORY_LIMIT);
+        log_line(&format!(
+            "prompt: open for {:?} (history={})",
+            item.title,
+            history.len()
+        ));
+        self.prompt = Some(Prompt::new(item, action, history));
+        // The top box is now the parameter field: take the keys.
+        self.want_focus = true;
+    }
+
+    /// Enter in the parameter field: run the command with what was picked.
+    fn finish_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        let value = prompt.value();
+        if value.is_empty() {
+            // Nothing typed: ask again instead of running `cmd /k ` (AltRun's
+            // dialog refused too).
+            self.status = prompt.empty_hint().to_string();
+            self.prompt = Some(prompt);
+            self.want_focus = true;
+            return;
+        }
+
+        let id = prompt.item.id.clone();
+        let title = prompt.item.title.clone();
+        match exec::run_with_arg(&prompt.item, &prompt.action, Some(&value)) {
+            exec::Outcome::Started => {
+                self.store.bump_frecency(&id);
+                // Remember it, so the next run can pick it instead of typing.
+                self.store.bump_param(&id, &value);
+                self.refresh_frecency(&id);
+                // The parameter itself is not logged: the history in the db is
+                // the feature, a plaintext log of it is not.
+                log_line(&format!(
+                    "execute: {title} (+parameter, {} chars)",
+                    value.chars().count()
+                ));
+                self.status = format!("已启动：{title}");
+                self.input.clear();
+                self.refresh_search();
+                hide_window(ctx);
+            }
+            // Unreachable — a value was supplied — but never close silently.
+            exec::Outcome::NeedsInput => {
+                self.status = prompt.empty_hint().to_string();
+                self.prompt = Some(prompt);
+            }
+            exec::Outcome::Failed(why) => {
+                log_line(&format!("execute: failed: {title} -> {why}"));
+                self.status = format!("执行失败：{title} —— {why}");
+                // Keep the text: the usual cause is a typo in it.
+                self.prompt = Some(prompt);
+                self.want_focus = true;
+            }
+        }
+    }
+
+    /// Keys while the parameter prompt is open.
+    ///
+    /// Every key handled here is *consumed* so the text box never sees it:
+    /// Enter would otherwise surrender focus, and Esc would revert the text
+    /// behind our back. Returns true when the prompt is done with this frame
+    /// (the caller stops rendering, exactly like Enter on a result row).
+    fn handle_prompt_keys(&mut self, ctx: &egui::Context) -> bool {
+        // Esc, two stages (same shape as the main box and AltRun's dialog):
+        // clear what was typed first, leave the prompt only when it is empty.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            if self.prompt.as_ref().is_some_and(|p| p.text.is_empty()) {
+                log_line("prompt: cancelled");
+                self.prompt = None;
+                self.reset_status();
+                self.want_focus = true;
+            } else if let Some(p) = self.prompt.as_mut() {
+                p.text.clear();
+                p.refilter();
+            }
+            return false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+            self.finish_prompt(ctx);
+            return true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
+            if let Some(p) = self.prompt.as_mut() {
+                p.move_cursor(1);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
+            if let Some(p) = self.prompt.as_mut() {
+                p.move_cursor(-1);
+            }
+        }
+        // Space is deliberately *not* consumed here: unlike the main box (where
+        // it means "run the selected item"), inside a parameter it is just a
+        // space.
+        false
     }
 
     fn name_layout_job(&self, sc: &Scored) -> LayoutJob {
@@ -1607,6 +1830,12 @@ impl eframe::App for MxRunApp {
             // from a clean slate instead of a stale query.
             self.input.clear();
             self.selected = 0;
+            // An open prompt dies with the window as well: coming back to a
+            // half-typed parameter for a command the user has moved on from
+            // would be worse than starting over.
+            if self.prompt.take().is_some() {
+                log_line("prompt: dropped with the window");
+            }
             self.refresh_search();
         }
         self.prev_visible = visible;
@@ -1624,7 +1853,15 @@ impl eframe::App for MxRunApp {
         // Skipped while the settings view is open — that state lives in this
         // window, unlike AltRun's separate modal dialogs — and for a moment
         // after showing, in case SetForegroundWindow has not landed yet.
+        //
+        // `MXRUN_KEEP_OPEN=1` disables this hiding entirely so the window can be
+        // screenshotted from an automation context: a process started in the
+        // background cannot take the foreground, so the window used to vanish
+        // after ~300 ms and no picture of the UI could be taken (see
+        // docs/开发进度.md §7 pitfall 12).
+        let keep_open = std::env::var("MXRUN_KEEP_OPEN").is_ok();
         if visible
+            && !keep_open
             && !self.view_settings
             && self
                 .shown_at
@@ -1636,7 +1873,8 @@ impl eframe::App for MxRunApp {
             return;
         }
 
-        // Global key handling (order matters: settings capture eats keys first).
+        // Global key handling (order matters: settings capture eats keys first,
+        // then the parameter prompt, which owns the keyboard while it is open).
         if self.view_settings {
             if !self.capturing_hotkey
                 && (ctx.input(|i| i.key_pressed(Key::Escape))
@@ -1645,6 +1883,10 @@ impl eframe::App for MxRunApp {
                 self.view_settings = false;
                 self.pending_hotkey = None;
                 self.reset_status();
+            }
+        } else if self.prompt.is_some() {
+            if self.handle_prompt_keys(&ctx) {
+                return;
             }
         } else {
             // Esc, two stages (AltRun §1.1): clear the box first, dismiss only
@@ -1702,6 +1944,12 @@ impl eframe::App for MxRunApp {
 
 impl MxRunApp {
     fn render_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // An open parameter prompt takes over both the top box and the list.
+        if self.prompt.is_some() {
+            self.render_prompt(ui);
+            return;
+        }
+
         // --- Search box ---
         let edit = egui::TextEdit::singleline(&mut self.input)
             .font(FontId::proportional(22.0))
@@ -1779,9 +2027,10 @@ impl MxRunApp {
                     }
                     ui.vertical(|ui| {
                         ui.label(job);
-                        // Items that need a typed argument are marked with `*`
-                        // until the prompt ships (P1-1) — AltRun's own
-                        // convention for "this one asks for input".
+                        // Items that need a typed argument are marked with `*`:
+                        // AltRun's own convention for "this one asks for input",
+                        // and here it warns that Enter will open the parameter
+                        // prompt instead of running straight away.
                         let needs_input = if item.item.wants_input() { "  ·  需要输入 *" } else { "" };
                         ui.label(
                             RichText::new(format!("{}  ·  {}{}", category, desc, needs_input))
@@ -1842,6 +2091,128 @@ impl MxRunApp {
                     .size(11.0)
                     .color(Color32::from_gray(110)),
             );
+        });
+    }
+
+    /// The parameter prompt, drawn where the search box and the command list
+    /// normally are: a chip naming the command, the parameter field, and what
+    /// this item was given before.
+    fn render_prompt(&mut self, ui: &mut egui::Ui) {
+        // Split the borrows up front: the closures below need the prompt and
+        // the focus flag at once, and nothing else from `self`.
+        let want_focus = &mut self.want_focus;
+        let prompt = self.prompt.as_mut().expect("caller checked");
+
+        let accent = Color32::from_rgb(255, 190, 80);
+
+        // --- top box: "which command is asking" + what was typed ---
+        ui.horizontal(|ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(255, 190, 80, 26))
+                .corner_radius(egui::CornerRadius::same(7))
+                .inner_margin(egui::Margin::symmetric(9, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            prompt.action.effect.icon(),
+                            truncate_chars(&prompt.item.title, 24)
+                        ))
+                        .size(14.0)
+                        .color(accent),
+                    );
+                });
+            let edit = egui::TextEdit::singleline(&mut prompt.text)
+                .font(FontId::proportional(20.0))
+                .hint_text(if prompt.run_line { "输入要运行的命令…" } else { "输入参数…" })
+                .desired_width(f32::INFINITY)
+                .frame(egui::Frame::default());
+            let resp = ui.add(edit);
+            if *want_focus {
+                resp.request_focus();
+                *want_focus = false;
+            }
+            if resp.changed() {
+                prompt.refilter();
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // --- suggestion list: the parameters used with this item before ---
+        let mut picked: Option<usize> = None;
+        if prompt.suggestions.is_empty() {
+            let msg = if prompt.history.is_empty() {
+                "还没有历史参数 · 输入后回车即可"
+            } else {
+                "没有匹配的历史参数"
+            };
+            ui.label(RichText::new(msg).size(13.0).color(Color32::from_gray(130)));
+        }
+        for row in 0..prompt.suggestions.len().min(MAX_ROWS) {
+            let h = prompt.suggestions[row];
+            let value = prompt.history[h].0.clone();
+            let uses = prompt.history[h].1;
+            let selected = prompt.cursor == Some(row);
+            let frame = egui::Frame::new()
+                .fill(if selected {
+                    Color32::from_rgba_unmultiplied(255, 190, 80, 30)
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(10, 5));
+            let inner = frame.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(truncate_chars(&value, 60))
+                            .size(14.0)
+                            .color(if selected { accent } else { Color32::from_gray(225) }),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("用过 {uses} 次"))
+                                .size(11.0)
+                                .color(Color32::from_gray(120)),
+                        );
+                    });
+                });
+            });
+            let resp = ui.interact(
+                inner.response.rect,
+                ui.id().with(("prompt-row", row)),
+                egui::Sense::click(),
+            );
+            if resp.hovered() {
+                prompt.cursor = Some(row);
+            }
+            if resp.clicked() {
+                picked = Some(row);
+            }
+        }
+        // A click fills the field instead of running straight away — a stored
+        // parameter is often the right one only *after* an edit, and filling is
+        // what AltRun's combobox did.
+        if let Some(row) = picked {
+            let h = prompt.suggestions[row];
+            prompt.text = prompt.history[h].0.clone();
+            prompt.cursor = Some(row);
+            *want_focus = true;
+        }
+
+        // --- hint line (this is the status bar while a prompt is open) ---
+        let hint = if prompt.cursor.is_some() {
+            format!("回车执行「{}」 · Esc 返回", truncate_chars(&prompt.value(), 40))
+        } else if prompt.history.is_empty() {
+            "回车执行 · Esc 返回".to_string()
+        } else {
+            "↑↓ 选历史参数 · 回车执行 · Esc 返回".to_string()
+        };
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.label(RichText::new(hint).size(11.0).color(Color32::from_gray(110)));
         });
     }
 }
@@ -2096,5 +2467,89 @@ mod tests {
             checked.push(*label);
         }
         println!("verified icon types: {checked:?}");
+    }
+
+    // ---- parameter prompt (P1-1) ------------------------------------------
+
+    fn history(entries: &[(&str, u32)]) -> Vec<(String, u32)> {
+        entries.iter().map(|(v, n)| (v.to_string(), *n)).collect()
+    }
+
+    fn prompt_with(entries: &[(&str, u32)], run_line: bool) -> Prompt {
+        let item = Item {
+            id: "p".into(),
+            title: "百度搜索".into(),
+            keywords: vec!["b".into()],
+            actions: vec![Action::open("http://www.baidu.com/s?wd=")],
+            ..Default::default()
+        };
+        let mut action = item.default_action().cloned().unwrap();
+        if run_line {
+            action.effect = Effect::Builtin { verb: BuiltinVerb::RunInput };
+        }
+        Prompt::new(item, action, history(entries))
+    }
+
+    #[test]
+    fn history_filter_is_case_insensitive_and_keeps_order() {
+        let h = history(&[("Rust 教程", 3), ("egui notes", 2), ("rust weekly", 1)]);
+        assert_eq!(filter_history(&h, ""), vec![0, 1, 2], "empty query: all of it");
+        assert_eq!(filter_history(&h, "  "), vec![0, 1, 2], "blank query too");
+        assert_eq!(filter_history(&h, "rust"), vec![0, 2], "order = use count");
+        assert_eq!(filter_history(&h, "RUST"), vec![0, 2], "case-insensitive");
+        assert_eq!(filter_history(&h, "gui"), vec![1], "substring, not prefix");
+        assert!(filter_history(&h, "没有这个").is_empty());
+    }
+
+    /// Enter uses the typed text until a suggestion is highlighted.
+    #[test]
+    fn prompt_value_prefers_the_highlighted_suggestion() {
+        let mut p = prompt_with(&[("rust", 5), ("egui", 1)], false);
+        assert_eq!(p.value(), "", "nothing typed yet");
+
+        p.text = "  my own query  ".into();
+        p.refilter();
+        assert_eq!(p.value(), "my own query", "typed text is trimmed");
+        assert_eq!(p.suggestions.len(), 0, "no history matches");
+
+        // Down highlights the first suggestion of the list, and that is what
+        // Enter then runs; the typed text is left alone.
+        p.text.clear();
+        p.refilter();
+        p.move_cursor(1);
+        assert_eq!(p.cursor, Some(0));
+        assert_eq!(p.value(), "rust");
+        p.move_cursor(1);
+        assert_eq!(p.value(), "egui");
+        // Clamped, not wrapped: holding Down must not jump back to the top.
+        p.move_cursor(1);
+        assert_eq!(p.value(), "egui");
+
+        // Typing again drops the highlight.
+        p.text = "ru".into();
+        p.refilter();
+        assert_eq!(p.cursor, None);
+        assert_eq!(p.suggestions, vec![0]);
+        assert_eq!(p.value(), "ru");
+    }
+
+    #[test]
+    fn prompt_cursor_stays_none_without_history() {
+        let mut p = prompt_with(&[], false);
+        p.move_cursor(1);
+        assert_eq!(p.cursor, None);
+        assert_eq!(p.value(), "");
+        assert!(p.history.is_empty());
+        assert_eq!(p.empty_hint(), "请输入参数（Esc 返回）");
+    }
+
+    /// `运行` takes the text as the command line itself, and says so.
+    #[test]
+    fn run_input_prompt_is_recognised() {
+        let p = prompt_with(&[], true);
+        assert!(p.run_line);
+        assert_eq!(p.empty_hint(), "输入要运行的命令（Esc 返回）");
+        let q = prompt_with(&[], false);
+        assert!(!q.run_line, "a search template is not a command line");
     }
 }

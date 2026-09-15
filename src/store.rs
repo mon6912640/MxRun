@@ -367,6 +367,18 @@ pub struct Store {
     pub warnings: Vec<String>,
 }
 
+/// Meta key holding one parameter's use count for one item.
+///
+/// Item ids contain `:` themselves (`shortcutlist:line:7`), which is harmless:
+/// the prefix is matched whole, never split.
+fn param_key(item_id: &str, value: &str) -> String {
+    format!("param:{item_id}:{value}")
+}
+
+/// How many parameters are remembered per item. AltRun's `ParamHistoryLimit`
+/// default was 50 — same number, but per item instead of global.
+pub const PARAM_HISTORY_LIMIT: usize = 50;
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,6 +469,17 @@ impl Store {
             {
                 if let Ok(mut table) = tx.open_table(META) {
                     let _ = table.insert(key, value);
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    fn remove_meta(&self, key: &str) {
+        if let Ok(tx) = self.db.begin_write() {
+            {
+                if let Ok(mut table) = tx.open_table(META) {
+                    let _ = table.remove(key);
                 }
             }
             let _ = tx.commit();
@@ -636,6 +659,75 @@ impl Store {
         f.last_used = now_secs();
         if let Ok(json) = serde_json::to_string(&f) {
             self.write_meta(&format!("frec:{id}"), &json);
+        }
+    }
+
+    // ----- parameter history -------------------------------------------
+
+    /// Remember one parameter the user typed for `item_id`.
+    ///
+    /// AltRun kept these in `ParamHistory.txt` next to the exe (rank = use
+    /// count, newest first, capped at `ParamHistoryLimit`). Keeping them in the
+    /// same meta table means no new file to manage, and the ranking can be
+    /// per item instead of one global list — "the wiki page I always open" and
+    /// "the search I always run" no longer share slots.
+    pub fn bump_param(&self, item_id: &str, value: &str) {
+        let value = value.trim();
+        // Nothing typed: recording it would put an empty row at the top of the
+        // suggestions forever.
+        if value.is_empty() {
+            return;
+        }
+        let key = param_key(item_id, value);
+        let count = self
+            .read_meta(&key)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.write_meta(&key, &count.to_string());
+        self.trim_param_history(item_id);
+    }
+
+    /// The parameters used with one item, `(value, uses)`, most used first.
+    /// `limit` is applied after sorting, so it means "the top N".
+    pub fn param_history(&self, item_id: &str, limit: usize) -> Vec<(String, u32)> {
+        let mut entries = self.param_entries(item_id);
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(limit);
+        entries
+    }
+
+    /// `(value, count)` for one item, in key order.
+    fn param_entries(&self, item_id: &str) -> Vec<(String, u32)> {
+        let prefix = format!("param:{item_id}:");
+        let mut out: Vec<(String, u32)> = Vec::new();
+        let mut scan = || -> Option<()> {
+            let tx = self.db.begin_read().ok()?;
+            let table = tx.open_table(META).ok()?;
+            for row in table.range(prefix.as_str()..).ok()? {
+                let (k, v) = row.ok()?;
+                // Keys come back sorted, so the first one that does not carry
+                // the prefix ends this item's slice.
+                let Some(value) = k.value().strip_prefix(prefix.as_str()) else {
+                    break;
+                };
+                out.push((value.to_string(), v.value().parse::<u32>().unwrap_or(0)));
+            }
+            Some(())
+        };
+        let _ = scan();
+        out
+    }
+
+    /// Keep the history bounded (AltRun's limit was 50): drop the least used.
+    fn trim_param_history(&self, item_id: &str) {
+        let mut entries = self.param_entries(item_id);
+        if entries.len() <= PARAM_HISTORY_LIMIT {
+            return;
+        }
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (value, _) in entries.into_iter().skip(PARAM_HISTORY_LIMIT) {
+            self.remove_meta(&param_key(item_id, &value));
         }
     }
 
@@ -885,6 +977,71 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Parameter history: per item, most used first, blanks ignored.
+    #[test]
+    fn param_history_ranks_per_item() {
+        let dir = temp_dir("param-history");
+        let store = Store::open_at(dir.clone()).unwrap();
+
+        // Only the values matter here; the counts are asserted separately.
+        let values = |item: &str, limit: usize| -> Vec<String> {
+            store.param_history(item, limit).into_iter().map(|(v, _)| v).collect()
+        };
+
+        store.bump_param("a", "rust");
+        store.bump_param("a", "rust");
+        store.bump_param("a", "egui");
+        store.bump_param("b", "另一个条目的参数");
+
+        assert_eq!(values("a", 10), vec!["rust", "egui"]);
+        assert_eq!(values("b", 10), vec!["另一个条目的参数"]);
+        assert!(values("c", 10).is_empty(), "unknown item: no history");
+        assert_eq!(values("a", 1), vec!["rust"], "limit = top N");
+        assert_eq!(
+            store.param_history("a", 10)[0].1,
+            2,
+            "the use count is kept, not just the value"
+        );
+
+        // Whitespace-only input is not a parameter.
+        store.bump_param("a", "   ");
+        assert_eq!(values("a", 10).len(), 2);
+
+        // Values are recorded as typed, spaces and all (they get encoded later).
+        store.bump_param("a", "两 个 词");
+        assert!(values("a", 10).contains(&"两 个 词".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The history stays bounded, and it drops the least used first.
+    #[test]
+    fn param_history_is_capped_by_least_used() {
+        let dir = temp_dir("param-cap");
+        let store = Store::open_at(dir.clone()).unwrap();
+
+        store.bump_param("a", "keep");
+        store.bump_param("a", "keep");
+        for i in 0..(PARAM_HISTORY_LIMIT + 5) {
+            store.bump_param("a", &format!("p{i:03}"));
+        }
+
+        let hist = store.param_history("a", PARAM_HISTORY_LIMIT * 2);
+        assert_eq!(hist.len(), PARAM_HISTORY_LIMIT, "cap enforced");
+        assert_eq!(hist[0].0, "keep", "the most used one is not evicted");
+        assert_eq!(hist[0].1, 2, "and it kept its count");
+
+        // Non-evicted entries are still readable, and "keep" appears once.
+        let top = store.param_history("a", 10);
+        assert_eq!(top.len(), 10);
+        assert_eq!(
+            store.param_history("a", PARAM_HISTORY_LIMIT).iter().filter(|(v, _)| v == "keep").count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Manual-check helper (not part of the normal run):
     ///
     /// ```text
@@ -955,12 +1112,35 @@ mod tests {
                 "manual",
                 "m7",
             ),
+            // P1-1 end to end: the typed parameter must reach a real process.
+            // It writes what it got to a temp file — that file is the evidence,
+            // and `MXRUN_SELFTEST_PARAM` can drive the whole thing with no
+            // keyboard. Hidden keeps the console from flashing.
+            {
+                let mut it = mk(
+                    "参数写入文件",
+                    "p11",
+                    crate::store::Effect::Run {
+                        line: r#"cmd /c echo {p} > "%TEMP%\mxrun-p11-param.txt""#.into(),
+                    },
+                    ArgSpec {
+                        source: ArgSource::Prompt,
+                        encode: Encoder::Raw,
+                        insert: InsertMode::Replace,
+                    },
+                    "manual",
+                    "m9",
+                );
+                it.launch = LaunchMode::Hidden;
+                it
+            },
         ];
         for item in items {
             store.upsert_from_source(item).unwrap();
         }
         println!("\n样本档案已就绪：{}", dir.display());
         println!("启动：  $env:APPDATA='{}'; .\\target\\release\\mxrun.exe", dir.parent().unwrap().display());
-        println!("可试：windir / myip / ask(应显示 *需要输入) / cb / hide→unhide / desk / npp\n");
+        println!("可试：windir / myip / ask(回车应变出参数输入框) / cb / hide→unhide / desk / npp");
+        println!("      p11 输入任意文字 → 写入 %TEMP%\\mxrun-p11-param.txt（可无键盘验收）\n");
     }
 }

@@ -21,9 +21,11 @@
 //!
 //! ## Arguments
 //!
-//! [`ArgSource::Prompt`] has no UI yet (P1-1), so it yields
-//! [`Outcome::NeedsInput`] and the list marks those items with `*`. The
-//! non-interactive sources (clipboard, foreground window) work today.
+//! [`ArgSource::Prompt`] takes its value from the inline prompt (P1-1): the UI
+//! collects the text and passes it to [`run_with_arg`]. Called through plain
+//! [`run`] there is nobody to ask, so it yields [`Outcome::NeedsInput`] — which
+//! is exactly the signal that makes the UI open the prompt. The other sources
+//! (clipboard, foreground window) need no typing and work either way.
 //!
 //! Legacy `{%c}` placeholders are handled too: AltRun's clipboard items are
 //! stored as `http://…?wd={%c}`, so `Replace` mode fills in whichever marker
@@ -59,7 +61,8 @@ pub const MARKER_CLIPBOARD: &str = "{%c}";
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Started,
-    /// The action needs the user to type something; the prompt is P1-1.
+    /// The action needs a value nobody supplied yet: the UI answers by opening
+    /// the parameter prompt, then re-runs it through [`run_with_arg`].
     NeedsInput,
     Failed(String),
 }
@@ -309,11 +312,18 @@ fn show_flag(mode: LaunchMode) -> i32 {
 }
 
 /// Resolve the argument value, or report that the user must type one.
-fn arg_value(arg: &ArgSpec) -> Result<Option<String>, Outcome> {
+///
+/// `typed` is the text from the prompt, and is only consulted for
+/// [`ArgSource::Prompt`] — a clipboard or foreground-window item takes its
+/// value from the system even while the user is looking at a prompt.
+fn arg_value(arg: &ArgSpec, typed: Option<&str>) -> Result<Option<String>, Outcome> {
     let raw = match arg.source {
         ArgSource::None => return Ok(None),
-        // The prompt UI is P1-1.
-        ArgSource::Prompt => return Err(Outcome::NeedsInput),
+        ArgSource::Prompt => match typed {
+            Some(text) if !text.is_empty() => text.to_string(),
+            // No prompt, or an empty one: the caller shows the prompt instead.
+            _ => return Err(Outcome::NeedsInput),
+        },
         ArgSource::Clipboard => clipboard_text().unwrap_or_default(),
         ArgSource::ForegroundId => {
             let fg = foreground();
@@ -331,8 +341,12 @@ fn arg_value(arg: &ArgSpec) -> Result<Option<String>, Outcome> {
 /// Build the final command string for an item: insert the argument, expand
 /// environment variables. Returns the command plus an optional working
 /// directory for relative commands.
-pub fn build_command(target: &str, arg: &ArgSpec) -> Result<(String, Option<String>), Outcome> {
-    let value = arg_value(arg)?;
+pub fn build_command(
+    target: &str,
+    arg: &ArgSpec,
+    typed: Option<&str>,
+) -> Result<(String, Option<String>), Outcome> {
+    let value = arg_value(arg, typed)?;
     let inserted = apply_insert(target, value.as_deref(), arg.insert);
     let command = expand_env(&inserted);
     let workdir = if wants_launcher_dir(&command) {
@@ -476,7 +490,7 @@ fn hide_others() -> Outcome {
     }
 }
 
-fn run_builtin(verb: BuiltinVerb) -> Outcome {
+fn run_builtin(verb: BuiltinVerb, typed: Option<&str>) -> Outcome {
     match verb {
         BuiltinVerb::MinimizeAll | BuiltinVerb::ShowDesktop => minimize_all(),
         BuiltinVerb::HideOthers => hide_others(),
@@ -507,9 +521,23 @@ fn run_builtin(verb: BuiltinVerb) -> Outcome {
         }
         BuiltinVerb::Shutdown => create_process("shutdown /s /t 5", None, LaunchMode::Hidden),
         BuiltinVerb::Reboot => create_process("shutdown /r /t 5", None, LaunchMode::Hidden),
-        // Needs the typed input; arrives with the prompt (P1-1).
-        BuiltinVerb::RunInput => Outcome::NeedsInput,
+        // AltRun's 「运行」: what the user typed *is* the command line. It is
+        // the manual equivalent of a fallback — the user picks this item first
+        // (see docs/命令模型设计.md §6.4). LaunchMode is forced to Normal: the
+        // item's own `Hidden` would make the launched program invisible, and
+        // for a "run what I type" command that is never what was meant.
+        BuiltinVerb::RunInput => match typed_line(typed) {
+            Some(line) => create_process(line, None, LaunchMode::Normal),
+            None => Outcome::NeedsInput,
+        },
     }
+}
+
+/// The command line to run for [`BuiltinVerb::RunInput`], if the user typed
+/// one. Whitespace-only input counts as "nothing typed" — running it would just
+/// flash an empty console.
+fn typed_line(typed: Option<&str>) -> Option<&str> {
+    typed.map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn reveal(path: &str) -> Outcome {
@@ -534,17 +562,26 @@ fn reveal(path: &str) -> Outcome {
 }
 
 /// Run one action. Pure dispatch — all OS work happens in the helpers above.
+///
+/// Items whose [`ArgSpec`] asks the user for a value cannot be run through
+/// here: they return [`Outcome::NeedsInput`], the UI opens the prompt, and the
+/// retry comes back through [`run_with_arg`].
 pub fn run(item: &Item, action: &Action) -> Outcome {
+    run_with_arg(item, action, None)
+}
+
+/// Same, with the text the user typed into the parameter prompt.
+pub fn run_with_arg(item: &Item, action: &Action, typed: Option<&str>) -> Outcome {
     match &action.effect {
-        Effect::Open { target } => match build_command(target, &item.arg) {
+        Effect::Open { target } => match build_command(target, &item.arg, typed) {
             Ok((cmd, dir)) => shell_execute(&cmd, dir.as_deref(), item.launch),
             Err(outcome) => outcome,
         },
-        Effect::Run { line } => match build_command(line, &item.arg) {
+        Effect::Run { line } => match build_command(line, &item.arg, typed) {
             Ok((cmd, dir)) => create_process(&cmd, dir.as_deref(), item.launch),
             Err(outcome) => outcome,
         },
-        Effect::Builtin { verb } => run_builtin(*verb),
+        Effect::Builtin { verb } => run_builtin(*verb, typed),
         Effect::Reveal { path } => reveal(path),
         Effect::Copy { text } => copy_to_clipboard(&expand_env(text)),
     }
@@ -624,7 +661,45 @@ mod tests {
     #[test]
     fn prompt_source_reports_needs_input() {
         let arg = ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace };
-        assert_eq!(build_command("cmd /k {p}", &arg), Err(Outcome::NeedsInput));
+        assert_eq!(build_command("cmd /k {p}", &arg, None), Err(Outcome::NeedsInput));
+        // An empty prompt is the same as no prompt: asking again beats running
+        // `cmd /k ` with nothing after it.
+        assert_eq!(build_command("cmd /k {p}", &arg, Some("")), Err(Outcome::NeedsInput));
+    }
+
+    /// Once the prompt hands the text over, it lands in the marker.
+    #[test]
+    fn prompt_text_fills_the_marker() {
+        let arg = ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace };
+        let (cmd, dir) = build_command("cmd /k {p}", &arg, Some("ping 127.0.0.1")).unwrap();
+        assert_eq!(cmd, "cmd /k ping 127.0.0.1");
+        assert!(dir.is_none());
+    }
+
+    /// The search-template shape: no marker, the encoded query is appended.
+    #[test]
+    fn prompt_text_is_encoded_for_search_engines() {
+        let arg = ArgSpec {
+            source: ArgSource::Prompt,
+            encode: Encoder::UrlQuery,
+            insert: InsertMode::Append,
+        };
+        let (cmd, _) = build_command("http://www.baidu.com/s?wd=", &arg, Some("rust 教程")).unwrap();
+        assert_eq!(cmd, "http://www.baidu.com/s?wd=rust+%E6%95%99%E7%A8%8B");
+    }
+
+    /// `运行` runs exactly what was typed — no encoding, no marker.
+    #[test]
+    fn typed_line_trims_and_rejects_blank() {
+        assert_eq!(typed_line(Some("  notepad  ")), Some("notepad"));
+        assert_eq!(typed_line(Some("   ")), None);
+        assert_eq!(typed_line(None), None);
+    }
+
+    #[test]
+    fn run_input_without_text_asks_for_it() {
+        assert_eq!(run_builtin(BuiltinVerb::RunInput, None), Outcome::NeedsInput);
+        assert_eq!(run_builtin(BuiltinVerb::RunInput, Some("  ")), Outcome::NeedsInput);
     }
 
     /// A clipboard search engine needs no typing: clipboard -> encode -> append.
@@ -636,9 +711,61 @@ mod tests {
             insert: InsertMode::Replace,
         };
         // Clipboard is empty in a test run, so only the shape is asserted.
-        let (cmd, dir) = build_command("http://x/?q={%c}", &arg).expect("no input needed");
+        let (cmd, dir) = build_command("http://x/?q={%c}", &arg, None).expect("no input needed");
         assert!(cmd.starts_with("http://x/?q="));
         assert!(dir.is_none());
+    }
+
+    /// End-to-end: the typed parameter really reaches a real process. The
+    /// command writes it to a temp file, so the assertion is on the *side
+    /// effect*, not on our own string handling — this is the test that would
+    /// catch "the prompt collected text but never passed it on".
+    #[test]
+    fn typed_parameter_reaches_a_real_process() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let out = std::env::temp_dir().join(format!("mxrun-param-{nanos}.txt"));
+        let _ = std::fs::remove_file(&out);
+
+        let item = Item {
+            id: "test-param".into(),
+            title: "参数端到端".into(),
+            subtitle: String::new(),
+            keywords: Vec::new(),
+            actions: vec![Action::run(format!("cmd /c echo {{p}} > \"{}\"", out.display()))],
+            arg: ArgSpec {
+                source: ArgSource::Prompt,
+                encode: Encoder::Raw,
+                insert: InsertMode::Replace,
+            },
+            launch: LaunchMode::Hidden,
+            source: Default::default(),
+            health: Default::default(),
+        };
+        let action = item.default_action().cloned().unwrap();
+
+        // Without the prompt text it must refuse...
+        assert_eq!(run(&item, &action), Outcome::NeedsInput);
+        // ...and with it, write the file.
+        assert_eq!(
+            run_with_arg(&item, &action, Some("hello-param")),
+            Outcome::Started
+        );
+
+        // The child runs asynchronously; give it a moment.
+        let mut body = None;
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                body = Some(text);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_file(&out);
+        let body = body.expect("the parameterised command never produced its file");
+        assert_eq!(body.trim(), "hello-param");
     }
 
     /// End-to-end: the Run path really starts a process. `cmd /c exit` is
@@ -666,7 +793,7 @@ mod tests {
     #[test]
     fn foreground_verb_without_snapshot_fails_cleanly() {
         // No snapshot was taken in a test process, so this must not panic.
-        match run_builtin(BuiltinVerb::HideForegroundWindow) {
+        match run_builtin(BuiltinVerb::HideForegroundWindow, None) {
             Outcome::Failed(_) | Outcome::Started => {}
             other => panic!("unexpected outcome {other:?}"),
         }
@@ -750,7 +877,7 @@ mod tests {
         assert!(info.hwnd != 0, "snapshot taken");
         assert_eq!(pid_of_window(info.hwnd), Some(pid), "snapshot is notepad");
 
-        assert_eq!(run_builtin(BuiltinVerb::HideForegroundWindow), Outcome::Started);
+        assert_eq!(run_builtin(BuiltinVerb::HideForegroundWindow, None), Outcome::Started);
         assert!(!is_visible(info.hwnd), "notepad must be hidden");
         // Restore must find it through the "last hidden" memory, not through a
         // fresh snapshot — that is the whole point of the remembered handle.
@@ -759,7 +886,7 @@ mod tests {
             info.hwnd,
             "the hidden window must be remembered"
         );
-        assert_eq!(run_builtin(BuiltinVerb::ShowForegroundWindow), Outcome::Started);
+        assert_eq!(run_builtin(BuiltinVerb::ShowForegroundWindow, None), Outcome::Started);
         assert!(is_visible(info.hwnd), "notepad must be visible again");
 
         kill_pid(pid);
