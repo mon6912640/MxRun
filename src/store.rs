@@ -375,6 +375,14 @@ fn param_key(item_id: &str, value: &str) -> String {
     format!("param:{item_id}:{value}")
 }
 
+/// Meta key remembering that the user deleted a source.
+///
+/// Keyed by `(provider, external_id)` rather than by id, because that is what
+/// an import can recognise — the id it would have used is gone with the row.
+fn gone_key(provider: &str, external_id: &str) -> String {
+    format!("gone:{provider}:{external_id}")
+}
+
 /// How many parameters are remembered per item. AltRun's `ParamHistoryLimit`
 /// default was 50 — same number, but per item instead of global.
 pub const PARAM_HISTORY_LIMIT: usize = 50;
@@ -640,12 +648,15 @@ impl Store {
     /// `(provider, external_id)` so re-importing updates instead of
     /// duplicating — and so the local frecency (keyed by id) survives.
     ///
-    /// Returns the id the item ended up under.
-    /// Reserved for the importers (P0-3); exercised by the unit tests.
-    #[allow(dead_code)]
-    pub fn upsert_from_source(&mut self, mut item: Item) -> Result<String, Box<dyn std::error::Error>> {
+    /// Returns the id the item ended up under, or `None` when the user deleted
+    /// this source before: a deleted item must not come back the next time the
+    /// same list is imported (see [`Store::delete_item`]).
+    pub fn upsert_from_source(&mut self, mut item: Item) -> Result<Option<String>, Box<dyn std::error::Error>> {
         if item.source.provider.is_empty() {
             return Err("upsert_from_source: 缺少 provider".into());
+        }
+        if self.is_deleted(&item.source.provider, &item.source.external_id) {
+            return Ok(None);
         }
         if !item.source.external_id.is_empty() {
             for existing in self.load_items()? {
@@ -659,12 +670,49 @@ impl Store {
             item.id = format!("{}:{}", item.source.provider, item.source.external_id);
         }
         self.upsert_item(&item)?;
-        Ok(item.id)
+        Ok(Some(item.id))
     }
 
-    /// Kept for the CRUD screen (P2) and used by the importer to clear demo
-    /// items once real data arrives.
-    pub fn delete_item(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Remove an item, and remember that the user did not want it.
+    ///
+    /// Two things happen beyond dropping the row:
+    ///
+    /// * its frecency and parameter history go too — they are keyed by id, and
+    ///   a later item that happens to reuse the id (a re-import of the same
+    ///   line, say) must not inherit the counts of the thing the user threw
+    ///   away;
+    /// * a **tombstone** is written for the item's `(provider, external_id)`,
+    ///   so importing the same source again does not resurrect it. Without
+    ///   that, "delete" would be a lie for anything that came from a list:
+    ///   the next `--import` would put it straight back.
+    ///
+    /// Used by the manager and by `Delete` on a row.
+    pub fn delete_item(&mut self, item: &Item) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let tx = self.db.begin_write()?;
+            {
+                let mut table = tx.open_table(COMMANDS)?;
+                table.remove(item.id.as_str())?;
+            }
+            tx.commit()?;
+        }
+
+        // No source to remember (a hand-made item that was never tied to a
+        // path): nothing to block, and nothing can bring it back anyway.
+        if !item.source.provider.is_empty() {
+            self.mark_deleted(item)?;
+        }
+
+        self.remove_meta(&format!("frec:{}", item.id));
+        for (value, _) in self.param_entries(&item.id) {
+            self.remove_meta(&param_key(&item.id, &value));
+        }
+        Ok(())
+    }
+
+    /// Remove an item by id without leaving a tombstone (dropping the demo
+    /// items on import — those are not "something the user deleted").
+    pub fn delete_item_by_id(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(COMMANDS)?;
@@ -672,6 +720,64 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ----- tombstones ---------------------------------------------------
+
+    /// Was this source deleted by the user? Imports ask before re-adding.
+    pub fn is_deleted(&self, provider: &str, external_id: &str) -> bool {
+        if provider.is_empty() || external_id.is_empty() {
+            return false;
+        }
+        self.read_meta(&gone_key(provider, external_id)).is_some()
+    }
+
+    /// Forget a tombstone. Done when the user adds the same thing again on
+    /// purpose: an import must not resurrect what was deleted, but a deliberate
+    /// add is a change of mind, not a resurrection.
+    pub fn clear_deleted(&self, provider: &str, external_id: &str) {
+        if provider.is_empty() || external_id.is_empty() {
+            return;
+        }
+        self.remove_meta(&gone_key(provider, external_id));
+    }
+
+    fn mark_deleted(&self, item: &Item) -> Result<(), Box<dyn std::error::Error>> {
+        let record = serde_json::json!({
+            "title": item.title,
+            "at": now_secs(),
+        });
+        self.write_meta(
+            &gone_key(&item.source.provider, &item.source.external_id),
+            &record.to_string(),
+        );
+        Ok(())
+    }
+
+    /// Everything the user has deleted, newest first — the raw material for a
+    /// future "已删除" list / undo.
+    #[allow(dead_code)] // exercised by the tests; a "已删除 / 撤销" view will read it
+    pub fn deleted_sources(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let mut scan = || -> Option<()> {
+            let tx = self.db.begin_read().ok()?;
+            let table = tx.open_table(META).ok()?;
+            for row in table.range("gone:"..).ok()? {
+                let (k, v) = row.ok()?;
+                let Some(rest) = k.value().strip_prefix("gone:") else {
+                    break;
+                };
+                let (provider, external_id) = rest.split_once(':').unwrap_or((rest, ""));
+                let title = serde_json::from_str::<serde_json::Value>(v.value())
+                    .ok()
+                    .and_then(|j| j.get("title").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_default();
+                out.push((provider.to_string(), external_id.to_string(), title));
+            }
+            Some(())
+        };
+        let _ = scan();
+        out
     }
 
     // ----- frecency -----------------------------------------------------
@@ -969,6 +1075,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Deleting an item takes its statistics with it, and remembers the source
+    /// so a later import cannot quietly put it back.
+    #[test]
+    fn delete_removes_stats_and_leaves_a_tombstone() {
+        let dir = temp_dir("delete");
+        let mut store = Store::open_at(dir.clone()).unwrap();
+
+        let mk = |title: &str| Item {
+            id: String::new(),
+            title: title.into(),
+            keywords: vec!["steam".into()],
+            actions: vec![Action::run("steam.exe")],
+            source: Source { provider: "shortcutlist".into(), external_id: "line:43".into() },
+            ..Default::default()
+        };
+        let id = store.upsert_from_source(mk("Steam")).unwrap().expect("first add");
+        store.bump_frecency(&id);
+        store.bump_frecency(&id);
+        store.bump_param(&id, "rust");
+        assert_eq!(store.get_frecency(&id).count, 2);
+        assert_eq!(store.param_history(&id, 10).len(), 1);
+
+        let item = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .expect("item is there");
+        store.delete_item(&item).unwrap();
+
+        // Gone from the list…
+        assert!(store.load_items().unwrap().iter().all(|i| i.id != id));
+        // …and its bookkeeping is gone with it, so nothing inherits the counts.
+        assert_eq!(store.get_frecency(&id).count, 0);
+        assert!(store.param_history(&id, 10).is_empty());
+
+        // The tombstone keeps the next import from resurrecting it…
+        assert!(store.is_deleted("shortcutlist", "line:43"));
+        assert_eq!(store.upsert_from_source(mk("Steam")).unwrap(), None, "not re-added");
+        assert!(store.load_items().unwrap().iter().all(|i| i.title != "Steam"));
+
+        // The deleted list is available for a future "undo".
+        let deleted = store.deleted_sources();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].0, "shortcutlist");
+        assert_eq!(deleted[0].1, "line:43");
+        assert_eq!(deleted[0].2, "Steam", "title recorded");
+
+        // …until the user adds the same thing on purpose, which forgets it.
+        store.clear_deleted("shortcutlist", "line:43");
+        assert!(!store.is_deleted("shortcutlist", "line:43"));
+        assert!(store.upsert_from_source(mk("Steam")).unwrap().is_some());
+        assert!(store.deleted_sources().is_empty(), "tombstone forgotten");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the demo items is not a user deletion — nothing is remembered,
+    /// so a fresh database still gets its demo rows.
+    #[test]
+    fn dropping_demo_items_leaves_no_tombstone() {
+        let dir = temp_dir("demo-drop");
+        let mut store = Store::open_at(dir.clone()).unwrap();
+        let demo = store.load_items().unwrap();
+        assert!(!demo.is_empty());
+        for item in &demo {
+            store.delete_item_by_id(&item.id).unwrap();
+        }
+        assert!(store.deleted_sources().is_empty());
+        assert!(!store.is_deleted("seed", "seed-0"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Re-opening an already migrated database must not re-seed or duplicate.
     #[test]
     fn reopening_is_idempotent() {        let dir = temp_dir("reopen");
@@ -997,9 +1176,9 @@ mod tests {
             ..Default::default()
         };
 
-        let id1 = store.upsert_from_source(mk("Steam")).unwrap();
+        let id1 = store.upsert_from_source(mk("Steam")).unwrap().expect("not deleted");
         store.bump_frecency(&id1);
-        let id2 = store.upsert_from_source(mk("Steam 客户端")).unwrap();
+        let id2 = store.upsert_from_source(mk("Steam 客户端")).unwrap().expect("not deleted");
 
         assert_eq!(id1, id2, "same source -> same id, so frecency survives");
         assert_eq!(store.get_frecency(&id1).count, 1);

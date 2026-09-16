@@ -58,6 +58,9 @@ const DEFAULT_HOTKEY: &str = "Alt+F1";
 /// are). Documented as a deliberate deviation.
 const LAUNCHER_SIZE: [f32; 2] = [680.0, 400.0];
 const ADD_SIZE: [f32; 2] = [540.0, 300.0];
+/// The manager is wider on purpose: command lines are long, and AltRun's own
+/// manager gave the command column 400px for the same reason.
+const MANAGER_SIZE: [f32; 2] = [880.0, 560.0];
 
 /// Paths this instance was started with (before eframe owns the process).
 static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -185,7 +188,7 @@ fn run_import(cli: import::CliImport) {
                 log_line(&format!("import: {note}"));
             }
             log_line(&format!(
-                "import: lines={} commands={} imported={} needs_input={} builtin={} removed_seed={} skipped(sep={} unwanted={} unsupported={})",
+                "import: lines={} commands={} imported={} needs_input={} builtin={} removed_seed={} skipped(sep={} unwanted={} unsupported={} deleted={})",
                 report.lines,
                 report.commands,
                 report.imported,
@@ -194,7 +197,8 @@ fn run_import(cli: import::CliImport) {
                 report.removed_seed,
                 report.skipped_separator,
                 report.skipped_unwanted,
-                report.skipped_unsupported
+                report.skipped_unsupported,
+                report.skipped_deleted
             ));
             message_box(
                 &format!(
@@ -1373,6 +1377,14 @@ impl AddForm {
     }
 }
 
+/// What a row's context menu asked for (a manager row or a result row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    Edit,
+    Delete,
+    Reveal,
+}
+
 /// A short note that shows itself for a couple of seconds and then takes the
 /// window away with it.
 ///
@@ -1423,6 +1435,12 @@ struct MxRunApp {
     toast: Option<Toast>,
     /// First-run question: "shall MxRun join the right-click menu?"
     ask_integration: bool,
+    /// Manager view (`快捷项管理`): every item, filterable, with edit/delete.
+    manage: bool,
+    /// Tray menu asked for the manager.
+    open_manage: Arc<AtomicBool>,
+    /// Id armed by the first `Delete` — the confirmation, without a modal.
+    pending_delete: Option<String>,
     /// This process was started *by* an add request (right-click → 发送到 while
     /// nothing was running). Only then does the "MxRun is now resident" note
     /// make sense.
@@ -1514,12 +1532,15 @@ impl MxRunApp {
         }
 
         // --- system tray ---
+        // Order follows AltRun's own menu (显示 / 快捷项管理 / 配置 / 退出).
         let menu = Menu::new();
         let toggle_item = MenuItem::new("显示 / 隐藏  MxRun", true, None);
+        let manage_item = MenuItem::new("快捷项管理…", true, None);
         let new_item = MenuItem::new("新建条目…", true, None);
         let settings_item = MenuItem::new("设置", true, None);
         let quit_item = MenuItem::new("退出 MxRun", true, None);
         let _ = menu.append(&toggle_item);
+        let _ = menu.append(&manage_item);
         let _ = menu.append(&new_item);
         let _ = menu.append(&settings_item);
         let _ = menu.append(&quit_item);
@@ -1538,11 +1559,14 @@ impl MxRunApp {
         // hidden has to be able to bring it back.
         let ctx2 = cc.egui_ctx.clone();
         let toggle_id = toggle_item.id().clone();
+        let manage_id = manage_item.id().clone();
         let new_id = new_item.id().clone();
         let settings_id = settings_item.id().clone();
         let quit_id = quit_item.id().clone();
         let open_settings = Arc::new(AtomicBool::new(false));
         let open_settings2 = open_settings.clone();
+        let open_manage = Arc::new(AtomicBool::new(false));
+        let open_manage2 = open_manage.clone();
         let open_new = Arc::new(AtomicBool::new(false));
         let open_new2 = open_new.clone();
         let pending_adds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1567,6 +1591,9 @@ impl MxRunApp {
                 for ev in MenuEvent::receiver().try_iter() {
                     if ev.id == toggle_id {
                         toggle_window(&ctx2);
+                    } else if ev.id == manage_id {
+                        open_manage2.store(true, Ordering::Relaxed);
+                        show_window_sized(&ctx2, Some(MANAGER_SIZE));
                     } else if ev.id == new_id {
                         open_new2.store(true, Ordering::Relaxed);
                         show_window_sized(&ctx2, Some(ADD_SIZE));
@@ -1637,6 +1664,9 @@ impl MxRunApp {
             add: None,
             toast: None,
             ask_integration,
+            manage: false,
+            open_manage,
+            pending_delete: None,
             cold_start_add: false,
             add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
@@ -1665,6 +1695,41 @@ impl MxRunApp {
                 log_line(&format!(
                     "selftest: answered the integration question {answer:?} -> {}",
                     app.status
+                ));
+            }
+        }
+
+        // Debug hook: drive the manager and the delete flow without a keyboard
+        // (`MXRUN_SELFTEST_MANAGE=1` opens it, `MXRUN_SELFTEST_DELETE=1` then
+        // deletes the selected row — twice, the way the confirmation works).
+        // **It really deletes**, so only ever point it at a scratch profile.
+        if std::env::var("MXRUN_SELFTEST_MANAGE").is_ok() {
+            app.enter_manage();
+            log_line(&format!(
+                "selftest: manage rows={} items={}",
+                app.results.len(),
+                app.items.len()
+            ));
+            if std::env::var("MXRUN_SELFTEST_DELETE").is_ok() && !app.results.is_empty() {
+                let victim = app.results[app.selected].idx;
+                let (id, title) = (
+                    app.items[victim].item.id.clone(),
+                    app.items[victim].item.title.clone(),
+                );
+                log_line(&format!("selftest: deleting {title:?} (id={id})"));
+                let ctx = cc.egui_ctx.clone();
+                app.request_delete(&ctx);
+                log_line(&format!("selftest: armed -> {}", app.status));
+                app.request_delete(&ctx);
+                log_line(&format!("selftest: after delete -> {}", app.status));
+                log_line(&format!(
+                    "selftest: items now={} still_present={} tombstone={}",
+                    app.items.len(),
+                    app.items.iter().any(|i| i.item.id == id),
+                    app.store
+                        .deleted_sources()
+                        .iter()
+                        .any(|(p, ext, _)| *ext == id || format!("{p}:{ext}") == id)
                 ));
             }
         }
@@ -1906,7 +1971,19 @@ impl MxRunApp {
         self.results.clear();
         self.calc_result = None;
         let query = self.input.trim();
-        if query.is_empty() {
+        let manage = self.manage;
+        if query.is_empty() && manage {
+            // Manager, no filter: every item there is, most used first — the
+            // ones that were never launched pile up at the bottom, which is
+            // exactly what you go looking for when tidying up.
+            for (idx, it) in self.items.iter().enumerate() {
+                self.results.push(Scored {
+                    idx,
+                    score: it.launches as f64,
+                    hit_indices: Vec::new(),
+                });
+            }
+        } else if query.is_empty() {
             // Idle: show everything ranked by frecency.
             for (idx, it) in self.items.iter().enumerate() {
                 self.results.push(Scored {
@@ -1944,16 +2021,30 @@ impl MxRunApp {
                 }
             }
         }
-        self.results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if !query.is_empty() {
+        if manage && query.is_empty() {
+            // Same ordering as the score above, with the title as the tiebreak
+            // so the list does not shuffle between frames.
+            self.results.sort_by(|a, b| {
+                let (la, lb) = (self.items[a.idx].launches, self.items[b.idx].launches);
+                lb.cmp(&la)
+                    .then_with(|| self.items[a.idx].item.title.cmp(&self.items[b.idx].item.title))
+            });
+        } else {
+            self.results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        // The manager is the place where seeing *everything* is the point: no
+        // score gate and no eight-row cap, it scrolls instead.
+        if !query.is_empty() && !manage {
             apply_score_gate(&mut self.results);
         }
-        self.results.truncate(MAX_ROWS);
-        self.selected = 0;
+        if !manage {
+            self.results.truncate(MAX_ROWS);
+        }
+        self.selected = self.selected.min(self.results.len().saturating_sub(1));
     }
 
     fn execute_selected(&mut self, ctx: &egui::Context) {
@@ -2212,13 +2303,18 @@ impl MxRunApp {
 
         // `upsert_from_source` keeps the id (and with it the launch count) when
         // the same source comes back; an edited row keeps its own id outright.
+        //
+        // Adding something on purpose also lifts an earlier tombstone: "delete"
+        // means "do not bring this back by yourself", not "never again".
+        self.store
+            .clear_deleted(&item.source.provider, &item.source.external_id);
         let saved = if item.source.external_id.is_empty() {
-            self.store.upsert_item(&item).map(|()| item.id.clone())
+            self.store.upsert_item(&item).map(|()| Some(item.id.clone()))
         } else {
             self.store.upsert_from_source(item)
         };
         match saved {
-            Ok(_) => {
+            Ok(Some(_)) => {
                 log_line(&format!(
                     "add: {verb} {keyword:?} -> {}",
                     truncate_chars(&command, 120)
@@ -2230,6 +2326,12 @@ impl MxRunApp {
                 };
                 self.finish_add(ctx);
             }
+            // Cannot happen: the tombstone was cleared just above. Say so
+            // rather than closing the card as if it had saved something.
+            Ok(None) => {
+                log_line("add: refused by a tombstone that should have been cleared");
+                self.set_add_error("这条之前被删过，仍处于删除状态");
+            }
             Err(e) => {
                 log_line(&format!("add: failed: {e}"));
                 self.set_add_error(&format!("保存失败：{e}"));
@@ -2240,6 +2342,85 @@ impl MxRunApp {
     fn set_add_error(&mut self, message: &str) {
         if let Some(form) = self.add.as_mut() {
             form.error = message.to_string();
+        }
+    }
+
+    // ---------- delete / insert / reveal ----------
+
+    /// `Delete` on the selected row.
+    ///
+    /// AltRun asked with a modal confirmation (`frmALTRun.pas:2233-2241`); the
+    /// question is the same here, the modal is not: the first press arms it, the
+    /// second one deletes, and any other key disarms. Same shape as the "keyword
+    /// already in use" warning on the add card.
+    fn request_delete(&mut self, ctx: &egui::Context) {
+        let Some(sc) = self.results.get(self.selected) else {
+            return;
+        };
+        let item = self.items[sc.idx].item.clone();
+
+        if self.pending_delete.as_deref() != Some(item.id.as_str()) {
+            self.pending_delete = Some(item.id.clone());
+            self.status = format!("再按一次 Delete 删除「{}」（其它按键取消）", item.title);
+            log_line(&format!("delete: confirm? {:?}", item.title));
+            return;
+        }
+
+        self.pending_delete = None;
+        match self.store.delete_item(&item) {
+            Ok(()) => {
+                log_line(&format!(
+                    "delete: removed {:?} (id={}, provider={})",
+                    item.title, item.id, item.source.provider
+                ));
+                self.status = format!("已删除：{}", item.title);
+                self.rebuild_index(ctx);
+                self.refresh_search();
+            }
+            Err(e) => {
+                log_line(&format!("delete: failed: {e}"));
+                self.status = format!("删除失败：{e}");
+            }
+        }
+    }
+
+    /// `Insert`: a blank card, the same one the right-click path uses.
+    fn request_new(&mut self) {
+        log_line("add: open blank card (Insert)");
+        self.add = Some(AddForm::blank(""));
+        self.want_focus = true;
+    }
+
+    /// `Ctrl+D`: open the folder the selected item lives in, with the file
+    /// selected — AltRun's "打开所在目录".
+    fn reveal_selected(&mut self) {
+        let Some(sc) = self.results.get(self.selected) else {
+            return;
+        };
+        let item = self.items[sc.idx].item.clone();
+        let Some(target) = item.icon_target() else {
+            self.status = format!("「{}」没有可定位的文件", item.title);
+            return;
+        };
+        let Some(path) = icon_source(&target) else {
+            self.status = format!("「{}」没有可定位的文件", item.title);
+            return;
+        };
+        if !path.exists() {
+            self.status = format!("找不到：{}", path.display());
+            return;
+        }
+        let action = Action::reveal(path.to_string_lossy().into_owned());
+        match exec::run(&item, &action) {
+            exec::Outcome::Started => {
+                log_line(&format!("reveal: {} -> {}", item.title, path.display()));
+                self.status = format!("已在资源管理器中定位：{}", path.display());
+            }
+            exec::Outcome::NeedsInput => {}
+            exec::Outcome::Failed(why) => {
+                log_line(&format!("reveal: failed: {why}"));
+                self.status = format!("定位失败：{why}");
+            }
         }
     }
 
@@ -2333,6 +2514,8 @@ impl MxRunApp {
     fn apply_window_size(&mut self, ctx: &egui::Context) {
         let want = if self.add.is_some() || self.toast.is_some() || self.ask_integration {
             ADD_SIZE
+        } else if self.manage {
+            MANAGER_SIZE
         } else {
             LAUNCHER_SIZE
         };
@@ -2372,6 +2555,76 @@ impl MxRunApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
             self.confirm_add(ctx);
             return true;
+        }
+        false
+    }
+
+    /// Enter the manager (tray menu → 快捷项管理, AltRun's `frmShortCutMan`).
+    ///
+    /// Same window, a different list: everything instead of the top eight, no
+    /// score gate, a scrollbar instead of a cap. The filter box is the familiar
+    /// search box, so narrowing 59 rows works the way everything else does.
+    fn enter_manage(&mut self) {
+        if self.manage {
+            return;
+        }
+        log_line(&format!("manage: open ({} items)", self.items.len()));
+        self.manage = true;
+        self.input.clear();
+        self.pending_delete = None;
+        self.selected = 0;
+        self.refresh_search();
+        self.want_focus = true;
+        self.status = format!(
+            "快捷项管理 · 共 {} 条 · 回车/F2 编辑 · Delete 删除 · Insert 新建 · Ctrl+D 定位 · Esc 返回",
+            self.items.len()
+        );
+    }
+
+    fn leave_manage(&mut self) {
+        log_line("manage: close");
+        self.manage = false;
+        self.input.clear();
+        self.pending_delete = None;
+        self.selected = 0;
+        self.refresh_search();
+        self.reset_status();
+        self.want_focus = true;
+    }
+
+    /// Keys while the manager is open. AltRun's manager keyboard, kept as it
+    /// was: F2 编辑 / Insert 添加 / Delete 删除 / 双击编辑 — with Enter doing
+    /// what double-click does, since there is no "run" here.
+    fn handle_manage_keys(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.leave_manage();
+            return true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
+            self.request_delete(ctx);
+            return false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Insert)) {
+            self.request_new();
+            return true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2))
+            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+        {
+            self.open_edit();
+            return true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::D)) {
+            self.reveal_selected();
+            return false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
+            if !self.results.is_empty() {
+                self.selected = (self.selected + 1).min(self.results.len() - 1);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
+            self.selected = self.selected.saturating_sub(1);
         }
         false
     }
@@ -2702,6 +2955,10 @@ impl eframe::App for MxRunApp {
             self.add = Some(AddForm::blank(""));
             self.want_focus = true;
         }
+        // Tray menu asked for the manager.
+        if self.open_manage.swap(false, Ordering::Relaxed) {
+            self.enter_manage();
+        }
 
         // Paths handed over by another process (right-click → 发送到, shell menu,
         // or a second launch with a path).
@@ -2831,6 +3088,10 @@ impl eframe::App for MxRunApp {
                 self.dismiss_toast(&ctx);
                 return;
             }
+        } else if self.manage {
+            if self.handle_manage_keys(&ctx) {
+                return;
+            }
         } else if self.prompt.is_some() {
             if self.handle_prompt_keys(&ctx) {
                 return;
@@ -2861,6 +3122,20 @@ impl eframe::App for MxRunApp {
             // dialog as well.
             if ctx.input(|i| i.key_pressed(Key::F2)) {
                 self.open_edit();
+            }
+            // Insert = 新建快捷项 (AltRun §1), Delete = 删除当前项 with a
+            // confirmation, Ctrl+D = 打开所在目录 (our Reveal action).
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Insert)) {
+                self.request_new();
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
+                self.request_delete(&ctx);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::D)) {
+                self.reveal_selected();
+                return;
             }
             if ctx.input(|i| i.key_pressed(Key::Enter)) {
                 // Nothing matched: offer to add it, the way AltRun did
@@ -2920,6 +3195,11 @@ impl MxRunApp {
             self.render_add(ui);
             return;
         }
+        // The manager: the same window, showing everything instead of results.
+        if self.manage {
+            self.render_manager(ui);
+            return;
+        }
         // An open parameter prompt takes over both the top box and the list.
         if self.prompt.is_some() {
             self.render_prompt(ui);
@@ -2957,6 +3237,7 @@ impl MxRunApp {
 
         // --- Result list ---
         let mut clicked: Option<usize> = None;
+        let mut menu_action: Option<(usize, MenuAction)> = None;
         for row in 0..self.results.len() {
             let sc = &self.results[row];
             let item = &self.items[sc.idx];
@@ -3046,10 +3327,38 @@ impl MxRunApp {
             if resp.clicked() {
                 clicked = Some(row);
             }
+            // AltRun's list had a right-click menu (添加 / 编辑 / 删除 /
+            // 打开所在目录). Add stays on Insert and the tray; the three that
+            // act on *this* row are here.
+            resp.context_menu(|ui| {
+                if ui.button("编辑 (F2)").clicked() {
+                    menu_action = Some((row, MenuAction::Edit));
+                    ui.close();
+                }
+                if ui.button("删除 (Delete)").clicked() {
+                    menu_action = Some((row, MenuAction::Delete));
+                    ui.close();
+                }
+                if ui.button("打开所在目录 (Ctrl+D)").clicked() {
+                    menu_action = Some((row, MenuAction::Reveal));
+                    ui.close();
+                }
+            });
         }
         if let Some(row) = clicked {
             self.selected = row;
             self.execute_selected(ctx);
+        }
+        if let Some((row, action)) = menu_action {
+            self.selected = row;
+            match action {
+                MenuAction::Edit => self.open_edit(),
+                MenuAction::Delete => {
+                    let ctx = ctx.clone();
+                    self.request_delete(&ctx);
+                }
+                MenuAction::Reveal => self.reveal_selected(),
+            }
         }
 
         if self.results.is_empty() && self.calc_result.is_none() {
@@ -3095,8 +3404,195 @@ impl MxRunApp {
         });
     }
 
-    /// The first-run question: MxRun has never been registered on this machine.
+    /// The manager: AltRun's `frmShortCutMan`, as a view of the same window.
     ///
+    /// Columns follow the original's four (ShortCut / Name / Param Type /
+    /// Command Line), adapted to this model: keyword, name, kind + command line,
+    /// launch count. Deliberately **not** copied from the original: drag
+    /// reordering (it dropped the frequency data), inline renaming (it bypassed
+    /// duplicate detection) and the checkbox column it never had.
+    fn render_manager(&mut self, ui: &mut egui::Ui) {
+        // --- filter box (the same search box, with a different hint) ---
+        let edit = egui::TextEdit::singleline(&mut self.input)
+            .font(FontId::proportional(17.0))
+            .hint_text(format!("筛选 {} 条条目…", self.items.len()))
+            .desired_width(f32::INFINITY)
+            .frame(egui::Frame::default());
+        let resp = ui.add(edit);
+        if self.want_focus {
+            resp.request_focus();
+            self.want_focus = false;
+        }
+        if resp.changed() {
+            self.selected = 0;
+            self.pending_delete = None;
+            self.refresh_search();
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("共 {} 条", self.results.len()))
+                    .size(12.0)
+                    .color(Color32::from_gray(150)),
+            );
+            if let Some(id) = self.pending_delete.clone() {
+                if let Some(it) = self.items.iter().find(|i| i.item.id == id) {
+                    ui.label(
+                        RichText::new(format!("再按一次 Delete 删除「{}」", it.item.title))
+                            .size(12.0)
+                            .color(Color32::from_rgb(255, 140, 120)),
+                    );
+                }
+            }
+        });
+        ui.separator();
+
+        // --- rows ---
+        let mut clicked: Option<usize> = None;
+        let mut double: Option<usize> = None;
+        let mut menu_action: Option<MenuAction> = None;
+        let armed = self.pending_delete.clone();
+        let selected = self.selected;
+        let mut new_selected = selected;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for row in 0..self.results.len() {
+                    let sc = &self.results[row];
+                    let indexed = &self.items[sc.idx];
+                    let item = &indexed.item;
+                    let is_armed = armed.as_deref() == Some(item.id.as_str());
+                    let is_selected = row == selected;
+                    let bg = if is_armed {
+                        Color32::from_rgba_unmultiplied(200, 60, 50, 60)
+                    } else if is_selected {
+                        Color32::from_white_alpha(18)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    let (emoji, category) = match item.default_action() {
+                        Some(a) => (a.effect.icon(), a.effect.label()),
+                        None => ("•", "条目"),
+                    };
+                    let keyword = item.keywords.first().cloned().unwrap_or_default();
+                    let detail = item
+                        .default_action()
+                        .and_then(action_command)
+                        .map(|c| truncate_chars(c, 70))
+                        .unwrap_or_default();
+                    let launches = launch_label(indexed.launches).unwrap_or_else(|| "未启动".into());
+
+                    let frame = egui::Frame::new()
+                        .fill(bg)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 5));
+                    let inner = frame.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(emoji).size(14.0));
+                            // keyword, the column AltRun put first
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    RichText::new(truncate_chars(&keyword, 12))
+                                        .size(13.0)
+                                        .color(Color32::from_rgb(255, 190, 80)),
+                                )
+                                .truncate(),
+                            );
+                            ui.add_sized(
+                                [170.0, 18.0],
+                                egui::Label::new(RichText::new(truncate_chars(&item.title, 18)).size(13.0))
+                                    .truncate(),
+                            );
+                            ui.label(
+                                RichText::new(format!("{category} · {detail}"))
+                                    .size(11.0)
+                                    .color(Color32::from_gray(140)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(launches)
+                                        .size(11.0)
+                                        .color(Color32::from_gray(120)),
+                                );
+                            });
+                        });
+                    });
+                    let rect = inner.response.rect;
+                    let resp = ui.interact(
+                        rect,
+                        ui.id().with(("manage-row", row)),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() {
+                        new_selected = row;
+                    }
+                    if resp.clicked() {
+                        clicked = Some(row);
+                    }
+                    if resp.double_clicked() {
+                        double = Some(row);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("编辑 (F2)").clicked() {
+                            menu_action = Some(MenuAction::Edit);
+                            ui.close();
+                        }
+                        if ui.button("删除 (Delete)").clicked() {
+                            menu_action = Some(MenuAction::Delete);
+                            ui.close();
+                        }
+                        if ui.button("打开所在目录 (Ctrl+D)").clicked() {
+                            menu_action = Some(MenuAction::Reveal);
+                            ui.close();
+                        }
+                    });
+                }
+            });
+
+        if new_selected != selected {
+            self.selected = new_selected;
+        }
+        if let Some(row) = clicked {
+            self.selected = row;
+        }
+        if let Some(row) = double {
+            // AltRun: double-click edits (there is no "run" in the manager).
+            self.selected = row;
+            self.open_edit();
+        }
+        if let Some(action) = menu_action {
+            match action {
+                MenuAction::Edit => self.open_edit(),
+                MenuAction::Delete => {
+                    let ctx = ui.ctx().clone();
+                    self.request_delete(&ctx);
+                }
+                MenuAction::Reveal => self.reveal_selected(),
+            }
+        }
+
+        if self.results.is_empty() {
+            ui.label(
+                RichText::new("没有匹配的条目")
+                    .size(13.0)
+                    .color(Color32::from_gray(130)),
+            );
+        }
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.label(
+                RichText::new(&self.status)
+                    .size(11.0)
+                    .color(Color32::from_gray(110)),
+            );
+        });
+    }
+
+    /// The first-run question: MxRun has never been registered on this machine.
     /// A card rather than a system dialog: it uses the app's own language, and
     /// Esc ("不用了") is as easy to reach as Enter.
     fn render_integration_ask(&mut self, ui: &mut egui::Ui) {

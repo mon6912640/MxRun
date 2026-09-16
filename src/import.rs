@@ -68,6 +68,8 @@ pub struct Report {
     pub skipped_separator: usize,
     pub skipped_unwanted: usize,
     pub skipped_unsupported: usize,
+    /// Rows whose source the user had deleted: tombstones keep them out.
+    pub skipped_deleted: usize,
     pub needs_input: usize,
     pub builtin: usize,
     /// Demo items removed because real data replaced them.
@@ -95,6 +97,9 @@ impl Report {
         ));
         if self.skipped_unsupported > 0 {
             s.push_str(&format!("、暂不支持 {} 条", self.skipped_unsupported));
+        }
+        if self.skipped_deleted > 0 {
+            s.push_str(&format!("\n· 你在 MxRun 里删过的 {} 条没有再加回来", self.skipped_deleted));
         }
         if self.removed_seed > 0 {
             s.push_str(&format!(
@@ -402,8 +407,15 @@ pub fn import_file(
                 ) {
                     report.builtin += 1;
                 }
-                store.upsert_from_source(*item)?;
-                report.imported += 1;
+                // `None` = the user deleted this source earlier; a tombstone
+                // keeps it from walking back in (see `Store::delete_item`).
+                match store.upsert_from_source(*item)? {
+                    Some(_) => report.imported += 1,
+                    None => {
+                        report.skipped_deleted += 1;
+                        report.notes.push(format!("跳过你删过的条目：{}", row.name));
+                    }
+                }
             }
             Decision::Separator => report.skipped_separator += 1,
             Decision::Unwanted(what) => {
@@ -434,6 +446,10 @@ pub fn import_file(
 const DEMO_PROVIDERS: &[&str] = &["seed", "legacy"];
 
 /// Delete the demo items. Returns how many were removed.
+///
+/// No tombstone: these were never the user's own entries, so there is nothing
+/// to remember — and marking them gone would stop a fresh database from ever
+/// getting its demo rows back.
 fn remove_seed_items(store: &mut Store) -> Result<usize, Box<dyn std::error::Error>> {
     let ids: Vec<String> = store
         .load_items()?
@@ -442,7 +458,7 @@ fn remove_seed_items(store: &mut Store) -> Result<usize, Box<dyn std::error::Err
         .map(|i| i.id)
         .collect();
     for id in &ids {
-        store.delete_item(id)?;
+        store.delete_item_by_id(id)?;
     }
     Ok(ids.len())
 }
@@ -685,6 +701,58 @@ mod tests {
         let items = store.load_items().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].source.provider, "shortcutlist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row the user deleted in MxRun must not walk back in on the next
+    /// import — it is counted separately so the summary can say so.
+    #[test]
+    fn deleted_rows_are_not_resurrected_by_an_import() {
+        let dir = std::env::temp_dir().join(format!(
+            "mxrun-imp-tombstone-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open_at(dir.clone()).unwrap();
+
+        let file = dir.join("list.txt");
+        std::fs::write(
+            &file,
+            "F12      |URL_Query           |b                             |百度 搜索引擎                 |http://www.baidu.com/s?wd=\n\
+             F5       |No_Encoding         |npp                           |Notepad--                     |C:\\Tools\\npp.exe\n",
+        )
+        .unwrap();
+
+        let first = import_file(&mut store, &file, true).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.skipped_deleted, 0);
+
+        // The user throws one of them away…
+        let victim = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.title.contains("Notepad"))
+            .expect("imported");
+        store.delete_item(&victim).unwrap();
+
+        // …and re-importing the same file leaves it deleted.
+        let second = import_file(&mut store, &file, true).unwrap();
+        assert_eq!(second.imported, 1, "only the other one is imported");
+        assert_eq!(second.skipped_deleted, 1);
+        assert!(
+            store.load_items().unwrap().iter().all(|i| i.title != victim.title),
+            "the deleted row stayed deleted"
+        );
+        assert!(
+            second.notes.iter().any(|n| n.contains("删过")),
+            "the summary mentions it: {:?}",
+            second.notes
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
