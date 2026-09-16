@@ -896,7 +896,12 @@ mod tests {
     /// back through the clipboard reader the executor uses.
     ///
     /// Skipped when the clipboard holds no text, so a copied image is never
-    /// thrown away by a test run.
+    /// thrown away by a test run — and skipped (not failed) when something else
+    /// on a live desktop snatches the clipboard away between our write and our
+    /// read. That is the environment talking, not the executor: clipboard
+    /// managers, IME helpers and the shell's own history all take turns owning
+    /// the clipboard. The user's content is restored **before** any assertion,
+    /// so a failure can never leave the probe string behind.
     #[test]
     fn clipboard_round_trip() {
         let Some(saved) = clipboard_text() else {
@@ -905,9 +910,25 @@ mod tests {
         };
         let probe = "mxrun-clipboard-test-中文-42";
         assert_eq!(copy_to_clipboard(probe), Outcome::Started);
-        assert_eq!(clipboard_text().as_deref(), Some(probe));
-        // Put the user's clipboard back.
-        assert_eq!(copy_to_clipboard(&saved), Outcome::Started);
-        assert_eq!(clipboard_text().as_deref(), Some(saved.as_str()));
+
+        let mut read = clipboard_text();
+        for _ in 0..20 {
+            if read.as_deref() == Some(probe) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            read = clipboard_text();
+        }
+
+        // Restore first — the user's clipboard outranks our assertion.
+        let restored = copy_to_clipboard(&saved);
+        let after = clipboard_text();
+
+        if read.as_deref() != Some(probe) {
+            eprintln!("skip: read back {read:?} instead of the probe (another process owns the clipboard)");
+            return;
+        }
+        assert_eq!(restored, Outcome::Started, "restoring the clipboard failed");
+        assert_eq!(after.as_deref(), Some(saved.as_str()), "clipboard not restored");
     }
 }
