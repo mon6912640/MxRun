@@ -16,6 +16,7 @@
 //! `Arc<AtomicBool>` to request the settings view) and calls
 //! `request_repaint` to wake the UI.
 
+mod discover;
 mod exec;
 mod import;
 mod integrate;
@@ -65,8 +66,10 @@ const MANAGER_SIZE: [f32; 2] = [880.0, 560.0];
 /// Paths this instance was started with (before eframe owns the process).
 static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-/// How much of the best score a row needs to stay on screen.
-///
+/// Config key for the auto-discovery switch (absent = on).
+const DISCOVERY_KEY: &str = "discovery";
+
+/// How much of the best score a row needs to stay on screen.///
 /// With a realistic list a short query fuzzy-matches almost everything, because
 /// nucleo happily finds subsequences inside the pinyin expansion ("dos" matches
 /// "Win**d**ows" → d-o-s). The real hit still wins by an order of magnitude, so
@@ -1385,6 +1388,25 @@ enum MenuAction {
     Reveal,
 }
 
+/// The manager's "where did this come from" filter. Auto-discovered items are
+/// the ones worth reviewing in bulk, so they get their own switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFilter {
+    /// Hand-made, imported, and the demo rows.
+    Curated,
+    /// Found by the Start Menu scan.
+    Discovered,
+}
+
+impl SourceFilter {
+    fn matches(self, provider: &str) -> bool {
+        match self {
+            SourceFilter::Discovered => provider == discover::PROVIDER,
+            SourceFilter::Curated => provider != discover::PROVIDER,
+        }
+    }
+}
+
 /// A short note that shows itself for a couple of seconds and then takes the
 /// window away with it.
 ///
@@ -1398,6 +1420,15 @@ struct Toast {
     until: std::time::Instant,
     title: String,
     body: String,
+}
+
+/// Where the last discovery run ended up, shared with the UI thread.
+#[derive(Default)]
+struct DiscoveryState {
+    /// `None` until a scan finishes.
+    output: Option<discover::ScanOutput>,
+    /// Set while a scan is running, so a second one is not started.
+    running: bool,
 }
 
 struct MxRunApp {
@@ -1441,6 +1472,14 @@ struct MxRunApp {
     open_manage: Arc<AtomicBool>,
     /// Id armed by the first `Delete` — the confirmation, without a modal.
     pending_delete: Option<String>,
+    /// Manager filter: `None` = everything, otherwise one side of the list.
+    manage_source: Option<SourceFilter>,
+    /// Auto-discovery (P0-4): shared with the scan thread.
+    discovery: Arc<Mutex<DiscoveryState>>,
+    /// Scan once the first frame is on screen; cleared afterwards.
+    discovery_pending: Option<bool>, // Some(force)
+    /// Last discovery outcome, for the settings page.
+    discovery_note: String,
     /// This process was started *by* an add request (right-click → 发送到 while
     /// nothing was running). Only then does the "MxRun is now resident" note
     /// make sense.
@@ -1667,6 +1706,14 @@ impl MxRunApp {
             manage: false,
             open_manage,
             pending_delete: None,
+            manage_source: None,
+            discovery: Arc::new(Mutex::new(DiscoveryState::default())),
+            // Auto-discovery is on by default (user's call, 2026-09-17); a
+            // stored "0" turns it off. The first scan is deferred to the first
+            // frame so it can never sit in front of startup.
+            discovery_pending: (store.get_config(DISCOVERY_KEY).as_deref() != Some("0"))
+                .then_some(false),
+            discovery_note: String::new(),
             cold_start_add: false,
             add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
@@ -1699,11 +1746,25 @@ impl MxRunApp {
             }
         }
 
+        // Debug hook: force a discovery scan at startup regardless of the cache
+        // (`MXRUN_SELFTEST_DISCOVER=force`), so the "deleted items stay deleted"
+        // rule can be verified without clicking 现在扫一次.
+        if let Ok(mode) = std::env::var("MXRUN_SELFTEST_DISCOVER") {
+            app.discovery_pending = Some(mode == "force");
+        }
+
         // Debug hook: drive the manager and the delete flow without a keyboard
         // (`MXRUN_SELFTEST_MANAGE=1` opens it, `MXRUN_SELFTEST_DELETE=1` then
         // deletes the selected row — twice, the way the confirmation works).
         // **It really deletes**, so only ever point it at a scratch profile.
         if std::env::var("MXRUN_SELFTEST_MANAGE").is_ok() {
+            // `MXRUN_SELFTEST_SOURCE=discovered|curated` narrows the manager
+            // first, so a scripted delete can target an auto-discovered row.
+            match std::env::var("MXRUN_SELFTEST_SOURCE").as_deref() {
+                Ok("discovered") => app.manage_source = Some(SourceFilter::Discovered),
+                Ok("curated") => app.manage_source = Some(SourceFilter::Curated),
+                _ => {}
+            }
             app.enter_manage();
             log_line(&format!(
                 "selftest: manage rows={} items={}",
@@ -1972,11 +2033,15 @@ impl MxRunApp {
         self.calc_result = None;
         let query = self.input.trim();
         let manage = self.manage;
+        let filter = self.manage_source;
         if query.is_empty() && manage {
             // Manager, no filter: every item there is, most used first — the
             // ones that were never launched pile up at the bottom, which is
             // exactly what you go looking for when tidying up.
             for (idx, it) in self.items.iter().enumerate() {
+                if filter.is_some_and(|f| !f.matches(&it.item.source.provider)) {
+                    continue;
+                }
                 self.results.push(Scored {
                     idx,
                     score: it.launches as f64,
@@ -1997,6 +2062,9 @@ impl MxRunApp {
             let mut buf: Vec<char> = Vec::new();
             let mut idx_buf: Vec<u32> = Vec::new();
             for (idx, it) in self.items.iter().enumerate() {
+                if filter.is_some_and(|f| !f.matches(&it.item.source.provider)) {
+                    continue;
+                }
                 if let Some(sc) = rank_item(
                     idx,
                     it,
@@ -2629,6 +2697,70 @@ impl MxRunApp {
         false
     }
 
+    /// Start the auto-discovery scan on a background thread, if one is due.
+    ///
+    /// Deliberately called from the first `ui()` frame: the scan costs ~300 ms
+    /// of COM work on the first run, and the cold-start budget is 255 ms — it
+    /// must never be in front of the window. The thread owns its own `Store`
+    /// handle (redb allows one writer at a time, so it only writes at the very
+    /// end, in a single transaction).
+    fn spawn_discovery(
+        &mut self,
+        force: bool,
+        input: discover::ScanInput,
+        state: Arc<Mutex<DiscoveryState>>,
+    ) {
+        {
+            let mut guard = match state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if guard.running {
+                return;
+            }
+            guard.running = true;
+        }
+        log_line(&format!("discover: scan started (force={force})"));
+        std::thread::spawn(move || {
+            // Filesystem + COM only (see `discover::ScanInput`): the database
+            // belongs to the UI thread.
+            let output = discover::collect(&input, force);
+            let mut guard = match state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.running = false;
+            guard.output = Some(output);
+        });
+    }
+
+    /// Pick up a finished scan: write what it found (this thread owns the
+    /// store), rebuild the index and say so in the status line.
+    ///
+    /// No toast on purpose: a scan can finish at any moment, and stealing the
+    /// window while somebody is typing would be worse than a sentence they read
+    /// the next time they look.
+    fn receive_discovery(&mut self, ctx: &egui::Context) {
+        let output = {
+            let mut guard = match self.discovery.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.output.take()
+        };
+        let Some(output) = output else {
+            return;
+        };
+        let report = discover::apply(&mut self.store, output);
+        log_line(&format!("discover: {}", report.summary()));
+        self.discovery_note = report.human();
+        if report.added > 0 {
+            self.rebuild_index(ctx);
+            self.refresh_search();
+            self.status = format!("{} · 可在设置里关闭，或在快捷项管理里清理", self.discovery_note);
+        }
+    }
+
     /// Get rid of the note and the window together.
     fn dismiss_toast(&mut self, ctx: &egui::Context) {
         if self.toast.take().is_some() {
@@ -2817,6 +2949,11 @@ impl MxRunApp {
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);
+        self.render_discovery_settings(ui);
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
         self.render_integration(ui);
 
         ui.add_space(16.0);
@@ -2826,6 +2963,60 @@ impl MxRunApp {
             self.pending_hotkey = None;
             self.reset_status();
         }
+    }
+
+    /// Auto-discovery (P0-4) in the settings page.
+    fn render_discovery_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("自动发现").size(15.0));
+        ui.add_space(6.0);
+
+        let mut on = self.discovery_pending.is_some()
+            || self.store.get_config(DISCOVERY_KEY).as_deref() != Some("0");
+        let running = self
+            .discovery
+            .lock()
+            .map(|g| g.running)
+            .unwrap_or(false);
+
+        if ui
+            .checkbox(&mut on, RichText::new("自动扫描开始菜单（新装的软件自动进列表）").size(13.0))
+            .changed()
+        {
+            self.store.set_config(DISCOVERY_KEY, if on { "1" } else { "0" });
+            self.discovery_pending = on.then_some(false);
+            self.status = if on {
+                "已开启自动发现，稍后会扫一次".into()
+            } else {
+                "已关闭自动发现（已发现的条目仍留在列表里）".to_string()
+            };
+            log_line(&format!("discover: switched {on}"));
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("现在扫一次").clicked() {
+                self.discovery_pending = Some(true);
+                self.status = "正在扫描开始菜单…".into();
+            }
+            if running {
+                ui.label(RichText::new("扫描中…").size(12.0).color(Color32::from_gray(150)));
+            }
+        });
+
+        let note = if self.discovery_note.is_empty() {
+            "还没扫过。扫描在后台进行，不影响呼出和搜索速度。".to_string()
+        } else {
+            self.discovery_note.clone()
+        };
+        ui.label(RichText::new(note).size(12.0).color(Color32::from_gray(140)));
+        ui.label(
+            RichText::new(
+                "只扫开始菜单里的程序（跳过卸载程序、帮助文档和网页快捷方式），\
+                 按真实程序路径去重——你自己手工加过的条目不会被覆盖。\
+                 不想要的可以在「快捷项管理」里删掉，删过的不会再被扫回来。",
+            )
+            .size(12.0)
+            .color(Color32::from_gray(140)),
+        );
     }
 
     /// The two ways to get things *into* MxRun from Explorer.
@@ -2963,6 +3154,20 @@ impl eframe::App for MxRunApp {
         // Paths handed over by another process (right-click → 发送到, shell menu,
         // or a second launch with a path).
         self.receive_pending_adds(&ctx);
+
+        // A finished auto-discovery scan changed the list.
+        self.receive_discovery(&ctx);
+
+        // Auto-discovery starts once the window is actually up (see
+        // `spawn_discovery`): never in front of the first frame.
+        if self.first_frame_logged
+            && let Some(force) = self.discovery_pending.take()
+        {
+            // The snapshot the worker needs is read here, on the thread that
+            // owns the store: one load_items plus one range query.
+            let input = discover::read_input(&mut self.store);
+            self.spawn_discovery(force, input, self.discovery.clone());
+        }
 
         // The card is a different-sized window; keep it in step with the mode.
         self.apply_window_size(&ctx);
@@ -3436,6 +3641,27 @@ impl MxRunApp {
                     .size(12.0)
                     .color(Color32::from_gray(150)),
             );
+            ui.add_space(10.0);
+            // Which half of the list to look at. Auto-discovered entries are
+            // the ones worth reviewing in bulk, so they get their own switch.
+            let mut picked = self.manage_source;
+            for (label, value) in [
+                ("全部", None),
+                ("手工 / 导入", Some(SourceFilter::Curated)),
+                ("自动发现", Some(SourceFilter::Discovered)),
+            ] {
+                if ui
+                    .selectable_label(self.manage_source == value, RichText::new(label).size(12.0))
+                    .clicked()
+                {
+                    picked = value;
+                }
+            }
+            if picked != self.manage_source {
+                self.manage_source = picked;
+                self.selected = 0;
+                self.refresh_search();
+            }
             if let Some(id) = self.pending_delete.clone() {
                 if let Some(it) = self.items.iter().find(|i| i.item.id == id) {
                     ui.label(

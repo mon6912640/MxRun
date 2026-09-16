@@ -294,7 +294,7 @@ pub enum InsertMode {
 }
 
 /// Axis 2: provenance. Makes imports idempotent and keeps sources apart.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[serde(default)]
 pub struct Source {
     /// "seed" | "legacy" | "manual" | "shortcutlist" | "startmenu" | "everything" | ...
@@ -375,8 +375,11 @@ fn param_key(item_id: &str, value: &str) -> String {
     format!("param:{item_id}:{value}")
 }
 
-/// Meta key remembering that the user deleted a source.
-///
+/// Prefix of the discovery scan cache (`scan:<shortcut path>`), so the whole
+/// thing can be read back in one range query.
+const SCAN_PREFIX: &str = "scan:";
+
+/// Meta key remembering that the user deleted a source.///
 /// Keyed by `(provider, external_id)` rather than by id, because that is what
 /// an import can recognise — the id it would have used is gone with the row.
 fn gone_key(provider: &str, external_id: &str) -> String {
@@ -724,9 +727,110 @@ impl Store {
 
     // ----- tombstones ---------------------------------------------------
 
+    /// A raw meta value. The discovery scan reads its cache in bulk instead
+    /// (`scan_cache`), so this is only used for one-off lookups.
+    #[allow(dead_code)]
+    pub fn meta(&self, key: &str) -> Option<String> {
+        self.read_meta(key)
+    }
+
+    #[allow(dead_code)]
+    pub fn set_meta(&self, key: &str, value: &str) {
+        self.write_meta(key, value);
+    }
+
+    /// Every `scan:` entry in one read transaction.
+    ///
+    /// The discovery cache is read wholesale: one transaction for ~200 keys,
+    /// instead of one per key (which would be ~200 file-level reads on the UI
+    /// thread while a frame is being drawn).
+    pub fn scan_cache(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut scan = || -> Option<()> {
+            let tx = self.db.begin_read().ok()?;
+            let table = tx.open_table(META).ok()?;
+            for row in table.range(SCAN_PREFIX..).ok()? {
+                let (k, v) = row.ok()?;
+                let key = k.value();
+                if !key.starts_with(SCAN_PREFIX) {
+                    break;
+                }
+                out.insert(key.to_string(), v.value().to_string());
+            }
+            Some(())
+        };
+        let _ = scan();
+        out
+    }
+
+    /// Write many meta values in one transaction (the scan cache again).
+    pub fn set_meta_many(&self, pairs: &[(String, String)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        if let Ok(tx) = self.db.begin_write() {
+            {
+                if let Ok(mut table) = tx.open_table(META) {
+                    for (key, value) in pairs {
+                        let _ = table.insert(key.as_str(), value.as_str());
+                    }
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    /// Add items that came from a scan, in **one** transaction.
+    ///
+    /// Unlike [`Store::upsert_from_source`] this never touches an item that is
+    /// already there: the user may have renamed it, changed its keyword, or
+    /// edited its command line, and a periodic scan must not undo that.
+    ///
+    /// Returns `(inserted, existing, tombstoned)`.
+    pub fn insert_scanned(
+        &mut self,
+        items: Vec<Item>,
+    ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+        let known: std::collections::HashSet<Source> = self
+            .load_items()?
+            .into_iter()
+            .map(|i| i.source)
+            .collect();
+
+        let mut fresh: Vec<Item> = Vec::new();
+        let (mut existing, mut tombstoned) = (0usize, 0usize);
+        for mut item in items {
+            if self.is_deleted(&item.source.provider, &item.source.external_id) {
+                tombstoned += 1;
+                continue;
+            }
+            if known.contains(&item.source) {
+                existing += 1;
+                continue;
+            }
+            if item.id.is_empty() {
+                item.id = format!("{}:{}", item.source.provider, item.source.external_id);
+            }
+            fresh.push(item);
+        }
+        if fresh.is_empty() {
+            return Ok((0, existing, tombstoned));
+        }
+
+        let inserted = fresh.len();
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(COMMANDS)?;
+            for item in &fresh {
+                table.insert(item.id.as_str(), serde_json::to_string(item)?.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok((inserted, existing, tombstoned))
+    }
+
     /// Was this source deleted by the user? Imports ask before re-adding.
-    pub fn is_deleted(&self, provider: &str, external_id: &str) -> bool {
-        if provider.is_empty() || external_id.is_empty() {
+    pub fn is_deleted(&self, provider: &str, external_id: &str) -> bool {        if provider.is_empty() || external_id.is_empty() {
             return false;
         }
         self.read_meta(&gone_key(provider, external_id)).is_some()
