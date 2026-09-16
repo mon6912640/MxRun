@@ -18,6 +18,8 @@
 
 mod exec;
 mod import;
+mod integrate;
+mod ipc;
 mod store;
 
 use eframe::egui;
@@ -33,7 +35,7 @@ use nucleo_matcher::{
 use pinyin::ToPinyin;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -45,6 +47,20 @@ use tray_icon::{
 
 const MAX_ROWS: usize = 8;
 const DEFAULT_HOTKEY: &str = "Alt+F1";
+
+/// The launcher's own size, and the size of the small add/edit card.
+///
+/// AltRun showed the add dialog as a separate little window and deliberately
+/// kept the launcher itself off screen (`docs/AltRun交互规格.md` §11). MxRun
+/// uses the same window reshaped instead of a second one: same "a small box
+/// appears, you confirm, it goes away" experience, without a second window to
+/// keep in sync (focus, z-order, backdrop, and `main_hwnd` all stay as they
+/// are). Documented as a deliberate deviation.
+const LAUNCHER_SIZE: [f32; 2] = [680.0, 400.0];
+const ADD_SIZE: [f32; 2] = [540.0, 300.0];
+
+/// Paths this instance was started with (before eframe owns the process).
+static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// How much of the best score a row needs to stay on screen.
 ///
@@ -200,25 +216,124 @@ fn run_import(cli: import::CliImport) {
     }
 }
 
+/// Install or remove the two Explorer entry points from the command line.
+///
+/// The same operations are buttons in the settings page; having them as
+/// switches too means a portable copy can register itself, and it is the only
+/// way to verify the registry/shortcut work without clicking.
+fn run_integration(install: bool) -> bool {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed = false;
+
+    let sendto = if install {
+        integrate::install_sendto().map(|p| format!("已加入「发送到」：{}", p.display()))
+    } else {
+        integrate::uninstall_sendto().map(|()| "已从「发送到」移除".to_string())
+    };
+    match sendto {
+        Ok(msg) => lines.push(msg),
+        Err(e) => {
+            lines.push(format!("发送到：{e}"));
+            failed = true;
+        }
+    }
+
+    let menu = if install {
+        integrate::install_shell_menu().map(|n| format!("已注册 {n} 处右键菜单（文件 / 目录 / 目录空白处）"))
+    } else {
+        integrate::uninstall_shell_menu().map(|()| "已移除右键菜单".to_string())
+    };
+    match menu {
+        Ok(msg) => lines.push(msg),
+        Err(e) => {
+            lines.push(format!("右键菜单：{e}"));
+            failed = true;
+        }
+    }
+
+    for line in &lines {
+        log_line(&format!("integration: {line}"));
+    }
+    message_box(
+        &format!(
+            "{}\n\n之后：右键一个文件/文件夹 → 发送到 → MxRun（或右键菜单）。\n\
+             MxRun 只会弹出一个小确认框，主窗口不会出现。",
+            lines.join("\n")
+        ),
+        if install { "MxRun 右键集成" } else { "MxRun 移除右键集成" },
+        failed,
+    );
+    true
+}
+
 fn main() -> eframe::Result<()> {
     // Anchor the clock the wake probe and the icon timings both read.
     PROC_START.get_or_init(std::time::Instant::now);
-    if !acquire_single_instance() {
-        log_line("startup: another instance is already running, exiting");
-        message_box(
-            "MxRun 已经在运行。\n\n请到系统托盘找到它（双击图标呼出），或按你自己设置的呼出快捷键。",
-            "MxRun",
-            false,
-        );
-        return Ok(());
-    }
 
-    // Import mode runs headless: no window, a summary dialog, everything also
-    // written to mxrun.log (a GUI-subsystem binary has no console to print to).
-    if let Some(cli) = import::parse_args(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Import mode runs headless and is checked *before* the single-instance
+    // guard on purpose: it is a maintenance command, and answering "MxRun is
+    // already running" to `--import` would be useless. redb's own file lock
+    // already prevents two writers, and the failure is reported in the dialog.
+    if let Some(cli) = import::parse_args(args.iter().cloned()) {
         run_import(cli);
         return Ok(());
     }
+
+    if args.iter().any(|a| a == "--install-integration") {
+        run_integration(true);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--uninstall-integration") {
+        run_integration(false);
+        return Ok(());
+    }
+
+    // Anything else on the command line is a path the user pointed at us:
+    // "发送到 → MxRun", the shell context menu, or a drop on the exe.
+    let paths: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|a| a.trim().trim_matches('"').to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+
+    if !acquire_single_instance() {
+        // Someone else is already running: hand the paths over and leave.
+        // No dialog — "不打扰" is the whole point of this interaction
+        // (docs/AltRun交互规格.md §11), and AltRun's own "already running"
+        // message box was the thing users had to click away.
+        match ipc::send(&paths) {
+            Ok(file) => log_line(&format!(
+                "handoff: sent {} path(s) to the running instance ({})",
+                paths.len(),
+                file.display()
+            )),
+            Err(e) => {
+                log_line(&format!("handoff: failed: {e}"));
+                message_box(
+                    &format!("MxRun 已经在运行，但无法把路径交给它：{e}"),
+                    "MxRun",
+                    true,
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // First instance with paths: start straight in the add dialog. The viewport
+    // is created at the dialog's size so the small card never flashes at
+    // launcher size first.
+    let start_with_paths = !paths.is_empty();
+    if start_with_paths {
+        let _ = PENDING_PATHS.set(paths);
+    }
+    let start_size = if start_with_paths {
+        ADD_SIZE
+    } else {
+        LAUNCHER_SIZE
+    };
 
     // Pay the one-off shell-imaging initialisation (~145 ms, measured) while
     // eframe is still creating its window and GL context. Our own code does not
@@ -251,7 +366,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
-            .with_inner_size([680.0, 400.0])
+            .with_inner_size(start_size)
             .with_min_inner_size([480.0, 200.0]),
         ..Default::default()
     };
@@ -468,11 +583,26 @@ fn main_hwnd() -> Option<HWND> {
 }
 
 fn show_window(ctx: &egui::Context) {
+    show_window_sized(ctx, None);
+}
+
+/// Show the window, optionally at a given size.
+///
+/// The size matters for the hand-off path: the add card must be small from its
+/// very first frame. The window's own size is otherwise owned by the app (see
+/// `MxRunApp::apply_window_size`), which is why `None` keeps it untouched.
+fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
     // Snapshot the window the user is in *before* we take focus: the
     // window-control actions (and {%wd}/{%wt}/{%wc}) refer to that window, not
     // to MxRun itself. AltRun captured the same values at hotkey-press time
     // (docs/AltRun交互规格.md §4).
-    exec::remember_foreground();
+    //
+    // Not for the add hand-off: there the user is in Explorer, and clobbering
+    // the snapshot would make "恢复窗口" bring back Explorer instead of the app
+    // they were actually working in.
+    if size.is_none() {
+        exec::remember_foreground();
+    }
     WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     match main_hwnd() {
         Some(hwnd) => unsafe {
@@ -481,16 +611,24 @@ fn show_window(ctx: &egui::Context) {
             let sh = GetSystemMetrics(SM_CYSCREEN);
             let mut rect = std::mem::zeroed();
             let _ = GetWindowRect(hwnd, &mut rect);
-            let ww = rect.right - rect.left;
-            let wh = rect.bottom - rect.top;
+            let current = [
+                (rect.right - rect.left) as f32,
+                (rect.bottom - rect.top) as f32,
+            ];
+            let [ww, wh] = size.unwrap_or(current);
+            let flags = if size.is_some() {
+                SWP_SHOWWINDOW
+            } else {
+                SWP_NOSIZE | SWP_SHOWWINDOW
+            };
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                (sw - ww) / 2,
-                (sh - wh) / 3,
-                0,
-                0,
-                SWP_NOSIZE | SWP_SHOWWINDOW,
+                (sw - ww as i32) / 2,
+                (sh - wh as i32) / 3,
+                ww as i32,
+                wh as i32,
+                flags,
             );
             let _ = SetForegroundWindow(hwnd);
         },
@@ -1109,6 +1247,125 @@ fn filter_history(history: &[(String, u32)], query: &str) -> Vec<usize> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Add / edit card (the way items get in)
+// ---------------------------------------------------------------------------
+
+/// Where the card came from — it decides what happens when it closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddOrigin {
+    /// Right-click / 发送到 / `MxRun.exe "<path>"`. The launcher was never on
+    /// screen, so confirming or cancelling leaves nothing behind (AltRun's
+    /// "不打扰", `docs/AltRun交互规格.md` §11).
+    External,
+    /// Opened from the launcher itself (F2): closing returns to the list.
+    Launcher,
+}
+
+/// The command line behind an action, when it has one. `None` for the effects
+/// that are not a command (builtin verbs, clipboard, reveal) — those cannot be
+/// meaningfully edited as text.
+fn action_command(action: &Action) -> Option<&str> {
+    match &action.effect {
+        Effect::Open { target } => Some(target),
+        Effect::Run { line } => Some(line),
+        _ => None,
+    }
+}
+
+/// The add / edit card: the same three fields AltRun's `frmShortCut`
+/// pre-filled (关键字 / 名称 / 命令行), in the same window instead of a second
+/// one.
+struct AddForm {
+    origin: AddOrigin,
+    /// The item being changed (F2). `None` = creating a new one.
+    editing: Option<Item>,
+    /// The path this came in as. Identity for re-adds: same file, same row.
+    source_path: String,
+    /// Paths still waiting behind this one (a multi-file right-click).
+    queue: Vec<String>,
+    keyword: String,
+    title: String,
+    command: String,
+    /// The first Enter on a colliding keyword only warns; the second replaces.
+    overwrite_asked: bool,
+    /// Why the last attempt was refused.
+    error: String,
+}
+
+impl AddForm {
+    /// A new item derived from a path (the right-click / 发送到 flow).
+    fn from_path(path: &str, queue: Vec<String>) -> Self {
+        let item = integrate::item_from_path(path);
+        let command = item
+            .default_action()
+            .and_then(action_command)
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            origin: AddOrigin::External,
+            editing: None,
+            source_path: path.to_string(),
+            queue,
+            keyword: item.keywords.first().cloned().unwrap_or(item.title.clone()),
+            title: item.title.clone(),
+            command,
+            overwrite_asked: false,
+            error: String::new(),
+        }
+    }
+
+    /// An empty card, seeded with the query that matched nothing — AltRun's
+    /// other way in ("无此项 "%s", 添加它?", `frmALTRun.pas:748-752`).
+    fn blank(seed: &str) -> Self {
+        Self {
+            origin: AddOrigin::Launcher,
+            editing: None,
+            source_path: String::new(),
+            queue: Vec::new(),
+            keyword: seed.to_string(),
+            title: seed.to_string(),
+            command: String::new(),
+            overwrite_asked: false,
+            error: String::new(),
+        }
+    }
+
+    /// The same card, filled in from an existing item (F2 编辑). `None` when the
+    /// item has no editable command line (builtin verb, clipboard copy…).
+    fn from_item(item: Item) -> Option<Self> {
+        let command = action_command(item.default_action()?)?.to_string();
+        Some(Self {
+            origin: AddOrigin::Launcher,
+            source_path: item.source.external_id.clone(),
+            keyword: item
+                .keywords
+                .first()
+                .cloned()
+                .unwrap_or_else(|| item.title.clone()),
+            title: item.title.clone(),
+            command,
+            editing: Some(item),
+            queue: Vec::new(),
+            overwrite_asked: false,
+            error: String::new(),
+        })
+    }
+
+    fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// "添加" or "保存", depending on what the card is doing.
+    fn confirm_label(&self) -> &'static str {
+        if self.is_editing() { "保存" } else { "添加" }
+    }
+
+    fn heading(&self) -> &'static str {
+        if self.is_editing() { "✎ 编辑条目" } else { "＋ 添加条目" }
+    }
+}
+
 struct MxRunApp {
     store: Store,
     items: Vec<Indexed>,
@@ -1134,6 +1391,14 @@ struct MxRunApp {
     // settings view
     view_settings: bool,
     open_settings: Arc<AtomicBool>,
+    /// Tray menu asked for a blank add card.
+    open_new: Arc<AtomicBool>,
+    /// Paths handed over by another process (fill → add dialog).
+    pending_adds: Arc<Mutex<Vec<String>>>,
+    /// Open add / edit card. Replaces the whole window content while it lives.
+    add: Option<AddForm>,
+    /// Window size the app last applied, so it only resizes on a mode change.
+    applied_size: [f32; 2],
     capturing_hotkey: bool,
     pending_hotkey: Option<String>,
     hotkey_str: String,
@@ -1191,9 +1456,11 @@ impl MxRunApp {
         // --- system tray ---
         let menu = Menu::new();
         let toggle_item = MenuItem::new("显示 / 隐藏  MxRun", true, None);
+        let new_item = MenuItem::new("新建条目…", true, None);
         let settings_item = MenuItem::new("设置", true, None);
         let quit_item = MenuItem::new("退出 MxRun", true, None);
         let _ = menu.append(&toggle_item);
+        let _ = menu.append(&new_item);
         let _ = menu.append(&settings_item);
         let _ = menu.append(&quit_item);
         let tray = TrayIconBuilder::new()
@@ -1203,47 +1470,83 @@ impl MxRunApp {
             .build()
             .map_err(|e| format!("无法创建托盘图标：{e}"))?;
 
-        // --- background event thread: hotkey + tray events ---
+        // --- background event thread: hotkey + tray events + the hand-off inbox ---
         // Must NOT live inside App::ui(): eframe sleeps while the window is
         // hidden, so ui() would stop running and the window could never be
-        // re-shown (the original "hidden = dead" bug).
+        // re-shown (the original "hidden = dead" bug). The inbox is polled here
+        // for the same reason — a request that arrives while the launcher is
+        // hidden has to be able to bring it back.
         let ctx2 = cc.egui_ctx.clone();
         let toggle_id = toggle_item.id().clone();
+        let new_id = new_item.id().clone();
         let settings_id = settings_item.id().clone();
         let quit_id = quit_item.id().clone();
         let open_settings = Arc::new(AtomicBool::new(false));
         let open_settings2 = open_settings.clone();
-        std::thread::spawn(move || loop {
-            let mut wake = false;
+        let open_new = Arc::new(AtomicBool::new(false));
+        let open_new2 = open_new.clone();
+        let pending_adds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_adds2 = pending_adds.clone();
+        std::thread::spawn(move || {
+            let mut tick: u32 = 0;
+            loop {
+                let mut wake = false;
 
-            for ev in GlobalHotKeyEvent::receiver().try_iter() {
-                if ev.state == HotKeyState::Pressed {
-                    toggle_window(&ctx2);
+                for ev in GlobalHotKeyEvent::receiver().try_iter() {
+                    if ev.state == HotKeyState::Pressed {
+                        toggle_window(&ctx2);
+                        wake = true;
+                    }
+                }
+                for ev in TrayIconEvent::receiver().try_iter() {
+                    if let TrayIconEvent::DoubleClick { .. } = ev {
+                        show_window(&ctx2);
+                        wake = true;
+                    }
+                }
+                for ev in MenuEvent::receiver().try_iter() {
+                    if ev.id == toggle_id {
+                        toggle_window(&ctx2);
+                    } else if ev.id == new_id {
+                        open_new2.store(true, Ordering::Relaxed);
+                        show_window_sized(&ctx2, Some(ADD_SIZE));
+                    } else if ev.id == settings_id {
+                        open_settings2.store(true, Ordering::Relaxed);
+                        show_window(&ctx2);
+                    } else if ev.id == quit_id {
+                        close_window();
+                    }
                     wake = true;
                 }
-            }
-            for ev in TrayIconEvent::receiver().try_iter() {
-                if let TrayIconEvent::DoubleClick { .. } = ev {
-                    show_window(&ctx2);
-                    wake = true;
-                }
-            }
-            for ev in MenuEvent::receiver().try_iter() {
-                if ev.id == toggle_id {
-                    toggle_window(&ctx2);
-                } else if ev.id == settings_id {
-                    open_settings2.store(true, Ordering::Relaxed);
-                    show_window(&ctx2);
-                } else if ev.id == quit_id {
-                    close_window();
-                }
-                wake = true;
-            }
 
-            if wake {
-                ctx2.request_repaint();
+                // Another process asked us to add paths (or just to wake up).
+                // Every other tick (100 ms) is plenty for a hand-off and keeps
+                // an idle launcher from hammering the filesystem.
+                tick = tick.wrapping_add(1);
+                if tick % 2 == 0 {
+                    for request in ipc::drain() {
+                        match request {
+                            ipc::Request::Add(paths) => {
+                                log_line(&format!("handoff: received {} path(s)", paths.len()));
+                                if let Ok(mut queue) = pending_adds2.lock() {
+                                    queue.extend(paths);
+                                }
+                                // Show at dialog size *before* the frame is
+                                // drawn: the card must never appear at launcher
+                                // size first and then jump.
+                                show_window_sized(&ctx2, Some(ADD_SIZE));
+                            }
+                            ipc::Request::Wake => show_window(&ctx2),
+                        }
+                        wake = true;
+                    }
+                }
+
+                if wake {
+                    ctx2.request_repaint();
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
         });
 
         let mut app = Self {
@@ -1269,6 +1572,10 @@ impl MxRunApp {
             shown_at: Some(std::time::Instant::now()),
             view_settings: false,
             open_settings,
+            open_new,
+            pending_adds,
+            add: None,
+            applied_size: LAUNCHER_SIZE,
             capturing_hotkey: false,
             pending_hotkey: None,
             status: String::new(),
@@ -1284,6 +1591,13 @@ impl MxRunApp {
         }
         app.rebuild_index(&cc.egui_ctx);
         app.refresh_search();
+
+        // Started with paths (right-click → 发送到, shell menu, or a drop on the
+        // exe): open the card before the first frame, so the window is *born*
+        // as the small card.
+        if let Some(paths) = PENDING_PATHS.get() {
+            app.open_add(paths.clone());
+        }
 
         // Queue the icons for the rows the first frame will draw, *before* that
         // frame exists. The first shell icon call costs ~200 ms (it initialises
@@ -1345,6 +1659,52 @@ impl MxRunApp {
                     app.finish_prompt(&ctx);
                     log_line(&format!("selftest: after parameter status={:?}", app.status));
                 }
+                // `MXRUN_SELFTEST_EDIT=1` drives the F2 path: open the card on
+                // the first row, change the command line, save. **It really
+                // edits the database**, so only ever point it at a scratch
+                // profile. Verifies the part the add path does not cover: the
+                // id survives (and with it the launch count).
+                if std::env::var("MXRUN_SELFTEST_EDIT").is_ok() {
+                    if let Some(sc) = app.results.first() {
+                        let before = app.items[sc.idx].item.clone();
+                        log_line(&format!(
+                            "selftest: editing {:?} (id={}, launches={})",
+                            before.title, before.id, app.items[sc.idx].launches
+                        ));
+                        app.open_edit();
+                        if let Some(form) = app.add.as_mut() {
+                            form.command = format!("{} --mxrun-selftest", form.command);
+                            log_line(&format!("selftest: card command={:?}", form.command));
+                        } else {
+                            log_line("selftest: card did not open (not an editable effect)");
+                        }
+                        for attempt in 1..=2 {
+                            app.confirm_add(&ctx);
+                            match app.add.as_ref() {
+                                Some(form) => {
+                                    log_line(&format!("selftest: card still open: {}", form.error))
+                                }
+                                None => break,
+                            }
+                            let _ = attempt;
+                        }
+                        let after = app
+                            .items
+                            .iter()
+                            .find(|i| i.item.id == before.id)
+                            .map(|i| i.item.clone());
+                        match after {
+                            Some(item) => log_line(&format!(
+                                "selftest: after edit id={} title={:?} command={:?}",
+                                item.id,
+                                item.title,
+                                action_command(item.default_action().unwrap_or(&item.actions[0]))
+                            )),
+                            None => log_line("selftest: edited item vanished"),
+                        }
+                        log_line(&format!("selftest: edit status={:?}", app.status));
+                    }
+                }
             }
         }
         Ok(app)
@@ -1352,7 +1712,7 @@ impl MxRunApp {
 
     fn reset_status(&mut self) {
         self.status = format!(
-            "{} 呼出 / 隐藏 · Enter/空格 执行 · Esc 清空或隐藏 · F2 设置",
+            "{} 呼出 / 隐藏 · Enter/空格 执行 · F2 编辑 · Esc 清空或隐藏（设置见托盘菜单）",
             self.hotkey_str
         );
     }
@@ -1612,8 +1972,301 @@ impl MxRunApp {
         }
     }
 
-    /// Keys while the parameter prompt is open.
+    // ---------- add / edit card ----------
+
+    /// Open the card for a batch of paths (right-click, 发送到, `MxRun.exe "…"`).
+    fn open_add(&mut self, mut paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        paths.retain(|p| !p.trim().is_empty());
+        if paths.is_empty() {
+            return;
+        }
+        let first = paths.remove(0);
+        log_line(&format!("add: open for {:?} (queue={})", first, paths.len()));
+        self.add = Some(AddForm::from_path(&first, paths));
+        self.want_focus = true;
+    }
+
+    /// Open the card on the selected item (F2).
+    fn open_edit(&mut self) {
+        let Some(sc) = self.results.get(self.selected) else {
+            return;
+        };
+        let item = self.items[sc.idx].item.clone();
+        match AddForm::from_item(item) {
+            Some(form) => {
+                log_line(&format!("edit: open for {:?}", form.title));
+                self.add = Some(form);
+            }
+            // Builtin verbs, clipboard copies and reveals have no command line
+            // to edit — say so instead of showing an empty box.
+            None => {
+                self.status = format!("「{}」是内建动作，暂时不能在界面里编辑", self.items[sc.idx].item.title);
+            }
+        }
+    }
+
+    /// Take over any paths another process handed us.
+    fn receive_pending_adds(&mut self, ctx: &egui::Context) {
+        let incoming: Vec<String> = match self.pending_adds.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => return,
+        };
+        if incoming.is_empty() {
+            return;
+        }
+        let opened = self.add.is_none();
+        match self.add.as_mut() {
+            // Already showing a card: queue behind it rather than losing them.
+            Some(form) => form.queue.extend(incoming),
+            None => self.open_add(incoming),
+        }
+        // Debug hook (`MXRUN_SELFTEST_ADD=1`): confirm the card without a
+        // keyboard. This is the only way to verify the whole right-click path
+        // (hand-off → card → database) from a script — keys cannot be delivered
+        // to the window (CLAUDE.md pitfall 3).
+        if opened && std::env::var("MXRUN_SELFTEST_ADD").is_ok() {
+            // Twice, because that is what a human does: the first Enter on a
+            // colliding keyword only warns, the second one replaces.
+            for attempt in 1..=2 {
+                log_line(&format!("selftest: confirming the add card (attempt {attempt})"));
+                self.confirm_add(ctx);
+                match self.add.as_ref() {
+                    Some(form) => log_line(&format!("selftest: card still open: {}", form.error)),
+                    None => break,
+                }
+            }
+            log_line(&format!("selftest: after add status={:?}", self.status));
+        }
+    }
+
+    /// Enter on the card: create the item, or save the edit.
+    fn confirm_add(&mut self, ctx: &egui::Context) {
+        // Snapshot the card first: deciding whether the keyword collides needs
+        // `&self`, and holding the `&mut self.add` borrow across that call is
+        // exactly the kind of aliasing Rust refuses (correctly).
+        let Some(form) = self.add.as_ref() else {
+            return;
+        };
+        let keyword = form.keyword.trim().to_string();
+        let mut title = form.title.trim().to_string();
+        let command = form.command.trim().to_string();
+        let editing = form.editing.clone();
+        let source_path = form.source_path.clone();
+        let overwrite_asked = form.overwrite_asked;
+
+        // AltRun refused an empty keyword or command line by silently turning
+        // the row into a blank separator; here it is simply refused
+        // (docs/AltRun交互规格.md §11, "两个坑别照抄" ①).
+        if keyword.is_empty() || command.is_empty() {
+            self.set_add_error("关键字和命令行都不能为空");
+            return;
+        }
+        if title.is_empty() {
+            title = keyword.clone();
+        }
+
+        // Colliding keyword: warn once, replace on the second Enter. AltRun
+        // asked with a modal; this is the same question without the modal.
+        let editing_id = editing.as_ref().map(|i| i.id.clone());
+        let clash = self.find_by_keyword(&keyword, editing_id.as_deref());
+        if let Some(other) = clash.clone() {
+            if !overwrite_asked {
+                self.set_add_error(&format!(
+                    "关键字「{keyword}」已被「{}」使用 —— 再按一次回车将覆盖它",
+                    other.title
+                ));
+                if let Some(form) = self.add.as_mut() {
+                    form.overwrite_asked = true;
+                }
+                return;
+            }
+        }
+
+        // What gets written: the edited item, the collided item, or a new one.
+        let Some(mut item) = editing
+            .clone()
+            .or_else(|| clash.clone())
+            .or_else(|| Some(integrate::item_from_path(&source_path)))
+        else {
+            return;
+        };
+        let verb = if editing.is_some() {
+            "updated"
+        } else if clash.is_some() {
+            "replaced"
+        } else {
+            "created"
+        };
+
+        item.title = title;
+        if item.keywords.is_empty() {
+            item.keywords.push(keyword.clone());
+        } else {
+            // Only the first trigger word is on the card; the rest (imported
+            // rows can carry several) are left alone.
+            item.keywords[0] = keyword.clone();
+        }
+        if let Some(action) = item.actions.first_mut() {
+            match &mut action.effect {
+                Effect::Open { target } => *target = command.clone(),
+                Effect::Run { line } => *line = command.clone(),
+                _ => {
+                    // Nothing to edit in a builtin verb: store the text as a
+                    // plain "open" action instead.
+                    action.effect = Effect::Open { target: command.clone() };
+                }
+            }
+        } else {
+            item.actions = vec![Action::open(&command)];
+        }
+
+        // `upsert_from_source` keeps the id (and with it the launch count) when
+        // the same source comes back; an edited row keeps its own id outright.
+        let saved = if item.source.external_id.is_empty() {
+            self.store.upsert_item(&item).map(|()| item.id.clone())
+        } else {
+            self.store.upsert_from_source(item)
+        };
+        match saved {
+            Ok(_) => {
+                log_line(&format!(
+                    "add: {verb} {keyword:?} -> {}",
+                    truncate_chars(&command, 120)
+                ));
+                self.status = match verb {
+                    "updated" => format!("已保存：{keyword}"),
+                    "replaced" => format!("已覆盖：{keyword}"),
+                    _ => format!("已添加：{keyword}"),
+                };
+                self.finish_add(ctx);
+            }
+            Err(e) => {
+                log_line(&format!("add: failed: {e}"));
+                self.set_add_error(&format!("保存失败：{e}"));
+            }
+        }
+    }
+
+    fn set_add_error(&mut self, message: &str) {
+        if let Some(form) = self.add.as_mut() {
+            form.error = message.to_string();
+        }
+    }
+
+    /// Leave the card: next queued path, or close according to where it came
+    /// from.
+    fn finish_add(&mut self, ctx: &egui::Context) {
+        let origin = self.add.as_ref().map(|f| f.origin);
+        // Multi-file right-click: the rest of the batch follows the same card.
+        if let Some(form) = self.add.as_mut() {
+            if !form.queue.is_empty() {
+                let next = form.queue.remove(0);
+                let rest = std::mem::take(&mut form.queue);
+                self.add = Some(AddForm::from_path(&next, rest));
+                self.want_focus = true;
+                return;
+            }
+        }
+        self.add = None;
+        // The list changed: rebuild so the new item is searchable right away
+        // (AltRun reloaded its list for the same reason).
+        self.rebuild_index(ctx);
+        self.refresh_search();
+        match origin {
+            Some(AddOrigin::External) => {
+                // Nothing stays on screen: the user was in Explorer, not here.
+                log_line("add: done, hiding");
+                self.apply_window_size(ctx);
+                hide_window(ctx);
+            }
+            Some(AddOrigin::Launcher) | None => {
+                self.apply_window_size(ctx);
+                self.want_focus = true;
+            }
+        }
+    }
+
+    fn cancel_add(&mut self, ctx: &egui::Context) {
+        let origin = self.add.as_ref().map(|f| f.origin);
+        let queued = self.add.as_ref().map(|f| f.queue.len()).unwrap_or(0);
+        log_line(&format!("add: cancelled (queued={queued})"));
+        self.add = None;
+        match origin {
+            Some(AddOrigin::External) => {
+                self.apply_window_size(ctx);
+                hide_window(ctx);
+            }
+            _ => {
+                self.apply_window_size(ctx);
+                self.want_focus = true;
+                self.reset_status();
+            }
+        }
+    }
+
+    /// The first item (other than `except_id`) that already answers to
+    /// `keyword`.
+    fn find_by_keyword(&self, keyword: &str, except_id: Option<&str>) -> Option<Item> {
+        let kw = keyword.to_lowercase();
+        self.items
+            .iter()
+            .find(|i| {
+                i.keywords_lower.iter().any(|k| *k == kw)
+                    && Some(i.item.id.as_str()) != except_id
+            })
+            .map(|i| i.item.clone())
+    }
+
+    /// Resize the window when the mode changes (launcher vs the small card).
+    /// The hand-off path sizes the window itself before showing it, so this is
+    /// usually a no-op — but it is what puts the launcher back to full size
+    /// after a right-click add.
+    fn apply_window_size(&mut self, ctx: &egui::Context) {
+        let want = if self.add.is_some() { ADD_SIZE } else { LAUNCHER_SIZE };
+        if want == self.applied_size {
+            return;
+        }
+        self.applied_size = want;
+        let Some(hwnd) = main_hwnd() else {
+            return;
+        };
+        unsafe {
+            let sw = GetSystemMetrics(SM_CXSCREEN);
+            let sh = GetSystemMetrics(SM_CYSCREEN);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                (sw - want[0] as i32) / 2,
+                (sh - want[1] as i32) / 3,
+                want[0] as i32,
+                want[1] as i32,
+                SWP_NOACTIVATE,
+            );
+        }
+        ctx.request_repaint();
+    }
+
+    /// Keys while the add / edit card is open.
     ///
+    /// Returns true when the card is done with this frame. Space is not
+    /// consumed (it is text here), and Tab/Shift+Tab are left to egui, which
+    /// already moves focus between the fields.
+    fn handle_add_keys(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.cancel_add(ctx);
+            return true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+            self.confirm_add(ctx);
+            return true;
+        }
+        false
+    }
+
+    /// Keys while the parameter prompt is open.
     /// Every key handled here is *consumed* so the text box never sees it:
     /// Enter would otherwise surrender focus, and Esc would revert the text
     /// behind our back. Returns true when the prompt is done with this frame
@@ -1767,12 +2420,94 @@ impl MxRunApp {
         );
 
         ui.add_space(16.0);
-        if ui.button("返回 (Esc / F2)").clicked() {
+        ui.separator();
+        ui.add_space(8.0);
+        self.render_integration(ui);
+
+        ui.add_space(16.0);
+        if ui.button("返回 (Esc)").clicked() {
             self.view_settings = false;
             self.capturing_hotkey = false;
             self.pending_hotkey = None;
             self.reset_status();
         }
+    }
+
+    /// The two ways to get things *into* MxRun from Explorer.
+    ///
+    /// AltRun had only the SendTo shortcut (its shell-menu code was never
+    /// called from anywhere — `docs/AltRun交互规格.md` §11). Both are opt-in
+    /// buttons rather than something done behind the user's back at startup:
+    /// writing to the registry and to the SendTo folder is visible surgery on
+    /// their system.
+    fn render_integration(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("右键集成").size(15.0));
+        ui.add_space(6.0);
+
+        let sendto = integrate::sendto_installed();
+        let menu = integrate::shell_menu_installed();
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if sendto { "✓ 已加入「发送到」菜单" } else { "· 未加入「发送到」菜单" })
+                    .size(13.0)
+                    .color(if sendto { Color32::from_rgb(140, 220, 140) } else { Color32::from_gray(150) }),
+            );
+            if ui.button(if sendto { "移除" } else { "加入" }).clicked() {
+                let outcome = if sendto {
+                    integrate::uninstall_sendto()
+                } else {
+                    integrate::install_sendto().map(|_| ())
+                };
+                self.status = match outcome {
+                    Ok(()) => {
+                        log_line(&format!("integration: sendto now installed={}", !sendto));
+                        if sendto { "已从「发送到」菜单移除".into() } else { "已加入「发送到」菜单".to_string() }
+                    }
+                    Err(e) => {
+                        log_line(&format!("integration: sendto failed: {e}"));
+                        format!("操作失败：{e}")
+                    }
+                };
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if menu { "✓ 已注册文件和目录右键菜单" } else { "· 未注册右键菜单" })
+                    .size(13.0)
+                    .color(if menu { Color32::from_rgb(140, 220, 140) } else { Color32::from_gray(150) }),
+            );
+            if ui.button(if menu { "移除" } else { "注册" }).clicked() {
+                let outcome = if menu {
+                    integrate::uninstall_shell_menu().map(|_| 0)
+                } else {
+                    integrate::install_shell_menu()
+                };
+                self.status = match outcome {
+                    Ok(n) => {
+                        log_line(&format!("integration: shell menu now installed={}", !menu));
+                        if menu {
+                            "已移除右键菜单".into()
+                        } else {
+                            format!("已注册 {n} 处右键菜单（文件 / 目录 / 目录空白处）")
+                        }
+                    }
+                    Err(e) => {
+                        log_line(&format!("integration: shell menu failed: {e}"));
+                        format!("注册失败：{e}")
+                    }
+                };
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("两种方式都只会调起一个小确认框，主窗口不会弹出来打扰你。\n\
+                           右键菜单写在 HKCU 下，不需要管理员权限。")
+                .size(12.0)
+                .color(Color32::from_gray(140)),
+        );
     }
 }
 
@@ -1816,6 +2551,18 @@ impl eframe::App for MxRunApp {
         if self.open_settings.swap(false, Ordering::Relaxed) {
             self.view_settings = true;
         }
+        // Tray menu asked for a blank add card.
+        if self.open_new.swap(false, Ordering::Relaxed) {
+            self.add = Some(AddForm::blank(""));
+            self.want_focus = true;
+        }
+
+        // Paths handed over by another process (right-click → 发送到, shell menu,
+        // or a second launch with a path).
+        self.receive_pending_adds(&ctx);
+
+        // The card is a different-sized window; keep it in step with the mode.
+        self.apply_window_size(&ctx);
 
         // Re-focus the input box whenever the window transitions hidden -> visible
         // (the background thread can't touch app state).
@@ -1874,7 +2621,8 @@ impl eframe::App for MxRunApp {
         }
 
         // Global key handling (order matters: settings capture eats keys first,
-        // then the parameter prompt, which owns the keyboard while it is open).
+        // then the add card, then the parameter prompt — each owns the keyboard
+        // while it is open).
         if self.view_settings {
             if !self.capturing_hotkey
                 && (ctx.input(|i| i.key_pressed(Key::Escape))
@@ -1883,6 +2631,10 @@ impl eframe::App for MxRunApp {
                 self.view_settings = false;
                 self.pending_hotkey = None;
                 self.reset_status();
+            }
+        } else if self.add.is_some() {
+            if self.handle_add_keys(&ctx) {
+                return;
             }
         } else if self.prompt.is_some() {
             if self.handle_prompt_keys(&ctx) {
@@ -1908,10 +2660,24 @@ impl eframe::App for MxRunApp {
                 self.execute_selected(&ctx);
                 return;
             }
+            // F2 edits the selected item — AltRun's own binding
+            // (docs/AltRun交互规格.md §1). The settings page it used to open
+            // lives in the tray menu now, which is where AltRun kept its 配置
+            // dialog as well.
             if ctx.input(|i| i.key_pressed(Key::F2)) {
-                self.view_settings = true;
+                self.open_edit();
             }
             if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                // Nothing matched: offer to add it, the way AltRun did
+                // ("无此项 "%s", 添加它?"). This is the launcher's own way in,
+                // next to the right-click one.
+                if self.results.is_empty() && !self.input.trim().is_empty() {
+                    let seed = self.input.trim().to_string();
+                    log_line(&format!("add: open for unmatched query {seed:?}"));
+                    self.add = Some(AddForm::blank(&seed));
+                    self.want_focus = true;
+                    return;
+                }
                 self.execute_selected(&ctx);
                 return;
             }
@@ -1944,6 +2710,11 @@ impl eframe::App for MxRunApp {
 
 impl MxRunApp {
     fn render_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The add / edit card takes over the whole window while it is open.
+        if self.add.is_some() {
+            self.render_add(ui);
+            return;
+        }
         // An open parameter prompt takes over both the top box and the list.
         if self.prompt.is_some() {
             self.render_prompt(ui);
@@ -2092,6 +2863,113 @@ impl MxRunApp {
                     .color(Color32::from_gray(110)),
             );
         });
+    }
+
+    /// The add / edit card. Three fields, the buttons, and a line saying what
+    /// is going to happen.
+    fn render_add(&mut self, ui: &mut egui::Ui) {
+        // Split the borrows: the closures need the form and the focus flag.
+        let want_focus = &mut self.want_focus;
+        let Some(form) = self.add.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(form.heading()).size(19.0));
+            if form.queue.len() > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("还有 {} 个待添加", form.queue.len()))
+                            .size(12.0)
+                            .color(Color32::from_gray(140)),
+                    );
+                });
+            }
+        });
+        ui.add_space(10.0);
+
+        egui::Grid::new("mxrun-add-fields")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                let field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .font(FontId::proportional(15.0))
+                            .hint_text(hint)
+                            .desired_width(408.0),
+                    )
+                };
+                ui.label(RichText::new("关键字").size(14.0));
+                let keyword = field(ui, &mut form.keyword, "输入什么能搜到它");
+                if *want_focus {
+                    keyword.request_focus();
+                    *want_focus = false;
+                }
+                // Editing the keyword after a collision warning means the user
+                // is fixing it, not confirming the overwrite.
+                if keyword.changed() {
+                    form.overwrite_asked = false;
+                    form.error.clear();
+                }
+                ui.end_row();
+
+                ui.label(RichText::new("名称").size(14.0));
+                let title = field(ui, &mut form.title, "列表里显示的名字");
+                if title.changed() {
+                    form.error.clear();
+                }
+                ui.end_row();
+
+                ui.label(RichText::new("命令行").size(14.0));
+                let command = field(ui, &mut form.command, "要打开或运行什么");
+                if command.changed() {
+                    form.error.clear();
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(8.0);
+        // What the card is about. For a right-click add the source path is the
+        // context the user just came from.
+        let note = if form.is_editing() {
+            "回车保存 · Esc 取消 · Tab 换行".to_string()
+        } else if form.source_path.is_empty() {
+            "回车添加 · Esc 取消".to_string()
+        } else {
+            format!("来自 {} · 回车添加 · Esc 取消", truncate_chars(&form.source_path, 46))
+        };
+        ui.label(RichText::new(note).size(11.0).color(Color32::from_gray(120)));
+        if !form.error.is_empty() {
+            ui.label(
+                RichText::new(&form.error)
+                    .size(12.0)
+                    .color(Color32::from_rgb(255, 190, 80)),
+            );
+        }
+
+        // Buttons, flush right (Enter/Esc do the same thing).
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new(form.confirm_label()).size(14.0)).clicked() {
+                    confirm = true;
+                }
+                if ui.button(RichText::new("取消").size(14.0)).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        // The borrow of `form` ends here, so the store work can run.
+        if confirm {
+            let ctx = ui.ctx().clone();
+            self.confirm_add(&ctx);
+        } else if cancel {
+            let ctx = ui.ctx().clone();
+            self.cancel_add(&ctx);
+        }
     }
 
     /// The parameter prompt, drawn where the search box and the command list
@@ -2551,5 +3429,66 @@ mod tests {
         assert_eq!(p.empty_hint(), "输入要运行的命令（Esc 返回）");
         let q = prompt_with(&[], false);
         assert!(!q.run_line, "a search template is not a command line");
+    }
+
+    // ---- add / edit card --------------------------------------------------
+
+    /// A dropped path arrives with all three fields filled in.
+    #[test]
+    fn add_card_prefills_from_the_path() {
+        let form = AddForm::from_path(r"C:\Tools\My App.exe", vec![]);
+        assert_eq!(form.keyword, "My App");
+        assert_eq!(form.title, "My App");
+        assert_eq!(form.command, r"C:\Tools\My App.exe");
+        assert_eq!(form.origin, AddOrigin::External);
+        assert!(!form.is_editing());
+        assert_eq!(form.confirm_label(), "添加");
+    }
+
+    /// F2 fills the same card from the item, and remembers what it is editing.
+    #[test]
+    fn add_card_edits_an_existing_item() {
+        let item = Item {
+            id: "x".into(),
+            title: "GitHub".into(),
+            // Imported rows can carry several trigger words; only the first is
+            // on the card, the rest must survive (the confirm path keeps them).
+            keywords: vec!["gh".into(), "github".into()],
+            actions: vec![Action::run(r"C:\Tools\gh.exe --fast")],
+            source: store::Source { provider: "manual".into(), external_id: "c:\\tools\\gh.exe".into() },
+            ..Default::default()
+        };
+        let form = AddForm::from_item(item.clone()).expect("a command line is editable");
+        assert_eq!(form.keyword, "gh");
+        assert_eq!(form.title, "GitHub");
+        assert_eq!(form.command, r"C:\Tools\gh.exe --fast");
+        assert_eq!(form.origin, AddOrigin::Launcher);
+        assert!(form.is_editing());
+        assert_eq!(form.confirm_label(), "保存");
+        assert_eq!(form.editing.as_ref().map(|i| i.keywords.len()), Some(2));
+    }
+
+    /// Items whose effect is not a command line cannot be edited here — better
+    /// to say so than to show an empty box that would overwrite the verb.
+    #[test]
+    fn add_card_refuses_builtin_effects() {
+        let item = Item {
+            id: "x".into(),
+            title: "显示桌面".into(),
+            actions: vec![Action { label: "默认".into(), effect: Effect::Builtin { verb: BuiltinVerb::MinimizeAll } }],
+            ..Default::default()
+        };
+        assert!(AddForm::from_item(item).is_none());
+    }
+
+    /// The "no match → add it" entry seeds the card with what was typed.
+    #[test]
+    fn blank_card_seeds_the_query() {
+        let form = AddForm::blank("my thing");
+        assert_eq!(form.keyword, "my thing");
+        assert_eq!(form.title, "my thing");
+        assert!(form.command.is_empty(), "the user supplies the command");
+        assert_eq!(form.origin, AddOrigin::Launcher);
+        assert!(form.source_path.is_empty(), "no source path to show");
     }
 }
