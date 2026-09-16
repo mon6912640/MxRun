@@ -1366,6 +1366,21 @@ impl AddForm {
     }
 }
 
+/// A short note that shows itself for a couple of seconds and then takes the
+/// window away with it.
+///
+/// Used for the one case where the add flow leaves something behind that the
+/// user did not ask for: MxRun was **not** running, so the right-click started
+/// it, and after the item is stored the process stays resident in the tray with
+/// the hotkey registered (`docs/开发进度.md` §2.11). AltRun simply exited there;
+/// the user asked for "stay resident, but say so".
+struct Toast {
+    /// When it should disappear.
+    until: std::time::Instant,
+    title: String,
+    body: String,
+}
+
 struct MxRunApp {
     store: Store,
     items: Vec<Indexed>,
@@ -1397,6 +1412,14 @@ struct MxRunApp {
     pending_adds: Arc<Mutex<Vec<String>>>,
     /// Open add / edit card. Replaces the whole window content while it lives.
     add: Option<AddForm>,
+    /// Self-dismissing note (see [`Toast`]).
+    toast: Option<Toast>,
+    /// This process was started *by* an add request (right-click → 发送到 while
+    /// nothing was running). Only then does the "MxRun is now resident" note
+    /// make sense.
+    cold_start_add: bool,
+    /// The note is shown once per process, not once per queued file.
+    add_note_shown: bool,
     /// Window size the app last applied, so it only resizes on a mode change.
     applied_size: [f32; 2],
     capturing_hotkey: bool,
@@ -1575,6 +1598,9 @@ impl MxRunApp {
             open_new,
             pending_adds,
             add: None,
+            toast: None,
+            cold_start_add: false,
+            add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
             capturing_hotkey: false,
             pending_hotkey: None,
@@ -1596,6 +1622,7 @@ impl MxRunApp {
         // exe): open the card before the first frame, so the window is *born*
         // as the small card.
         if let Some(paths) = PENDING_PATHS.get() {
+            app.cold_start_add = true;
             app.open_add(paths.clone());
             app.selftest_confirm_add(&cc.egui_ctx);
         }
@@ -2186,10 +2213,29 @@ impl MxRunApp {
         self.refresh_search();
         match origin {
             Some(AddOrigin::External) => {
-                // Nothing stays on screen: the user was in Explorer, not here.
-                log_line("add: done, hiding");
-                self.apply_window_size(ctx);
-                hide_window(ctx);
+                // Nothing usually stays on screen: the user was in Explorer,
+                // not here. The exception is the one case where something *does*
+                // stay behind — this process, which the add request itself
+                // started and which now sits in the tray with the hotkey
+                // registered. Say so, once, then get out of the way.
+                if self.cold_start_add && !self.add_note_shown {
+                    self.add_note_shown = true;
+                    log_line("add: noting that the launcher stays resident");
+                    self.toast = Some(Toast {
+                        until: std::time::Instant::now() + Duration::from_millis(2600),
+                        title: self.status.clone(),
+                        body: format!(
+                            "MxRun 已在托盘运行（{} 呼出 · 右键托盘图标可退出）",
+                            self.hotkey_str
+                        ),
+                    });
+                    self.want_focus = false;
+                    self.apply_window_size(ctx);
+                } else {
+                    log_line("add: done, hiding");
+                    self.apply_window_size(ctx);
+                    hide_window(ctx);
+                }
             }
             Some(AddOrigin::Launcher) | None => {
                 self.apply_window_size(ctx);
@@ -2234,7 +2280,11 @@ impl MxRunApp {
     /// usually a no-op — but it is what puts the launcher back to full size
     /// after a right-click add.
     fn apply_window_size(&mut self, ctx: &egui::Context) {
-        let want = if self.add.is_some() { ADD_SIZE } else { LAUNCHER_SIZE };
+        let want = if self.add.is_some() || self.toast.is_some() {
+            ADD_SIZE
+        } else {
+            LAUNCHER_SIZE
+        };
         if want == self.applied_size {
             return;
         }
@@ -2273,6 +2323,14 @@ impl MxRunApp {
             return true;
         }
         false
+    }
+
+    /// Get rid of the note and the window together.
+    fn dismiss_toast(&mut self, ctx: &egui::Context) {
+        if self.toast.take().is_some() {
+            self.apply_window_size(ctx);
+            hide_window(ctx);
+        }
     }
 
     /// Keys while the parameter prompt is open.
@@ -2573,6 +2631,19 @@ impl eframe::App for MxRunApp {
         // The card is a different-sized window; keep it in step with the mode.
         self.apply_window_size(&ctx);
 
+        // The after-add note dismisses itself (and takes the window with it).
+        if let Some(toast) = self.toast.as_ref() {
+            let left = toast.until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                log_line("add: note elapsed, hiding");
+                self.dismiss_toast(&ctx);
+                return;
+            }
+            // Wake up exactly when it is due, instead of relying on the 250 ms
+            // focus poll.
+            ctx.request_repaint_after(left);
+        }
+
         // Re-focus the input box whenever the window transitions hidden -> visible
         // (the background thread can't touch app state).
         let visible = window_visible();
@@ -2601,6 +2672,8 @@ impl eframe::App for MxRunApp {
                 log_line("add: dropped with the window");
                 self.apply_window_size(&ctx);
             }
+            // The note goes with the window too (it was about the window).
+            self.toast = None;
             self.refresh_search();
         }
         self.prev_visible = visible;
@@ -2652,6 +2725,14 @@ impl eframe::App for MxRunApp {
             }
         } else if self.add.is_some() {
             if self.handle_add_keys(&ctx) {
+                return;
+            }
+        } else if self.toast.is_some() {
+            // Esc (or Enter) gets rid of the note early; it is only a note.
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+                || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+            {
+                self.dismiss_toast(&ctx);
                 return;
             }
         } else if self.prompt.is_some() {
@@ -2728,6 +2809,11 @@ impl eframe::App for MxRunApp {
 
 impl MxRunApp {
     fn render_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // A note that is on its way out owns the window for its last moments.
+        if self.toast.is_some() {
+            self.render_toast(ui);
+            return;
+        }
         // The add / edit card takes over the whole window while it is open.
         if self.add.is_some() {
             self.render_add(ui);
@@ -2877,6 +2963,31 @@ impl MxRunApp {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.label(
                 RichText::new(&self.status)
+                    .size(11.0)
+                    .color(Color32::from_gray(110)),
+            );
+        });
+    }
+
+    /// The short note that follows an add which left MxRun resident.
+    fn render_toast(&mut self, ui: &mut egui::Ui) {
+        let Some(toast) = self.toast.as_ref() else {
+            return;
+        };
+        let green = Color32::from_rgb(140, 220, 140);
+        ui.add_space(18.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(&toast.title).size(19.0).color(green));
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(&toast.body)
+                    .size(13.0)
+                    .color(Color32::from_gray(170)),
+            );
+        });
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.label(
+                RichText::new("这条提示 2 秒后自己消失")
                     .size(11.0)
                     .color(Color32::from_gray(110)),
             );
