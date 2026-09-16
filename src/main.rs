@@ -1597,6 +1597,7 @@ impl MxRunApp {
         // as the small card.
         if let Some(paths) = PENDING_PATHS.get() {
             app.open_add(paths.clone());
+            app.selftest_confirm_add(&cc.egui_ctx);
         }
 
         // Queue the icons for the rows the first frame will draw, *before* that
@@ -2027,19 +2028,27 @@ impl MxRunApp {
         // keyboard. This is the only way to verify the whole right-click path
         // (hand-off → card → database) from a script — keys cannot be delivered
         // to the window (CLAUDE.md pitfall 3).
-        if opened && std::env::var("MXRUN_SELFTEST_ADD").is_ok() {
-            // Twice, because that is what a human does: the first Enter on a
-            // colliding keyword only warns, the second one replaces.
-            for attempt in 1..=2 {
-                log_line(&format!("selftest: confirming the add card (attempt {attempt})"));
-                self.confirm_add(ctx);
-                match self.add.as_ref() {
-                    Some(form) => log_line(&format!("selftest: card still open: {}", form.error)),
-                    None => break,
-                }
-            }
-            log_line(&format!("selftest: after add status={:?}", self.status));
+        if opened {
+            self.selftest_confirm_add(ctx);
         }
+    }
+
+    /// Walk the card through "press Enter" without a keyboard
+    /// (`MXRUN_SELFTEST_ADD=1`). Twice, because that is what a human does: the
+    /// first Enter on a colliding keyword only warns, the second replaces.
+    fn selftest_confirm_add(&mut self, ctx: &egui::Context) {
+        if std::env::var("MXRUN_SELFTEST_ADD").is_err() || self.add.is_none() {
+            return;
+        }
+        for attempt in 1..=2 {
+            log_line(&format!("selftest: confirming the add card (attempt {attempt})"));
+            self.confirm_add(ctx);
+            match self.add.as_ref() {
+                Some(form) => log_line(&format!("selftest: card still open: {}", form.error)),
+                None => break,
+            }
+        }
+        log_line(&format!("selftest: after add status={:?}", self.status));
     }
 
     /// Enter on the card: create the item, or save the edit.
@@ -2582,6 +2591,15 @@ impl eframe::App for MxRunApp {
             // would be worse than starting over.
             if self.prompt.take().is_some() {
                 log_line("prompt: dropped with the window");
+            }
+            // Same for the add / edit card, and it matters more here: a card is
+            // usually a right-click the user has already walked away from, and
+            // leaving it armed means the next hotkey press greets them with a
+            // half-filled form instead of the launcher. The pre-fill is free to
+            // recreate — just right-click the file again.
+            if self.add.take().is_some() {
+                log_line("add: dropped with the window");
+                self.apply_window_size(&ctx);
             }
             self.refresh_search();
         }
