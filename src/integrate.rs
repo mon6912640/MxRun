@@ -221,6 +221,30 @@ pub fn sendto_installed() -> bool {
     sendto_lnk().is_some_and(|p| p.exists())
 }
 
+/// Is the SendTo shortcut there **and** pointing at this exact executable?
+///
+/// The distinction is what makes a portable copy work: move the folder (or the
+/// USB stick changes letter) and the shortcut survives but points at a path
+/// that no longer exists. See [`repair_if_registered`].
+pub fn sendto_points_at(exe: &Path) -> bool {
+    let Some(lnk) = sendto_lnk() else {
+        return false;
+    };
+    if !lnk.exists() {
+        return false;
+    }
+    match resolve_lnk(&lnk) {
+        Some(target) => same_path(&target, exe),
+        // A shortcut we cannot read is one we cannot trust: let the repair
+        // rewrite it rather than leaving a dead entry in the menu.
+        None => false,
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
 /// Put "MxRun" into the right-click → 发送到 menu.
 ///
 /// No arguments on the shortcut: Windows appends the selected files itself,
@@ -281,14 +305,154 @@ pub fn shell_menu_installed() -> bool {
     false
 }
 
+/// Is the context-menu verb registered **for this exact executable**?
+pub fn shell_menu_points_at(exe: &Path) -> bool {
+    let entries = shell_menu_entries();
+    let Some((key, arg)) = entries.first() else {
+        return false;
+    };
+    let Some(value) = read_reg_string(&format!("{key}\\command"), None) else {
+        return false;
+    };
+    value.eq_ignore_ascii_case(&command_for(exe, arg))
+}
+
+/// What goes into the `command` key, in one place so the check and the write
+/// can never drift apart.
+fn command_for(exe: &Path, arg: &str) -> String {
+    format!("\"{}\" \"{arg}\"", exe.to_string_lossy())
+}
+
+/// The value of a registry string, or `None` when it is missing or not a
+/// string. Used to tell "registered for me" from "registered for the copy I
+/// used to have".
+fn read_reg_string(key: &str, name: Option<&str>) -> Option<String> {
+    use windows::Win32::System::Registry::{RegQueryValueExW, REG_EXPAND_SZ};
+
+    let sub = wide(key);
+    let mut hkey = HKEY::default();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            None,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if status.0 != 0 {
+        return None;
+    }
+
+    let name_w = name.map(wide);
+    let name_ptr = name_w.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
+    let mut kind = REG_SZ;
+    let mut size: u32 = 0;
+    // First call asks for the size, second one fills the buffer.
+    let probe = unsafe {
+        RegQueryValueExW(hkey, name_ptr, None, Some(&mut kind), None, Some(&mut size))
+    };
+    if probe.0 != 0 || size == 0 {
+        let _ = unsafe { RegCloseKey(hkey) };
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let status = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name_ptr,
+            None,
+            Some(&mut kind),
+            Some(buf.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    let _ = unsafe { RegCloseKey(hkey) };
+    if status.0 != 0 || (kind != REG_SZ && kind != REG_EXPAND_SZ) {
+        return None;
+    }
+    let words: Vec<u16> = buf
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|c| *c != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&words))
+}
+
+/// Keep the entries pointing at *this* copy of MxRun.
+///
+/// This is what makes the folder portable. The registrations themselves are the
+/// record of "the user wanted this": if one exists but aims somewhere else — the
+/// folder moved, the drive letter changed, the exe was renamed — rewrite it
+/// silently. If nothing is registered, do nothing at all (that is a preference,
+/// not an oversight; the first-run question handles a brand-new machine).
+///
+/// Returns the log lines describing what happened.
+pub fn repair_if_registered() -> Vec<String> {
+    let mut notes = Vec::new();
+    let Ok(exe) = std::env::current_exe() else {
+        return notes;
+    };
+
+    if sendto_installed() && !sendto_points_at(&exe) {
+        match install_sendto() {
+            Ok(path) => notes.push(format!("self-heal: 发送到 已重新指向 {}（{}）", exe.display(), path.display())),
+            Err(e) => notes.push(format!("self-heal: 发送到 修复失败：{e}")),
+        }
+    }
+    if shell_menu_installed() && !shell_menu_points_at(&exe) {
+        match install_shell_menu() {
+            Ok(n) => notes.push(format!("self-heal: 右键菜单 {n} 处已重新指向 {}", exe.display())),
+            Err(e) => notes.push(format!("self-heal: 右键菜单 修复失败：{e}")),
+        }
+    }
+    notes
+}
+
+/// True when either entry point exists, whatever it points at.
+pub fn any_registered() -> bool {
+    sendto_installed() || shell_menu_installed()
+}
+
+// ---------------------------------------------------------------------------
+// "have we asked on this machine yet?"
+// ---------------------------------------------------------------------------
+
+/// Machine-local marker for the first-run question.
+///
+/// Deliberately **not** in the data dir: in portable mode that folder travels,
+/// while "does this machine's Explorer know about MxRun" is a fact about the
+/// machine you are sitting at. `%LOCALAPPDATA%` is per-machine-per-user and
+/// never roams, which is exactly the scope of the question.
+fn asked_marker() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|base| {
+        PathBuf::from(base)
+            .join("MxRun")
+            .join("integration-asked")
+    })
+}
+
+pub fn integration_asked() -> bool {
+    asked_marker().is_some_and(|p| p.exists())
+}
+
+pub fn mark_integration_asked() {
+    let Some(path) = asked_marker() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, b"1");
+}
+
 pub fn install_shell_menu() -> Result<usize, String> {
     let exe = std::env::current_exe().map_err(|e| format!("找不到自身路径：{e}"))?;
-    let exe = exe.to_string_lossy().into_owned();
     let mut done = 0;
     for (key, arg) in shell_menu_entries() {
         write_reg_string(key, None, MENU_LABEL)?;
-        write_reg_string(key, Some("Icon"), &exe)?;
-        write_reg_string(&format!("{key}\\command"), None, &format!("\"{exe}\" \"{arg}\""))?;
+        write_reg_string(key, Some("Icon"), &exe.to_string_lossy())?;
+        write_reg_string(&format!("{key}\\command"), None, &command_for(&exe, arg))?;
         done += 1;
     }
     Ok(done)

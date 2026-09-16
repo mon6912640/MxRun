@@ -71,12 +71,13 @@ static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::ne
 /// profile: `dos` scored 1088 for the intended row and 16–63 for the noise.
 const SCORE_GATE: f64 = 0.15;
 
-/// Append a timestamped line to %APPDATA%\MxRun\mxrun.log (debug aid).
+/// Append a timestamped line to `<data dir>\mxrun.log` (debug aid).
+///
+/// The data dir is `%APPDATA%\MxRun`, or `data\` beside the exe in portable
+/// mode — the log follows the database so a portable folder stays
+/// self-contained.
 fn log_line(msg: &str) {
-    let base = std::env::var("APPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let path = base.join("MxRun").join("mxrun.log");
+    let path = store::default_data_dir().join("mxrun.log");
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -254,6 +255,9 @@ fn run_integration(install: bool) -> bool {
     for line in &lines {
         log_line(&format!("integration: {line}"));
     }
+    // Answering through the command line counts as answering: a scripted setup
+    // should not leave a question pending for the next interactive start.
+    integrate::mark_integration_asked();
     message_box(
         &format!(
             "{}\n\n之后：右键一个文件/文件夹 → 发送到 → MxRun（或右键菜单）。\n\
@@ -378,7 +382,10 @@ fn main() -> eframe::Result<()> {
             Err(msg) => {
                 log_line(&format!("startup failed: {msg}"));
                 message_box(
-                    &format!("MxRun 启动失败：\n\n{msg}\n\n数据目录：%APPDATA%\\MxRun"),
+                    &format!(
+                        "MxRun 启动失败：\n\n{msg}\n\n数据目录：{}",
+                        store::default_data_dir().display()
+                    ),
                     "MxRun 启动失败",
                     true,
                 );
@@ -1414,6 +1421,8 @@ struct MxRunApp {
     add: Option<AddForm>,
     /// Self-dismissing note (see [`Toast`]).
     toast: Option<Toast>,
+    /// First-run question: "shall MxRun join the right-click menu?"
+    ask_integration: bool,
     /// This process was started *by* an add request (right-click → 发送到 while
     /// nothing was running). Only then does the "MxRun is now resident" note
     /// make sense.
@@ -1450,6 +1459,34 @@ impl MxRunApp {
         // unparseable rows without a word).
         for w in &store.warnings {
             log_line(&format!("store: {w}"));
+        }
+
+        // Keep the Explorer entries pointing at *this* copy. A portable folder
+        // that moved (or a USB stick with a new drive letter) would otherwise
+        // leave menu items aiming at a path that no longer exists. Anything the
+        // user never registered stays untouched — see `repair_if_registered`.
+        for note in integrate::repair_if_registered() {
+            log_line(&format!("integration: {note}"));
+        }
+        log_line(&format!(
+            "startup: data_dir={} portable={} integration(sendto={} menu={})",
+            store::default_data_dir().display(),
+            store::is_portable(),
+            integrate::sendto_installed(),
+            integrate::shell_menu_installed()
+        ));
+
+        // A machine whose Explorer has never heard of MxRun gets asked once
+        // (see `integrate::mark_integration_asked`). Skipped when the window is
+        // opening for a right-click add — the user is busy with a card — and
+        // when a script is driving us.
+        let started_for_add = PENDING_PATHS.get().is_some_and(|p| !p.is_empty());
+        let ask_integration = !started_for_add
+            && !integrate::any_registered()
+            && !integrate::integration_asked()
+            && std::env::var("MXRUN_SELFTEST").is_err();
+        if ask_integration {
+            log_line("integration: nothing registered on this machine, asking");
         }
 
         // --- global hotkey (from config, default Alt+F1) ---
@@ -1599,6 +1636,7 @@ impl MxRunApp {
             pending_adds,
             add: None,
             toast: None,
+            ask_integration,
             cold_start_add: false,
             add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
@@ -1617,6 +1655,19 @@ impl MxRunApp {
         }
         app.rebuild_index(&cc.egui_ctx);
         app.refresh_search();
+
+        // Debug hook: answer the first-run question without a keyboard
+        // (`MXRUN_SELFTEST_INTEGRATION=yes|no`) — pressing the card's button is
+        // the only other way, and keys cannot be delivered from a script.
+        if app.ask_integration {
+            if let Ok(answer) = std::env::var("MXRUN_SELFTEST_INTEGRATION") {
+                app.answer_integration(&cc.egui_ctx, answer.eq_ignore_ascii_case("yes"));
+                log_line(&format!(
+                    "selftest: answered the integration question {answer:?} -> {}",
+                    app.status
+                ));
+            }
+        }
 
         // Started with paths (right-click → 发送到, shell menu, or a drop on the
         // exe): open the card before the first frame, so the window is *born*
@@ -2280,7 +2331,7 @@ impl MxRunApp {
     /// usually a no-op — but it is what puts the launcher back to full size
     /// after a right-click add.
     fn apply_window_size(&mut self, ctx: &egui::Context) {
-        let want = if self.add.is_some() || self.toast.is_some() {
+        let want = if self.add.is_some() || self.toast.is_some() || self.ask_integration {
             ADD_SIZE
         } else {
             LAUNCHER_SIZE
@@ -2331,6 +2382,30 @@ impl MxRunApp {
             self.apply_window_size(ctx);
             hide_window(ctx);
         }
+    }
+
+    /// Answer the first-run question and act on it.
+    ///
+    /// Either answer marks the machine as asked: nagging on every start would be
+    /// worse than never offering, and the settings page can still turn the
+    /// entries on later.
+    fn answer_integration(&mut self, ctx: &egui::Context, yes: bool) {
+        self.ask_integration = false;
+        integrate::mark_integration_asked();
+        if yes {
+            let sendto = integrate::install_sendto();
+            let menu = integrate::install_shell_menu();
+            self.status = match (&sendto, &menu) {
+                (Ok(_), Ok(n)) => format!("已加入右键菜单（{n} 处）和「发送到」"),
+                (Err(e), _) | (_, Err(e)) => format!("注册失败：{e}"),
+            };
+            log_line(&format!("integration: first-run answer=yes, status={:?}", self.status));
+        } else {
+            self.status = "好的，随时可以在设置里加入右键菜单".to_string();
+            log_line("integration: first-run answer=no");
+        }
+        self.apply_window_size(ctx);
+        self.want_focus = true;
     }
 
     /// Keys while the parameter prompt is open.
@@ -2529,6 +2604,9 @@ impl MxRunApp {
                 self.status = match outcome {
                     Ok(()) => {
                         log_line(&format!("integration: sendto now installed={}", !sendto));
+                        // Touching the switch is an answer to the first-run
+                        // question, whichever way it went.
+                        integrate::mark_integration_asked();
                         if sendto { "已从「发送到」菜单移除".into() } else { "已加入「发送到」菜单".to_string() }
                     }
                     Err(e) => {
@@ -2554,6 +2632,7 @@ impl MxRunApp {
                 self.status = match outcome {
                     Ok(n) => {
                         log_line(&format!("integration: shell menu now installed={}", !menu));
+                        integrate::mark_integration_asked();
                         if menu {
                             "已移除右键菜单".into()
                         } else {
@@ -2674,6 +2753,14 @@ impl eframe::App for MxRunApp {
             }
             // The note goes with the window too (it was about the window).
             self.toast = None;
+            // An unanswered first-run question is not lost, just postponed: the
+            // marker is only written when the user actually answers, so the next
+            // start asks again.
+            if self.ask_integration {
+                log_line("integration: first-run question postponed (window hidden)");
+                self.ask_integration = false;
+                self.apply_window_size(&ctx);
+            }
             self.refresh_search();
         }
         self.prev_visible = visible;
@@ -2722,6 +2809,15 @@ impl eframe::App for MxRunApp {
                 self.view_settings = false;
                 self.pending_hotkey = None;
                 self.reset_status();
+            }
+        } else if self.ask_integration {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+                self.answer_integration(&ctx, true);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.answer_integration(&ctx, false);
+                return;
             }
         } else if self.add.is_some() {
             if self.handle_add_keys(&ctx) {
@@ -2812,6 +2908,11 @@ impl MxRunApp {
         // A note that is on its way out owns the window for its last moments.
         if self.toast.is_some() {
             self.render_toast(ui);
+            return;
+        }
+        // The first-run question (a machine that has never seen MxRun).
+        if self.ask_integration {
+            self.render_integration_ask(ui);
             return;
         }
         // The add / edit card takes over the whole window while it is open.
@@ -2992,6 +3093,45 @@ impl MxRunApp {
                     .color(Color32::from_gray(110)),
             );
         });
+    }
+
+    /// The first-run question: MxRun has never been registered on this machine.
+    ///
+    /// A card rather than a system dialog: it uses the app's own language, and
+    /// Esc ("不用了") is as easy to reach as Enter.
+    fn render_integration_ask(&mut self, ui: &mut egui::Ui) {
+        let mut answer: Option<bool> = None;
+        ui.add_space(10.0);
+        ui.label(RichText::new("要把 MxRun 加进右键菜单吗？").size(19.0));
+        ui.add_space(10.0);
+        for line in [
+            "· 右键 → 发送到 → MxRun",
+            "· 文件 / 文件夹右键 → 用 MxRun 添加(&M)",
+            "",
+            "加进去之后，右键只会弹一张小卡片（关键字、名称、命令行已预填），",
+            "主窗口不会跳出来打扰你。写在 HKCU 下，不需要管理员权限，",
+            "随时能在设置里移除。",
+        ] {
+            ui.label(
+                RichText::new(line)
+                    .size(13.0)
+                    .color(Color32::from_gray(if line.is_empty() { 90 } else { 170 })),
+            );
+        }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("加入").size(14.0)).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button(RichText::new("不用了").size(14.0)).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(yes) = answer {
+            let ctx = ui.ctx().clone();
+            self.answer_integration(&ctx, yes);
+        }
     }
 
     /// The add / edit card. Three fields, the buttons, and a line saying what

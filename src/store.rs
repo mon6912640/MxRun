@@ -386,12 +386,46 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `%APPDATA%\MxRun` (falls back to the current directory).
+/// Marker file that switches the whole app into portable mode: put an empty
+/// `portable.txt` next to `mxrun.exe` and everything — database, backups, log,
+/// the hand-off inbox — lives in a `data/` folder beside the exe instead of
+/// `%APPDATA%`.
+///
+/// That is what makes the folder copyable: the settings (and with them "the
+/// right-click entries are mine") travel with it, and nothing is left behind on
+/// the machine you happened to run it from.
+pub const PORTABLE_MARKER: &str = "portable.txt";
+
+/// Where this run keeps its data: the portable folder if the marker is there,
+/// otherwise `%APPDATA%\MxRun`.
 pub fn default_data_dir() -> PathBuf {
-    std::env::var("APPDATA")
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    data_dir_for(exe_dir.as_deref(), std::env::var_os("APPDATA").as_deref())
+}
+
+/// The rule above, as a pure function — so it can be tested without writing
+/// markers next to the test executable.
+fn data_dir_for(exe_dir: Option<&Path>, appdata: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(dir) = exe_dir {
+        if dir.join(PORTABLE_MARKER).exists() {
+            return dir.join("data");
+        }
+    }
+    appdata
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("MxRun")
+}
+
+/// True when the app is running from a portable folder (see
+/// [`PORTABLE_MARKER`]). Used for the startup line in the log.
+pub fn is_portable() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(PORTABLE_MARKER).exists()))
+        .unwrap_or(false)
 }
 
 impl Store {
@@ -937,8 +971,7 @@ mod tests {
 
     /// Re-opening an already migrated database must not re-seed or duplicate.
     #[test]
-    fn reopening_is_idempotent() {
-        let dir = temp_dir("reopen");
+    fn reopening_is_idempotent() {        let dir = temp_dir("reopen");
         let mut store = Store::open_at(dir.clone()).unwrap();
         let first = store.load_items().unwrap().len();
         assert_eq!(first, seed_items().len(), "fresh db gets the demo items");
@@ -1016,8 +1049,7 @@ mod tests {
 
     /// The history stays bounded, and it drops the least used first.
     #[test]
-    fn param_history_is_capped_by_least_used() {
-        let dir = temp_dir("param-cap");
+    fn param_history_is_capped_by_least_used() {        let dir = temp_dir("param-cap");
         let store = Store::open_at(dir.clone()).unwrap();
 
         store.bump_param("a", "keep");
@@ -1037,6 +1069,38 @@ mod tests {
         assert_eq!(
             store.param_history("a", PARAM_HISTORY_LIMIT).iter().filter(|(v, _)| v == "keep").count(),
             1
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Portable mode: a `portable.txt` next to the exe moves everything into
+    /// `data/` there; without it the per-user `%APPDATA%\MxRun` is used.
+    #[test]
+    fn portable_marker_moves_the_data_next_to_the_exe() {
+        let dir = temp_dir("portable");
+        fs::create_dir_all(&dir).unwrap();
+
+        // No marker: the per-user roaming profile wins. (A made-up drive letter
+        // keeps this from looking like anybody's real profile path — the
+        // pre-commit hook rightly refuses to see those in the repository.)
+        assert_eq!(
+            data_dir_for(Some(&dir), Some(std::ffi::OsStr::new(r"R:\roaming"))),
+            PathBuf::from(r"R:\roaming").join("MxRun")
+        );
+
+        // Marker present: data lives beside the exe…
+        fs::write(dir.join(PORTABLE_MARKER), b"").unwrap();
+        assert_eq!(data_dir_for(Some(&dir), Some(std::ffi::OsStr::new(r"R:\roaming"))), dir.join("data"));
+
+        // …even when %APPDATA% is not set at all (a stripped-down environment).
+        assert_eq!(data_dir_for(Some(&dir), None), dir.join("data"));
+
+        // No exe directory to speak of (can't happen for a real process, but
+        // the fallback must not panic).
+        assert_eq!(
+            data_dir_for(None, Some(std::ffi::OsStr::new(r"R:\roaming"))),
+            PathBuf::from(r"R:\roaming").join("MxRun")
         );
 
         let _ = fs::remove_dir_all(&dir);
