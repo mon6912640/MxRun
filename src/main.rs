@@ -620,9 +620,6 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
     WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     match main_hwnd() {
         Some(hwnd) => unsafe {
-            // Center on the primary monitor at 1/3 height.
-            let sw = GetSystemMetrics(SM_CXSCREEN);
-            let sh = GetSystemMetrics(SM_CYSCREEN);
             let mut rect = std::mem::zeroed();
             let _ = GetWindowRect(hwnd, &mut rect);
             let current = [
@@ -630,6 +627,14 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
                 (rect.bottom - rect.top) as f32,
             ];
             let [ww, wh] = size.unwrap_or(current);
+
+            // Where to put it: the position the user dragged it to last time
+            // (AltRun's WinTop/WinLeft), clamped so a monitor change cannot
+            // leave the card off-screen; otherwise centred at 1/3 height.
+            let (x, y) = place_for([ww, wh]);
+            if remembered_position().is_some() {
+                log_line(&format!("window: placed at {x},{y} (remembered)"));
+            }
             let flags = if size.is_some() {
                 SWP_SHOWWINDOW
             } else {
@@ -638,8 +643,8 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                (sw - ww as i32) / 2,
-                (sh - wh as i32) / 3,
+                x,
+                y,
                 ww as i32,
                 wh as i32,
                 flags,
@@ -652,6 +657,68 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
         None => log_line("show: main window handle not found"),
     }
     ctx.request_repaint();
+}
+
+/// Where the user last dragged the card (AltRun's WinTop/WinLeft).///
+/// Kept in a process-wide slot rather than read from the store on every show:
+/// `show_window` is called from the hotkey thread, which does not own the
+/// database. The app fills it in at startup and after every drag.
+static WINDOW_POS: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+fn remembered_position() -> Option<(i32, i32)> {
+    WINDOW_POS.lock().ok().and_then(|p| *p)
+}
+
+fn set_remembered_position(pos: Option<(i32, i32)>) {
+    if let Ok(mut slot) = WINDOW_POS.lock() {
+        *slot = pos;
+    }
+}
+
+/// The stored position (AltRun's `WinTop`/`WinLeft`), read from the config.
+fn stored_position(store: &Store) -> Option<(i32, i32)> {
+    let x = store.get_config("win_x")?.parse::<i32>().ok()?;
+    let y = store.get_config("win_y")?.parse::<i32>().ok()?;
+    Some((x, y))
+}
+
+/// Where a window of this size should go: the remembered spot if there is one,
+/// otherwise centred at 1/3 height. Always clamped into the screen, so a
+/// remembered position from a monitor that is no longer attached cannot leave
+/// the card invisible.
+fn place_for(size: [f32; 2]) -> (i32, i32) {
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let (w, h) = (size[0] as i32, size[1] as i32);
+    match remembered_position() {
+        Some((x, y)) => (x.clamp(0, (sw - w).max(0)), y.clamp(0, (sh - h).max(0))),
+        None => ((sw - w) / 2, (sh - h) / 3),
+    }
+}
+
+/// Where the card is right now, straight from the window manager.
+fn current_position() -> Option<(i32, i32)> {
+    let hwnd = main_hwnd()?;
+    let mut rect = unsafe { std::mem::zeroed() };
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    Some((rect.left, rect.top))
+}
+
+/// Hand the window to the OS and let it run its own move loop, the way every
+/// Win32 app does (`ReleaseCapture` + `WM_NCLBUTTONDOWN` with `HTCAPTION`).
+///
+/// The call blocks until the drag ends, which is exactly what makes remembering
+/// the position easy: when it returns, the new position is final.
+fn drag_window(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTCAPTION as usize)),
+            Some(LPARAM(0)),
+        );
+    }
 }
 
 fn hide_window(_ctx: &egui::Context) {
@@ -1053,6 +1120,8 @@ struct Indexed {
     frec_bonus: f64,
     /// How many times this item has been launched (shown in the row).
     launches: u32,
+    /// Unix seconds of the last launch — the `Ctrl+L` recent list sorts on it.
+    last_used: u64,
 }
 
 struct Scored {
@@ -1422,6 +1491,72 @@ struct Toast {
     body: String,
 }
 
+/// How far back the `Ctrl+L` recent list looks.
+const RECENT_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Was this item used inside the recent window? Never-used items (`last_used`
+/// 0) are not "recent" — AltRun's LatestList only ever held real launches.
+///
+/// A timestamp in the *future* counts as recent on purpose: clocks jump
+/// backwards (NTP, DST, a manual fix), and that must not empty the list of
+/// things the user just launched.
+fn is_recent(last_used: u64, now: u64) -> bool {
+    last_used > 0 && now.saturating_sub(last_used) <= RECENT_WINDOW_SECS
+}
+
+/// Which row a digit key asks for, given the modifiers that are held.
+///
+/// **A bare digit is never a command.** Digits are how you search for the items
+/// that have them in their name — `360安全卫士`, `7-Zip`, `1password` — and a
+/// launcher that swallowed `7` would make those unreachable. AltRun drew the
+/// same line: its number keys only fire with `Alt` or `Ctrl`
+/// (`frmALTRun.pas:1566`).
+///
+/// The tenth row is `0`, exactly as AltRun printed it in its index column.
+fn digit_row(key: Key, ctrl: bool, alt: bool) -> Option<usize> {
+    use egui::Key::*;
+    if !ctrl && !alt {
+        return None;
+    }
+    Some(match key {
+        Num1 => 0,
+        Num2 => 1,
+        Num3 => 2,
+        Num4 => 3,
+        Num5 => 4,
+        Num6 => 5,
+        Num7 => 6,
+        Num8 => 7,
+        Num9 => 8,
+        Num0 => 9,
+        _ => return None,
+    })
+}
+
+/// `;` runs the second row and `'` the third — AltRun's own shortcuts
+/// (`frmALTRun.pas:1588-1594`), kept as they were. The price is that neither
+/// character can be typed into the search box; AltRun's keywords were always
+/// plain identifiers, and so are the user's.
+const SEMICOLON_ROW: usize = 1;
+const QUOTE_ROW: usize = 2;
+
+/// Which row a `Ctrl`/`Alt` + digit asks for, reading the keyboard. Our own
+/// keys are *consumed* so the digits never reach the search box.
+fn consume_digit(ctx: &egui::Context) -> Option<usize> {
+    use egui::Key::*;
+    const DIGITS: [Key; 10] = [Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
+    for key in DIGITS {
+        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::ALT] {
+            if ctx.input_mut(|i| i.consume_key(modifiers, key))
+                && let Some(row) = digit_row(key, modifiers.ctrl, modifiers.alt)
+            {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
 /// Where the last discovery run ended up, shared with the UI thread.
 #[derive(Default)]
 struct DiscoveryState {
@@ -1480,6 +1615,8 @@ struct MxRunApp {
     discovery_pending: Option<bool>, // Some(force)
     /// Last discovery outcome, for the settings page.
     discovery_note: String,
+    /// `Ctrl+L`: show only recently used items (AltRun's 最近列表).
+    recent_only: bool,
     /// This process was started *by* an add request (right-click → 发送到 while
     /// nothing was running). Only then does the "MxRun is now resident" note
     /// make sense.
@@ -1612,6 +1749,10 @@ impl MxRunApp {
         let pending_adds2 = pending_adds.clone();
         std::thread::spawn(move || {
             let mut tick: u32 = 0;
+            // Single click toggles the window (AltRun's behaviour), and a double
+            // click must not toggle it twice — the second click inside this
+            // window is swallowed.
+            let mut last_tray_click: Option<std::time::Instant> = None;
             loop {
                 let mut wake = false;
 
@@ -1622,9 +1763,20 @@ impl MxRunApp {
                     }
                 }
                 for ev in TrayIconEvent::receiver().try_iter() {
-                    if let TrayIconEvent::DoubleClick { .. } = ev {
-                        show_window(&ctx2);
-                        wake = true;
+                    if let TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Left,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
+                    } = ev
+                    {
+                        let now = std::time::Instant::now();
+                        let fresh = last_tray_click
+                            .is_none_or(|t| now.duration_since(t) > Duration::from_millis(350));
+                        if fresh {
+                            last_tray_click = Some(now);
+                            toggle_window(&ctx2);
+                            wake = true;
+                        }
                     }
                 }
                 for ev in MenuEvent::receiver().try_iter() {
@@ -1714,6 +1866,7 @@ impl MxRunApp {
             discovery_pending: (store.get_config(DISCOVERY_KEY).as_deref() != Some("0"))
                 .then_some(false),
             discovery_note: String::new(),
+            recent_only: false,
             cold_start_add: false,
             add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
@@ -1733,6 +1886,12 @@ impl MxRunApp {
         app.rebuild_index(&cc.egui_ctx);
         app.refresh_search();
 
+        // Where the card was last left (AltRun's WinTop/WinLeft): the hotkey
+        // thread needs it, and it does not own the database, so hand it over
+        // through the process-wide slot.
+        let pos = stored_position(&app.store);
+        set_remembered_position(pos);
+
         // Debug hook: answer the first-run question without a keyboard
         // (`MXRUN_SELFTEST_INTEGRATION=yes|no`) — pressing the card's button is
         // the only other way, and keys cannot be delivered from a script.
@@ -1751,6 +1910,27 @@ impl MxRunApp {
         // rule can be verified without clicking 现在扫一次.
         if let Ok(mode) = std::env::var("MXRUN_SELFTEST_DISCOVER") {
             app.discovery_pending = Some(mode == "force");
+        }
+
+        // Debug hook: switch to the recent list at startup
+        // (`MXRUN_SELFTEST_RECENT=1`), the only way to check it from a script.
+        if std::env::var("MXRUN_SELFTEST_RECENT").is_ok() {
+            app.toggle_recent();
+        }
+
+        // Debug hook: place the card at a fixed spot and remember it, which is
+        // what a real drag does (`MXRUN_SELFTEST_WINPOS=x,y`). The next start
+        // must come back to that spot — the only way to verify the position
+        // memory without a mouse.
+        if let Ok(spec) = std::env::var("MXRUN_SELFTEST_WINPOS")
+            && let Some((x, y)) = spec.split_once(',').and_then(|(x, y)| {
+                Some((x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?))
+            })
+        {
+            app.store.set_config("win_x", &x.to_string());
+            app.store.set_config("win_y", &y.to_string());
+            set_remembered_position(Some((x, y)));
+            log_line(&format!("window: position saved at {x},{y} (selftest)"));
         }
 
         // Debug hook: drive the manager and the delete flow without a keyboard
@@ -1917,7 +2097,7 @@ impl MxRunApp {
 
     fn reset_status(&mut self) {
         self.status = format!(
-            "{} 呼出 / 隐藏 · Enter/空格 执行 · F2 编辑 · Esc 清空或隐藏（设置见托盘菜单）",
+            "{} 呼出 / 隐藏 · Enter/空格 执行 · Ctrl+数字 执行第 N 项 · F2 编辑 · 设置见托盘菜单",
             self.hotkey_str
         );
     }
@@ -1988,6 +2168,7 @@ impl MxRunApp {
                     searchable,
                     frec_bonus: frecency_bonus(&frec),
                     launches: frec.count,
+                    last_used: frec.last_used,
                 }
             })
             .collect();
@@ -2013,6 +2194,7 @@ impl MxRunApp {
         if let Some(indexed) = self.items.iter_mut().find(|i| i.item.id == id) {
             indexed.launches = frec.count;
             indexed.frec_bonus = frecency_bonus(&frec);
+            indexed.last_used = frec.last_used;
         }
     }
 
@@ -2034,7 +2216,25 @@ impl MxRunApp {
         let query = self.input.trim();
         let manage = self.manage;
         let filter = self.manage_source;
-        if query.is_empty() && manage {
+        let recent_only = self.recent_only;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if recent_only {
+            // `Ctrl+L`: AltRun's 最近列表 — what has actually been used lately,
+            // most recent first. Nothing used in the window means an empty list,
+            // which is honest (and the status line says what the list is).
+            for (idx, it) in self.items.iter().enumerate() {
+                if is_recent(it.last_used, now) {
+                    self.results.push(Scored {
+                        idx,
+                        score: it.last_used as f64,
+                        hit_indices: Vec::new(),
+                    });
+                }
+            }
+        } else if query.is_empty() && manage {
             // Manager, no filter: every item there is, most used first — the
             // ones that were never launched pile up at the bottom, which is
             // exactly what you go looking for when tidying up.
@@ -2089,7 +2289,15 @@ impl MxRunApp {
                 }
             }
         }
-        if manage && query.is_empty() {
+        // The sorting below has to know what "most recent" means for Ctrl+L.
+        if recent_only {
+            self.results.sort_by(|a, b| {
+                self.items[b.idx]
+                    .last_used
+                    .cmp(&self.items[a.idx].last_used)
+                    .then_with(|| self.items[a.idx].item.title.cmp(&self.items[b.idx].item.title))
+            });
+        } else if manage && query.is_empty() {
             // Same ordering as the score above, with the title as the tiebreak
             // so the list does not shuffle between frames.
             self.results.sort_by(|a, b| {
@@ -2106,7 +2314,7 @@ impl MxRunApp {
         }
         // The manager is the place where seeing *everything* is the point: no
         // score gate and no eight-row cap, it scrolls instead.
-        if !query.is_empty() && !manage {
+        if !query.is_empty() && !manage && !recent_only {
             apply_score_gate(&mut self.results);
         }
         if !manage {
@@ -2459,6 +2667,70 @@ impl MxRunApp {
         self.want_focus = true;
     }
 
+    /// Remember where the card sits now (called after the user drags it).
+    fn save_position(&mut self) {
+        let Some((x, y)) = current_position() else {
+            return;
+        };
+        self.store.set_config("win_x", &x.to_string());
+        self.store.set_config("win_y", &y.to_string());
+        set_remembered_position(Some((x, y)));
+        log_line(&format!("window: position saved at {x},{y}"));
+    }
+
+    /// `Ctrl/Alt+N`, `;`, `'`: run the Nth row directly (AltRun's fastest way
+    /// in once you know your list).
+    fn run_index(&mut self, row: usize, ctx: &egui::Context) {
+        if row >= self.results.len() {
+            // Out of range is silent: the number of rows changes as you type,
+            // and a scolding status line would be noise.
+            return;
+        }
+        self.selected = row;
+        self.execute_selected(ctx);
+    }
+
+    /// `Ctrl+C`: put the selected item's command line on the clipboard.
+    fn copy_command(&mut self) {
+        let Some(sc) = self.results.get(self.selected) else {
+            return;
+        };
+        let item = self.items[sc.idx].item.clone();
+        let Some(command) = item.default_action().and_then(action_command) else {
+            self.status = format!("「{}」是内建动作，没有命令行可复制", item.title);
+            return;
+        };
+        let action = Action::copy(command);
+        match exec::run(&item, &action) {
+            exec::Outcome::Started => {
+                log_line(&format!("copy: command line of {:?}", item.title));
+                self.status = format!("已复制命令行：{}", truncate_chars(command, 60));
+            }
+            exec::Outcome::NeedsInput => {}
+            exec::Outcome::Failed(why) => {
+                self.status = format!("复制失败：{why}");
+            }
+        }
+    }
+
+    /// `Ctrl+L`: show only what has been used recently (AltRun's 最近列表),
+    /// most recent first. Pressing it again goes back to the normal list.
+    fn toggle_recent(&mut self) {
+        self.recent_only = !self.recent_only;
+        self.selected = 0;
+        self.refresh_search();
+        if self.recent_only {
+            self.status = "最近列表：只看最近 7 天用过的（再按 Ctrl+L 返回）".to_string();
+        } else {
+            self.reset_status();
+        }
+        log_line(&format!(
+            "list: recent_only={} rows={}",
+            self.recent_only,
+            self.results.len()
+        ));
+    }
+
     /// `Ctrl+D`: open the folder the selected item lives in, with the file
     /// selected — AltRun's "打开所在目录".
     fn reveal_selected(&mut self) {
@@ -2594,14 +2866,16 @@ impl MxRunApp {
         let Some(hwnd) = main_hwnd() else {
             return;
         };
+        // A mode change resizes the card but must not move it back to the
+        // middle: once the user has dragged it somewhere, that is where it
+        // lives (clamped, in case the size change would hang it off-screen).
+        let (x, y) = place_for(want);
         unsafe {
-            let sw = GetSystemMetrics(SM_CXSCREEN);
-            let sh = GetSystemMetrics(SM_CYSCREEN);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                (sw - want[0] as i32) / 2,
-                (sh - want[1] as i32) / 3,
+                x,
+                y,
                 want[0] as i32,
                 want[1] as i32,
                 SWP_NOACTIVATE,
@@ -3363,6 +3637,45 @@ impl eframe::App for MxRunApp {
                 self.selected =
                     (self.selected + self.results.len() - 1) % self.results.len().max(1);
             }
+            // Tab / Shift+Tab walk the list like ↓ / ↑ (AltRun's binding).
+            // Only here in the launcher: inside the cards Tab is how you move
+            // between the fields, so it must not be eaten.
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab))
+                && !self.results.is_empty()
+            {
+                self.selected = (self.selected + 1) % self.results.len().max(1);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Tab))
+                && !self.results.is_empty()
+            {
+                self.selected =
+                    (self.selected + self.results.len() - 1) % self.results.len().max(1);
+            }
+            // Ctrl/Alt+digit runs the Nth row; `;` and `'` are AltRun's own
+            // shortcuts for the second and third (they sit right next to the
+            // numbers on the keyboard it was written for).
+            if let Some(row) = consume_digit(&ctx) {
+                self.run_index(row, &ctx);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Semicolon)) {
+                self.run_index(SEMICOLON_ROW, &ctx);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Quote)) {
+                self.run_index(QUOTE_ROW, &ctx);
+                return;
+            }
+            // Ctrl+C copies the selected item's command line, Ctrl+L switches
+            // to the recently used list (both from AltRun's key table).
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::C)) {
+                self.copy_command();
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::L)) {
+                self.toggle_recent();
+                return;
+            }
         }
 
         let panel = egui::Frame::new()
@@ -3374,6 +3687,23 @@ impl eframe::App for MxRunApp {
         egui::CentralPanel::default()
             .frame(panel)
             .show(ui, |ui| {
+                // Dragging the card's empty space moves the window: the OS runs
+                // its own move loop (`drag_window`), which is why the position
+                // can be saved the moment the call returns. Registered before
+                // the views so that rows, buttons and text fields — added later
+                // and therefore on top — keep their own drag behaviour.
+                let bg = ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("card-drag"),
+                    egui::Sense::drag(),
+                );
+                if bg.drag_started()
+                    && let Some(hwnd) = main_hwnd()
+                {
+                    drag_window(hwnd);
+                    self.save_position();
+                }
+
                 if self.view_settings {
                     self.render_settings(ui);
                 } else {
@@ -3442,6 +3772,7 @@ impl MxRunApp {
 
         // --- Result list ---
         let mut clicked: Option<usize> = None;
+        let mut run_now: Option<usize> = None;
         let mut menu_action: Option<(usize, MenuAction)> = None;
         for row in 0..self.results.len() {
             let sc = &self.results[row];
@@ -3474,6 +3805,18 @@ impl MxRunApp {
             let inner = frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    // The index, the way AltRun printed it in the first column —
+                    // just quieter, so it does not fight the icon and the title.
+                    // `Ctrl/Alt + N` runs this row; `;` and `'` are the second
+                    // and third.
+                    ui.add_sized(
+                        [14.0, 20.0],
+                        egui::Label::new(
+                            RichText::new(format!("{}", row + 1))
+                                .size(11.0)
+                                .color(Color32::from_gray(if selected { 150 } else { 85 })),
+                        ),
+                    );
                     match &icon {
                         // Real shell icon at the display resolution (the texture
                         // is fetched at 24 * pixels_per_point physical pixels and
@@ -3529,8 +3872,15 @@ impl MxRunApp {
             if resp.hovered() {
                 self.selected = row;
             }
+            // AltRun's list semantics (docs/AltRun交互规格.md §1): a single
+            // click only *selects*, and a double click (or the middle button)
+            // runs it. Clicking to run was a mis-click waiting to happen once
+            // the list grew past a hundred entries.
             if resp.clicked() {
                 clicked = Some(row);
+            }
+            if resp.double_clicked() || resp.clicked_by(egui::PointerButton::Middle) {
+                run_now = Some(row);
             }
             // AltRun's list had a right-click menu (添加 / 编辑 / 删除 /
             // 打开所在目录). Add stays on Insert and the tray; the three that
@@ -3551,6 +3901,10 @@ impl MxRunApp {
             });
         }
         if let Some(row) = clicked {
+            // Select only — running is the double click below.
+            self.selected = row;
+        }
+        if let Some(row) = run_now {
             self.selected = row;
             self.execute_selected(ctx);
         }
@@ -4149,6 +4503,7 @@ mod tests {
             searchable: base.to_lowercase(),
             item,
             frec_bonus: 0.0,
+            last_used: 0,
             launches: 0,
         }
     }
@@ -4481,5 +4836,45 @@ mod tests {
         assert!(form.command.is_empty(), "the user supplies the command");
         assert_eq!(form.origin, AddOrigin::Launcher);
         assert!(form.source_path.is_empty(), "no source path to show");
+    }
+
+    // ---- keyboard flow (P1: AltRun's key table) ---------------------------
+
+    /// The rule that keeps digit-named items reachable: bare digits are search
+    /// text, never a command. Only Ctrl/Alt turn a digit into "run row N".
+    #[test]
+    fn bare_digits_stay_search_text() {
+        for key in [Key::Num1, Key::Num7, Key::Num0] {
+            assert_eq!(digit_row(key, false, false), None, "{key:?} must be typeable");
+        }
+        // …and with a modifier they pick a row, 1-based on screen, 0-based here.
+        assert_eq!(digit_row(Key::Num1, true, false), Some(0));
+        assert_eq!(digit_row(Key::Num1, false, true), Some(0), "Alt works too");
+        assert_eq!(digit_row(Key::Num9, true, false), Some(8));
+        // The tenth row is `0`, exactly as AltRun's index column printed it.
+        assert_eq!(digit_row(Key::Num0, true, false), Some(9));
+        // Anything that is not a digit is not our business.
+        assert_eq!(digit_row(Key::A, true, false), None);
+        assert_eq!(digit_row(Key::F2, true, false), None);
+    }
+
+    /// `;` and `'` are AltRun's second and third rows.
+    #[test]
+    fn punctuation_rows_match_the_original() {
+        assert_eq!(SEMICOLON_ROW, 1, "`;` is the 2nd row on screen");
+        assert_eq!(QUOTE_ROW, 2, "`'` is the 3rd row on screen");
+    }
+
+    /// `Ctrl+L`: "recently used" means *used*, inside a week.
+    #[test]
+    fn recent_list_window() {
+        let now = 1_800_000_000u64;
+        assert!(is_recent(now, now), "just launched");
+        assert!(is_recent(now - RECENT_WINDOW_SECS, now), "at the edge");
+        assert!(!is_recent(now - RECENT_WINDOW_SECS - 1, now), "one second too old");
+        assert!(!is_recent(0, now), "never launched is not recent");
+        // A clock that jumped backwards (NTP, DST, a manual fix) must not hide
+        // what was just used: a "future" timestamp stays recent.
+        assert!(is_recent(now + 10_000, now));
     }
 }
