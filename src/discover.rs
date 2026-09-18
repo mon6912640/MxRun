@@ -98,7 +98,14 @@ impl ScanReport {
     /// Wording for the status line / settings page.
     pub fn human(&self) -> String {
         if self.added == 0 {
-            format!("已扫描开始菜单，没有新应用（现有 {} 个，用时 {}ms）", self.existing, self.millis)
+            // This used to print "现有 N 个", which read as "the list has N
+            // items" — it is really how many the scan already knew about, so a
+            // cached re-scan showed "没有新应用（现有 2 个）" on a 157-item list
+            // (spotted in a screenshot, 2026-09-17). Say what was examined.
+            format!(
+                "已扫描开始菜单：没有新应用（这次检查了 {} 个快捷方式，{} 个没变化，用时 {}ms）",
+                self.seen, self.cached, self.millis
+            )
         } else {
             format!(
                 "自动发现 {} 个应用（跳过 {} 个卸载/帮助类、{} 个网页快捷方式）",

@@ -62,6 +62,10 @@ const ADD_SIZE: [f32; 2] = [540.0, 300.0];
 /// The manager is wider on purpose: command lines are long, and AltRun's own
 /// manager gave the command column 400px for the same reason.
 const MANAGER_SIZE: [f32; 2] = [880.0, 560.0];
+/// Settings grew past the launcher's height (hotkey + discovery + integration),
+/// and a settings page that hides its own buttons is worse than a taller card.
+/// It scrolls too, so nothing can fall off the bottom again.
+const SETTINGS_SIZE: [f32; 2] = [680.0, 560.0];
 
 /// Paths this instance was started with (before eframe owns the process).
 static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -1617,6 +1621,9 @@ struct MxRunApp {
     discovery_note: String,
     /// `Ctrl+L`: show only recently used items (AltRun's 最近列表).
     recent_only: bool,
+    /// Set when the selection moved by keyboard, so the list can scroll it back
+    /// into view (the launcher list scrolls now that eight rows no longer fit).
+    scroll_selected: bool,
     /// This process was started *by* an add request (right-click → 发送到 while
     /// nothing was running). Only then does the "MxRun is now resident" note
     /// make sense.
@@ -1867,6 +1874,7 @@ impl MxRunApp {
                 .then_some(false),
             discovery_note: String::new(),
             recent_only: false,
+            scroll_selected: false,
             cold_start_add: false,
             add_note_shown: false,
             applied_size: LAUNCHER_SIZE,
@@ -2687,6 +2695,7 @@ impl MxRunApp {
             return;
         }
         self.selected = row;
+        self.scroll_selected = true;
         self.execute_selected(ctx);
     }
 
@@ -2856,6 +2865,8 @@ impl MxRunApp {
             ADD_SIZE
         } else if self.manage {
             MANAGER_SIZE
+        } else if self.view_settings {
+            SETTINGS_SIZE
         } else {
             LAUNCHER_SIZE
         };
@@ -3158,6 +3169,21 @@ impl MxRunApp {
     // ---------- settings view ----------
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
+        // Scrollable: the page keeps growing, and a settings screen whose own
+        // "返回" button is below the window edge is a bug (reported 2026-09-17).
+        // The wheel and the bar scroll it; dragging scrolls nothing — on a
+        // frameless card, dragging anywhere should move the window (see the drag
+        // handle in `eframe::App::ui`), which is what AltRun did too.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
+            .show(ui, |ui| self.render_settings_body(ui));
+    }
+
+    fn render_settings_body(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("⚙ 设置").size(20.0));
         ui.add_space(12.0);
 
@@ -3632,10 +3658,12 @@ impl eframe::App for MxRunApp {
             }
             if ctx.input(|i| i.key_pressed(Key::ArrowDown)) && !self.results.is_empty() {
                 self.selected = (self.selected + 1) % self.results.len().max(1);
+                self.scroll_selected = true;
             }
             if ctx.input(|i| i.key_pressed(Key::ArrowUp)) && !self.results.is_empty() {
                 self.selected =
                     (self.selected + self.results.len() - 1) % self.results.len().max(1);
+                self.scroll_selected = true;
             }
             // Tab / Shift+Tab walk the list like ↓ / ↑ (AltRun's binding).
             // Only here in the launcher: inside the cards Tab is how you move
@@ -3644,12 +3672,14 @@ impl eframe::App for MxRunApp {
                 && !self.results.is_empty()
             {
                 self.selected = (self.selected + 1) % self.results.len().max(1);
+                self.scroll_selected = true;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Tab))
                 && !self.results.is_empty()
             {
                 self.selected =
                     (self.selected + self.results.len() - 1) % self.results.len().max(1);
+                self.scroll_selected = true;
             }
             // Ctrl/Alt+digit runs the Nth row; `;` and `'` are AltRun's own
             // shortcuts for the second and third (they sit right next to the
@@ -3771,9 +3801,25 @@ impl MxRunApp {
         }
 
         // --- Result list ---
+        //
+        // Scrollable: eight rows at the current row height are more than a
+        // 400px card holds, so the last one or two used to be cut off with no
+        // way to reach them (the list only ever scrolls when the selection is
+        // moved, which `scroll_selected` tracks).
         let mut clicked: Option<usize> = None;
         let mut run_now: Option<usize> = None;
         let mut menu_action: Option<(usize, MenuAction)> = None;
+        let scroll_selected = std::mem::take(&mut self.scroll_selected);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            // Wheel and scroll bar scroll it; dragging scrolls nothing — on a
+            // frameless card, dragging anywhere should move the window (see the
+            // drag handle in eframe::App::ui), which is what AltRun did too.
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
+            .show(ui, |ui| {
         for row in 0..self.results.len() {
             let sc = &self.results[row];
             let item = &self.items[sc.idx];
@@ -3872,6 +3918,10 @@ impl MxRunApp {
             if resp.hovered() {
                 self.selected = row;
             }
+            // Keep the selection on screen when ↑↓/Tab/digits move it.
+            if selected && scroll_selected {
+                resp.scroll_to_me(Some(egui::Align::Center));
+            }
             // AltRun's list semantics (docs/AltRun交互规格.md §1): a single
             // click only *selects*, and a double click (or the middle button)
             // runs it. Clicking to run was a mis-click waiting to happen once
@@ -3900,6 +3950,7 @@ impl MxRunApp {
                 }
             });
         }
+        });
         if let Some(row) = clicked {
             // Select only — running is the double click below.
             self.selected = row;
@@ -4038,6 +4089,13 @@ impl MxRunApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            // Wheel and scroll bar scroll it; dragging scrolls nothing — on a
+            // frameless card, dragging anywhere should move the window (see the
+            // drag handle in eframe::App::ui), which is what AltRun did too.
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
             .show(ui, |ui| {
                 for row in 0..self.results.len() {
                     let sc = &self.results[row];
