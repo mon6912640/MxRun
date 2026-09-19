@@ -1537,6 +1537,24 @@ fn digit_row(key: Key, ctrl: bool, alt: bool) -> Option<usize> {
     })
 }
 
+/// A bare digit runs a row **only while the search box is empty**.
+///
+/// With text in the box, digits are search text — `python 3.12`, `3.12`, `win
+/// 11` all have to be typeable. The empty-box half is the same idea as AltRun's
+/// "space with an empty box runs the first item": with nothing typed, a key is
+/// a command; once you are typing, it is input.
+///
+/// Cost, measured before choosing it: no item in the real lists starts with a
+/// digit (0 of 175 Start Menu shortcuts, 0 of 72 curated keywords), so nothing
+/// becomes unreachable — and a digit-leading query can still be found by any
+/// of its later characters ("zip" finds 7-Zip).
+fn bare_digit_row(key: Key, input_is_empty: bool) -> Option<usize> {
+    if !input_is_empty {
+        return None;
+    }
+    digit_row(key, true, false)
+}
+
 /// `;` runs the second row and `'` the third — AltRun's own shortcuts
 /// (`frmALTRun.pas:1588-1594`), kept as they were. The price is that neither
 /// character can be typed into the search box; AltRun's keywords were always
@@ -1556,6 +1574,23 @@ fn consume_digit(ctx: &egui::Context) -> Option<usize> {
             {
                 return Some(row);
             }
+        }
+    }
+    None
+}
+
+/// The same for a bare digit with an empty search box (`bare_digit_row`).
+fn consume_bare_digit(ctx: &egui::Context, input_is_empty: bool) -> Option<usize> {
+    if !input_is_empty {
+        return None;
+    }
+    use egui::Key::*;
+    const DIGITS: [Key; 10] = [Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
+    for key in DIGITS {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
+            && let Some(row) = bare_digit_row(key, input_is_empty)
+        {
+            return Some(row);
         }
     }
     None
@@ -1918,6 +1953,25 @@ impl MxRunApp {
         // rule can be verified without clicking 现在扫一次.
         if let Ok(mode) = std::env::var("MXRUN_SELFTEST_DISCOVER") {
             app.discovery_pending = Some(mode == "force");
+        }
+
+        // Debug hook: run row N the way a digit key does
+        // (`MXRUN_SELFTEST_ROW=3` is what pressing `3` on an empty box does).
+        // **It really runs the item**, so only point it at a scratch profile.
+        if let Ok(spec) = std::env::var("MXRUN_SELFTEST_ROW")
+            && let Ok(row) = spec.trim().parse::<usize>()
+        {
+            let title = app
+                .results
+                .get(row.saturating_sub(1))
+                .map(|sc| app.items[sc.idx].item.title.clone());
+            log_line(&format!(
+                "selftest: row {row} -> {:?} ({} rows)",
+                title,
+                app.results.len()
+            ));
+            app.run_index(row.saturating_sub(1), &cc.egui_ctx);
+            log_line(&format!("selftest: after row {row}: {}", app.status));
         }
 
         // Debug hook: switch to the recent list at startup
@@ -3688,6 +3742,13 @@ impl eframe::App for MxRunApp {
                 self.run_index(row, &ctx);
                 return;
             }
+            // A bare digit does the same **while the box is empty** — summon,
+            // see your list, press 3. Typing anything turns digits back into
+            // text (`bare_digit_row`).
+            if let Some(row) = consume_bare_digit(&ctx, self.input.trim().is_empty()) {
+                self.run_index(row, &ctx);
+                return;
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Semicolon)) {
                 self.run_index(SEMICOLON_ROW, &ctx);
                 return;
@@ -4899,7 +4960,7 @@ mod tests {
     // ---- keyboard flow (P1: AltRun's key table) ---------------------------
 
     /// The rule that keeps digit-named items reachable: bare digits are search
-    /// text, never a command. Only Ctrl/Alt turn a digit into "run row N".
+    /// text, never a command…
     #[test]
     fn bare_digits_stay_search_text() {
         for key in [Key::Num1, Key::Num7, Key::Num0] {
@@ -4914,6 +4975,20 @@ mod tests {
         // Anything that is not a digit is not our business.
         assert_eq!(digit_row(Key::A, true, false), None);
         assert_eq!(digit_row(Key::F2, true, false), None);
+    }
+
+    /// …except with an empty box, where a bare digit runs the row it names.
+    #[test]
+    fn bare_digits_run_a_row_only_on_an_empty_box() {
+        assert_eq!(bare_digit_row(Key::Num3, true), Some(2), "empty box: run row 3");
+        assert_eq!(bare_digit_row(Key::Num1, true), Some(0));
+        assert_eq!(bare_digit_row(Key::Num0, true), Some(9));
+        // The moment there is text in the box, digits belong to the query.
+        for key in [Key::Num1, Key::Num3, Key::Num0] {
+            assert_eq!(bare_digit_row(key, false), None, "{key:?} must be typeable");
+        }
+        assert_eq!(bare_digit_row(Key::A, true), None);
+        assert_eq!(bare_digit_row(Key::Enter, true), None);
     }
 
     /// `;` and `'` are AltRun's second and third rows.
