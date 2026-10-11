@@ -380,6 +380,10 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_transparent(true)
+            // Explicit: the taskbar / Alt+Tab entry. It already read "MxRun"
+            // (eframe defaults to the crate name), but that would silently
+            // follow a rename of the binary.
+            .with_title("MxRun")
             .with_always_on_top()
             .with_inner_size(start_size)
             .with_min_inner_size([480.0, 200.0]),
@@ -722,6 +726,13 @@ fn drag_window(hwnd: HWND) {
             Some(WPARAM(HTCAPTION as usize)),
             Some(LPARAM(0)),
         );
+        // The modal move loop underneath that call pumps its own messages and
+        // swallows the mouse ones: winit never sees the button come up, so egui
+        // keeps believing the pointer is down and **ignores the next drag**
+        // (measured with synthesized input 2026-09-19: every second drag did
+        // nothing — which is exactly what "I can't drag it" felt like). Post
+        // the release ourselves so the input state catches up.
+        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -4319,18 +4330,29 @@ impl MxRunApp {
             return;
         }
 
-        // --- Drag grip ---
+        // --- Title strip ---
         //
-        // A frameless card needs to say where it can be grabbed, and the card
-        // is otherwise full of things that want the pointer (search box, rows,
-        // buttons). This thin pill at the top is the answer — the whole strip
-        // around it is draggable too, as is any row.
-        ui.vertical_centered(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 3.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, egui::CornerRadius::same(2), Color32::from_gray(72));
+        // The card is frameless, so this is its title bar: the app name on the
+        // left, a grip on the right, and — like everywhere else on the card —
+        // the strip drags the window (see the drag handle in `App::ui`). A
+        // frameless card has to say what it is and where it can be grabbed.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("MxRun")
+                    .size(12.0)
+                    .color(Color32::from_gray(135)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(26.0, 3.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(2),
+                    Color32::from_gray(74),
+                );
+            });
         });
-        ui.add_space(4.0);
+        ui.add_space(3.0);
 
         // --- Search box ---
         //
@@ -4605,7 +4627,7 @@ impl MxRunApp {
         let status = self.status.clone();
         // egui 0.36 unified the panel types: this used to be `TopBottomPanel`,
         // and `show_inside` is now `show`.
-        egui::Panel::bottom("mxrun-status")
+        let rect = egui::Panel::bottom("mxrun-status")
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 ui.add_space(2.0);
@@ -4616,7 +4638,23 @@ impl MxRunApp {
                 );
             })
             .response
-            .rect
+            .rect;
+        // The panel registers its own `click_and_drag` on its resize edge and
+        // eats the press there, which made the status strip the one dead spot on
+        // the card (measured: a drag at its top edge did nothing). Lay a drag
+        // area on top of it — later widgets win — so the whole card drags.
+        let drag = ui.interact(
+            rect,
+            ui.id().with("status-drag"),
+            egui::Sense::drag(),
+        );
+        if drag.drag_started()
+            && let Some(hwnd) = main_hwnd()
+        {
+            drag_window(hwnd);
+            self.save_position();
+        }
+        rect
     }
 
     /// Complain in the log if the list is drawn over the status line — the
