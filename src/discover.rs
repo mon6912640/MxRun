@@ -89,6 +89,8 @@ pub struct ScanReport {
     pub skipped_junk: usize,
     pub skipped_web: usize,
     pub skipped_missing: usize,
+    /// System / maintenance tools the scan refuses to add (see is_system_tool).
+    pub skipped_system: usize,
     /// Already in the list (the user's own entry, or an earlier scan).
     pub existing: usize,
     /// Removed by the user before — a tombstone keeps them out.
@@ -100,6 +102,10 @@ pub struct ScanReport {
     pub uwp_existing: usize,
     /// How long the AppsFolder enumeration took, in milliseconds.
     pub uwp_millis: u128,
+    /// Duplicate UWP entries dropped because a desktop item had the same name.
+    pub removed_duplicates: usize,
+    /// Stored system tools dropped because today's rules filter them out.
+    pub removed_filtered: usize,
     /// How long the scan took, in milliseconds.
     pub millis: u128,
 }
@@ -108,22 +114,24 @@ impl ScanReport {
     /// One line for the log.
     pub fn summary(&self) -> String {
         format!(
-            "seen={} cached={} added={} existing={} tombstoned={} skipped(junk={} web={} missing={}) uwp(seen={} existing={} in {}ms) in {}ms",
+            "seen={} cached={} added={} existing={} tombstoned={} dropped(dupes={} filtered={}) skipped(junk={} web={} missing={} system={}) uwp(seen={} existing={} in {}ms) in {}ms",
             self.seen,
             self.cached,
             self.added,
             self.existing,
             self.tombstoned,
+            self.removed_duplicates,
+            self.removed_filtered,
             self.skipped_junk,
             self.skipped_web,
             self.skipped_missing,
+            self.skipped_system,
             self.uwp_seen,
             self.uwp_existing,
             self.uwp_millis,
             self.millis
         )
     }
-
     /// Wording for the status line / settings page.
     pub fn human(&self) -> String {
         if self.added == 0 {
@@ -320,6 +328,141 @@ fn normalize_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
+/// Remove UWP duplicates that a **non**-UWP item already covers by name.
+///
+/// The scan no longer creates these (the UWP pass now knows the names the Start
+/// Menu pass just found), but lists written before that fix still hold them —
+/// the ranking diagnostic showed two `Settings` rows. Deleting **without** a
+/// tombstone is deliberate: if the user later removes the desktop entry, the app
+/// should be discoverable again on the next scan.
+pub fn cleanup_duplicate_titles(store: &mut Store) -> usize {
+    let items = store.load_items().unwrap_or_default();
+    let mut desktop_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in &items {
+        if item.source.provider != UWP_PROVIDER {
+            desktop_titles.insert(normalize_name(&item.title));
+        }
+    }
+    let mut removed = 0;
+    for item in &items {
+        if item.source.provider == UWP_PROVIDER && desktop_titles.contains(&normalize_name(&item.title))
+        {
+            crate::log_line(&format!(
+                "discover: dropping duplicate UWP entry {:?} (a desktop entry has the same name)",
+                item.title
+            ));
+            if store.delete_item_by_id(&item.id).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Windows tools people actually launch from a launcher.
+///
+/// Everything else in `%WINDIR%\System32` / `SysWOW64` is a console, a debugger
+/// or a vendor diagnostic that nobody types into a launcher: the scan used to
+/// add `Application Verifier`, `Event Viewer`, `services`, `Steps Recorder`,
+/// `System Information`, `ODBC Data Sources`, `Windows App Cert Kit` — and they
+/// took the *top* of short queries (see the ranking diagnostic in
+/// `docs/开发进度.md` §2.29). An allow-list is the manageable direction: a
+/// blacklist of Windows' own tools never ends.
+///
+/// A user who does want one of them adds it by hand; manual entries are never
+/// filtered.
+const WINDOWS_TOOLS_TO_KEEP: &[&str] = &[
+    "cmd",
+    "powershell",
+    "pwsh",
+    "wt",
+    "notepad",
+    "calc",
+    "mspaint",
+    "explorer",
+    "control",
+    "taskmgr",
+    "snippingtool",
+    "osk",
+    "magnify",
+    "charmap",
+    "dxdiag",
+];
+
+/// Should the scan skip this target as a system / maintenance tool?
+///
+/// Three rules, all measured against a real Start Menu (§2.29):
+/// * `.msc` / `.cpl` — console snap-ins and control-panel applets;
+/// * anything under `\Windows\Installer\` — MSI cache leftovers that only
+///   trigger a repair;
+/// * `System32` / `SysWOW64` files that are not on [`WINDOWS_TOOLS_TO_KEEP`].
+///
+/// Pure (path in, decision out), so the rules can be tested.
+fn is_system_tool(target: &Path) -> bool {
+    let lower = target.to_string_lossy().to_lowercase();
+    let ext = target
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if ext == "msc" || ext == "cpl" {
+        return true;
+    }
+    if lower.contains(r"\windows\installer\") {
+        return true;
+    }
+    // Windows Kits is the SDK: App Cert Kit, Performance Analyzer, gflags and
+    // friends. Same allow-list treatment.
+    let in_windows_dirs = lower.contains(r"\windows\system32\")
+        || lower.contains(r"\windows\syswow64\")
+        || lower.contains(r"\windows\winsxs\")
+        || lower.contains(r"\windows kits\");
+    if !in_windows_dirs {
+        return false;
+    }
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    !WINDOWS_TOOLS_TO_KEEP.contains(&stem.as_str())
+}
+
+/// Drop discovered items that today's rules would never have added.
+///
+/// The filter above only protects *new* scans; lists written before it keep
+/// their `Application Verifier`, `Event Viewer`, `services.msc` and friends —
+/// and those are exactly the rows that were taking the top of short queries.
+/// This is the self-healing half.
+///
+/// Two guard rails: only items a scan put there (`startmenu` — a manual or
+/// imported entry is never touched), and only ones **never launched** — if the
+/// user actually uses one of them from MxRun, it stays.
+pub fn cleanup_filtered_discovered(store: &mut Store) -> usize {
+    let items = store.load_items().unwrap_or_default();
+    let mut removed = 0;
+    for item in &items {
+        if item.source.provider != PROVIDER {
+            continue;
+        }
+        if store.get_frecency(&item.id).count > 0 {
+            continue;
+        }
+        let Some(target) = item.default_action().and_then(crate::action_command) else {
+            continue;
+        };
+        if !is_system_tool(Path::new(&target)) {
+            continue;
+        }
+        crate::log_line(&format!(
+            "discover: dropping {:?} — a system tool today's rules filter out",
+            item.title
+        ));
+        if store.delete_item_by_id(&item.id).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Scan the Start Menu: pure filesystem + COM work, no database access.
 pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
     let started = std::time::Instant::now();
@@ -371,6 +514,10 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
                 out.report.skipped_missing += 1;
                 return;
             }
+            if is_system_tool(&target) {
+                out.report.skipped_system += 1;
+                return;
+            }
             let key = normalize(&target);
             if !seen_targets.insert(key) {
                 // The same executable is already in the list — either the
@@ -392,10 +539,15 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
     // the same app usually already exists as the user's own entry or as the
     // `.exe` shim the Start Menu scan found.
     let uwp_started = std::time::Instant::now();
+    // Names to avoid: what the list already has, **plus what this same scan just
+    // found on the Start Menu**. Missing the second half put two `Settings` rows
+    // in the list — one from a shortcut, one from the Store (spotted in the
+    // ranking diagnostic, 2026-09-19).
     let mut titles: std::collections::HashSet<String> = input
         .titles
         .iter()
         .map(|t| normalize_name(t))
+        .chain(fresh.iter().map(|item| normalize_name(&item.title)))
         .collect();
     for entry in enumerate_apps_folder() {
         if !is_uwp_aumid(&entry.parsing) {
@@ -432,6 +584,8 @@ pub fn apply(store: &mut Store, mut out: ScanOutput) -> ScanReport {
             crate::log_line(&format!("discover: writing failed: {e}"));
         }
     }
+    out.report.removed_duplicates = cleanup_duplicate_titles(store);
+    out.report.removed_filtered += cleanup_filtered_discovered(store);
     out.report
 }
 
@@ -657,6 +811,78 @@ mod tests {
         assert!(title_taken("计算器", &taken));
         assert!(title_taken("  计算器 ", &taken));
         assert!(!title_taken("照片", &taken));
+    }
+
+    /// A UWP entry that a desktop item already covers by name gets dropped — and
+    /// dropped *without* a tombstone, so it can come back if the user removes the
+    /// desktop entry later.
+    #[test]
+    fn duplicate_titles_are_cleaned_up() {
+        let dir = temp_dir("dup-cleanup");
+        let mut store = Store::open_at(dir.clone()).expect("store");
+
+        let mut desktop = uwp_item_for("Settings", "ignored");
+        desktop.id = "startmenu:test-settings".to_string();
+        desktop.source.provider = PROVIDER.to_string();
+        desktop.source.external_id = r"c:\windows\settings.lnk".to_string();
+        desktop.title = "Settings".to_string();
+        let mut duplicate = uwp_item_for("Settings", "Microsoft.Windows.Settings_abc!App");
+        duplicate.id = "uwp:test-settings".to_string();
+        let mut keeper = uwp_item_for("照片", "Microsoft.Windows.Photos_abc!App");
+        keeper.id = "uwp:test-photos".to_string();
+        store.upsert_item(&desktop).expect("insert desktop");
+        store.upsert_item(&duplicate).expect("insert uwp dup");
+        store.upsert_item(&keeper).expect("insert uwp keeper");
+
+        assert_eq!(cleanup_duplicate_titles(&mut store), 1, "one duplicate");
+        let left: Vec<String> = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.title)
+            .collect();
+        assert!(left.contains(&"Settings".to_string()), "the desktop one stays");
+        assert!(left.contains(&"照片".to_string()), "an unrelated UWP app stays");
+        assert!(
+            !store.is_deleted(&duplicate.source.provider, &duplicate.source.external_id),
+            "no tombstone: it may return"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// System / maintenance tools stay out of the list; the ones people actually
+    /// launch stay in.
+    #[test]
+    fn system_tools_are_filtered() {
+        let p = |s: &str| PathBuf::from(s);
+        // Consoles and control-panel applets.
+        assert!(is_system_tool(&p(r"C:\WINDOWS\system32\eventvwr.msc")));
+        assert!(is_system_tool(&p(r"C:\WINDOWS\system32\services.msc")));
+        assert!(is_system_tool(&p(r"C:\WINDOWS\system32\joy.cpl")));
+        // MSI cache leftovers: launching one only triggers a repair.
+        assert!(is_system_tool(&p(
+            r"C:\WINDOWS\Installer\{BC1FA5CF-A36F-4C61-9638-09D0B431B00D}\foo.exe"
+        )));
+        // Windows' own directories: only the allow-list survives.
+        assert!(is_system_tool(&p(r"C:\Windows\System32\appverif.exe")));
+        assert!(is_system_tool(&p(r"C:\Windows\SysWOW64\AMDBugReportTool.exe")));
+        assert!(is_system_tool(&p(r"C:\WINDOWS\system32\psr.exe")));
+        assert!(is_system_tool(&p(r"C:\WINDOWS\system32\msinfo32.exe")));
+        assert!(!is_system_tool(&p(r"C:\Windows\System32\cmd.exe")));
+        assert!(!is_system_tool(&p(r"C:\Windows\System32\notepad.exe")));
+        assert!(!is_system_tool(&p(r"C:\Windows\System32\calc.exe")));
+        assert!(!is_system_tool(&p(r"C:\Windows\explorer.exe")));
+        // Everything outside Windows' directories is untouched — this rule must
+        // never eat a normal application.
+        assert!(!is_system_tool(&p(
+            r"C:\Program Files\Google\Chrome\chrome.exe"
+        )));
+        assert!(!is_system_tool(&p(
+            r"C:\Program Files\AMD\CNext\RadeonSoftware.exe"
+        )));
+        assert!(!is_system_tool(&p(r"S:\games\Steam\Steam.exe")));
+        assert!(!is_system_tool(&p(r"R:\apps\AltRun\Bin\AltRun.exe")));
     }
 
     #[test]

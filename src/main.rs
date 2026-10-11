@@ -1435,6 +1435,11 @@ struct Indexed {
 struct Scored {
     idx: usize,
     score: f64,
+    /// The query hits a *token start* in the searchable text (`chrome` for
+    /// `chr`, `calc` for `c`) rather than being scattered through it
+    /// (`c`…`o`…`c`…`o`…`s` in "Cocos Dashboard"). Short queries only accept
+    /// these; see [`MIN_FUZZY_CHARS`].
+    strong: bool,
     /// char indices into `item.title` to highlight (may be empty)
     hit_indices: Vec<u32>,
 }
@@ -1494,9 +1499,37 @@ fn rank_item(
     Some(Scored {
         idx,
         score: base + keyword_bonus + it.frec_bonus,
+        strong: is_token_start(&it.searchable, &q),
         hit_indices: hits,
     })
 }
+
+/// Does `query` sit at the start of some word in `haystack`?
+///
+/// The searchable text is lowercase with the fields — and the per-syllable
+/// pinyin — separated by spaces, so "a word start" is exactly what a user means
+/// by "starts with": `chr` is a word start in "chrome", not in "cocos dashboard".
+/// Cheap (a handful of comparisons per item) and pure enough to test.
+fn is_token_start(haystack: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if haystack.starts_with(query) {
+        return true;
+    }
+    haystack
+        .match_indices(' ')
+        .any(|(i, _)| haystack[i + 1..].starts_with(query))
+}
+
+/// Queries this short only accept token-start matches. One or two letters is a
+/// "find me something starting with this" gesture; letting them fuzzy-match
+/// everywhere is what filled the list with noise (125 of 198 items matched `e`,
+/// 2026-09-19). Measured with the diagnostic: at 3, `e` drops from eight rows to
+/// six all-real ones and `ch`/`py` lose their scattered filler, while the
+/// hand-written one- and two-letter keywords (`b`, `g`, `zd`) still match as
+/// token starts and stay.
+const MIN_FUZZY_CHARS: usize = 3;
 
 /// Drop the long tail of weak fuzzy matches (see [`SCORE_GATE`]). Expects a
 /// sorted list; a zero best score means nothing matched strongly, so nothing is
@@ -1535,6 +1568,99 @@ fn row_detail(item: &Item) -> String {
         return "Windows 应用".to_string();
     }
     truncate_chars(target, 64)
+}
+
+/// Build the searchable index for a list of items.
+///
+/// Free function (not a method) so the ranking can be measured and tested
+/// without a window: the diagnostic below drives it directly on a copy of a real
+/// database, which is how the "noise" question gets answered with numbers rather
+/// than taste.
+fn index_items(items: Vec<Item>, store: &mut Store) -> Vec<Indexed> {
+    items
+        .into_iter()
+        .map(|item| {
+            let base = item.haystack();
+            let mut full = String::new();
+            let mut initials = String::new();
+            for ch in base.chars() {
+                let mut buf = [0u8; 4];
+                let s: &str = ch.encode_utf8(&mut buf);
+                if let Some(py) = s.to_pinyin().next().flatten() {
+                    let plain = py.plain();
+                    full.push_str(plain);
+                    full.push(' ');
+                    if let Some(c) = plain.chars().next() {
+                        initials.push(c);
+                    }
+                }
+            }
+            let searchable = if initials.is_empty() {
+                base.to_lowercase()
+            } else {
+                format!("{} {} {}", base.to_lowercase(), full, initials)
+            };
+            let frec = store.get_frecency(&item.id);
+            Indexed {
+                title_chars: item.title.chars().count(),
+                keywords_lower: item
+                    .keywords
+                    .iter()
+                    .map(|k| k.trim().to_lowercase())
+                    .filter(|k| !k.is_empty())
+                    .collect(),
+                item,
+                searchable,
+                frec_bonus: frecency_bonus(&frec),
+                launches: frec.count,
+                last_used: frec.last_used,
+            }
+        })
+        .collect()
+}
+
+/// Rank `items` for `query` exactly the way the launcher does, and return the
+/// top rows with their scores. Used by the diagnostic and the tests — the point
+/// is that it cannot drift from what the UI does.
+#[cfg(test)]
+fn rank_all(items: &[Indexed], query: &str, limit: usize) -> Vec<(String, f64, bool)> {
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf: Vec<char> = Vec::new();
+    let mut idx_buf: Vec<u32> = Vec::new();
+    let mut scored: Vec<Scored> = Vec::new();
+    for (idx, it) in items.iter().enumerate() {
+        if let Some(sc) = rank_item(
+            idx,
+            it,
+            query,
+            &pattern,
+            &mut matcher,
+            &mut buf,
+            &mut idx_buf,
+        ) {
+            scored.push(sc);
+        }
+    }
+    let before_gate = scored.len();
+    apply_score_gate(&mut scored);
+    // Mirror the launcher: short queries drop scattered matches.
+    if query.chars().count() < MIN_FUZZY_CHARS {
+        scored.retain(|sc| sc.strong);
+    }
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let _ = before_gate;
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|sc| {
+            (
+                items[sc.idx].item.title.clone(),
+                sc.score,
+                sc.strong,
+            )
+        })
+        .collect()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -2796,46 +2922,7 @@ impl MxRunApp {
     fn rebuild_index(&mut self, _ctx: &egui::Context) {
         let t0 = std::time::Instant::now();
         let items = self.store.load_items().unwrap_or_default();
-        self.items = items
-            .into_iter()
-            .map(|item| {
-                let base = item.haystack();
-                let mut full = String::new();
-                let mut initials = String::new();
-                for ch in base.chars() {
-                    let mut buf = [0u8; 4];
-                    let s: &str = ch.encode_utf8(&mut buf);
-                    if let Some(py) = s.to_pinyin().next().flatten() {
-                        let plain = py.plain();
-                        full.push_str(plain);
-                        full.push(' ');
-                        if let Some(c) = plain.chars().next() {
-                            initials.push(c);
-                        }
-                    }
-                }
-                let searchable = if initials.is_empty() {
-                    base.to_lowercase()
-                } else {
-                    format!("{} {} {}", base.to_lowercase(), full, initials)
-                };
-                let frec = self.store.get_frecency(&item.id);
-                Indexed {
-                    title_chars: item.title.chars().count(),
-                    keywords_lower: item
-                        .keywords
-                        .iter()
-                        .map(|k| k.trim().to_lowercase())
-                        .filter(|k| !k.is_empty())
-                        .collect(),
-                    item,
-                    searchable,
-                    frec_bonus: frecency_bonus(&frec),
-                    launches: frec.count,
-                    last_used: frec.last_used,
-                }
-            })
-            .collect();
+        self.items = index_items(items, &mut self.store);
 
         // Icons are no longer fetched here: warming all of them before the first
         // frame cost ~0.6 s at 59 items and grows linearly with the list. They
@@ -3096,6 +3183,9 @@ impl MxRunApp {
                     self.results.push(Scored {
                         idx,
                         score: it.last_used as f64,
+                        // Not a search hit at all: this list is "what you used
+                        // lately", so every row is as strong as every other.
+                        strong: true,
                         hit_indices: Vec::new(),
                     });
                 }
@@ -3111,6 +3201,7 @@ impl MxRunApp {
                 self.results.push(Scored {
                     idx,
                     score: it.launches as f64,
+                    strong: true,
                     hit_indices: Vec::new(),
                 });
             }
@@ -3120,6 +3211,7 @@ impl MxRunApp {
                 self.results.push(Scored {
                     idx,
                     score: it.frec_bonus,
+                    strong: true,
                     hit_indices: Vec::new(),
                 });
             }
@@ -3176,6 +3268,13 @@ impl MxRunApp {
         // The manager is the place where seeing *everything* is the point: no
         // score gate and no eight-row cap, it scrolls instead.
         if !query.is_empty() && !manage && !recent_only {
+            // Short queries mean "something *starting* with this": a one-letter
+            // query fuzzy-matches most of a 200-item list (`e` hit 125 of them),
+            // and the padding below the real matches is the noise a user
+            // notices. Longer queries keep the fuzzy reach.
+            if query.chars().count() < MIN_FUZZY_CHARS {
+                self.results.retain(|sc| sc.strong);
+            }
             apply_score_gate(&mut self.results);
         }
         if !manage {
@@ -5829,6 +5928,144 @@ mod tests {
 
     /// Imported rows carry no description, so the second line falls back to
     /// what the item actually runs — otherwise half the row is blank.
+    /// Diagnostic, not a test: rank a fixed query list against a *copy* of a real
+    /// database and print the rows. This is how the "search noise" question gets
+    /// answered with numbers.
+    ///
+    /// ```text
+    /// mkdir %TEMP%\diag  &  copy %APPDATA%\MxRun\mxrun.redb %TEMP%\diag\
+    /// set MXRUN_DIAG_DIR=%TEMP%\diag
+    /// cargo test -- --ignored --nocapture diag_ranking
+    /// ```
+    #[test]
+    #[ignore = "diagnostic: needs MXRUN_DIAG_DIR pointing at a copied data directory"]
+    fn diag_ranking() {
+        let Ok(dir) = std::env::var("MXRUN_DIAG_DIR") else {
+            eprintln!("set MXRUN_DIAG_DIR to a directory holding a copied mxrun.redb");
+            return;
+        };
+        let mut store = Store::open_at(std::path::PathBuf::from(&dir)).expect("open copy");
+        let items = index_items(store.load_items().unwrap_or_default(), &mut store);
+        let queries: Vec<String> = std::env::var("MXRUN_DIAG_QUERIES")
+            .map(|s| s.split(',').map(|q| q.trim().to_string()).collect())
+            .unwrap_or_else(|_| {
+                ["c", "a", "e", "s", "ch", "chr", "ch", "计算", "jsj", "py", "st", "se"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+        println!("\n=== {} items ===", items.len());
+        // `MXRUN_DIAG_DUPES=1` answers a different question: which items share a
+        // title (the shape that showed two identical `Settings` rows).
+        if std::env::var_os("MXRUN_DIAG_DUPES").is_some() {
+            let mut by_title: std::collections::HashMap<String, Vec<&Indexed>> =
+                std::collections::HashMap::new();
+            for it in &items {
+                by_title
+                    .entry(it.item.title.trim().to_lowercase())
+                    .or_default()
+                    .push(it);
+            }
+            let mut dupes: Vec<_> = by_title.iter().filter(|(_, v)| v.len() > 1).collect();
+            dupes.sort_by_key(|(t, _)| t.clone());
+            println!("\n-- titles appearing more than once: {} --", dupes.len());
+            for (title, group) in dupes {
+                println!("{title:?}");
+                for it in group {
+                    println!(
+                        "    id={:<44} provider={:<10} target={}",
+                        truncate_chars(&it.item.id, 42),
+                        it.item.source.provider,
+                        truncate_chars(it.item.icon_target().unwrap_or("(none)"), 56)
+                    );
+                }
+            }
+            return;
+        }
+        for q in queries {
+            let raw = {
+                let pattern = Pattern::parse(&q, CaseMatching::Ignore, Normalization::Smart);
+                let mut matcher = Matcher::new(Config::DEFAULT);
+                let mut buf: Vec<char> = Vec::new();
+                let mut idx: Vec<u32> = Vec::new();
+                items
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, it)| {
+                        rank_item(*i, it, &q, &pattern, &mut matcher, &mut buf, &mut idx).is_some()
+                    })
+                    .count()
+            };
+            let strong = {
+                let toks: Vec<&str> = vec![];
+                let _ = toks;
+                let pattern = Pattern::parse(&q, CaseMatching::Ignore, Normalization::Smart);
+                let mut matcher = Matcher::new(Config::DEFAULT);
+                let mut buf: Vec<char> = Vec::new();
+                let mut idx: Vec<u32> = Vec::new();
+                items
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, it)| {
+                        rank_item(*i, it, &q, &pattern, &mut matcher, &mut buf, &mut idx)
+                            .is_some_and(|sc| sc.strong)
+                    })
+                    .count()
+            };
+            let shown = rank_all(&items, &q, 8);
+            println!(
+                "\nquery {q:?}  (matched {raw}, token-start {strong}, shown {})",
+                shown.len()
+            );
+            for (i, (title, score, sc_strong)) in shown.iter().enumerate() {
+                println!(
+                    "   {}. {:<28} {score:>8.1} {:<8} {}",
+                    i + 1,
+                    truncate_chars(title, 26),
+                    if *sc_strong { "start" } else { "fuzzy" },
+                    target_of(&items, title)
+                );
+            }
+        }
+    }
+
+    /// Which file an item points at (for the ranking diagnostic).
+    fn target_of(items: &[Indexed], title: &str) -> String {
+        items
+            .iter()
+            .find(|it| it.item.title == title)
+            .and_then(|it| it.item.icon_target())
+            .map(|t| truncate_chars(t, 58))
+            .unwrap_or_default()
+    }
+
+    /// The short-query rule rests on one predicate, so pin it down.
+    #[test]
+    fn token_start_rule() {
+        let hay = "character map 系统应用 charmap";
+        assert!(is_token_start(hay, "c"));
+        assert!(is_token_start(hay, "ch"));
+        assert!(is_token_start(hay, "cha"), "prefix of the first word");
+        // Not a word start — and this is the case the rule exists for:
+        // "character" is c-h-a-r, so `chr` is a *scattered* match. It still
+        // scores as a fuzzy hit, it just is not a "starts with".
+        assert!(!is_token_start(hay, "chr"));
+        assert!(is_token_start(hay, "map"), "prefix of a later word");
+        assert!(is_token_start(hay, "系统"), "a CJK title is one word");
+        assert!(!is_token_start(hay, "ar"), "inside a word is not a word start");
+        assert!(!is_token_start(hay, "racter"));
+        assert!(!is_token_start(hay, ""), "an empty query matches nothing");
+        // Pinyin syllables are separate tokens, so initials keep working:
+        // `计算器` becomes "计算器 calc jisuanqi jsq", where `j` is a word start.
+        let pinyin = "计算器 calc jisuanqi jsq";
+        assert!(is_token_start(pinyin, "j"));
+        assert!(is_token_start(pinyin, "js"));
+        assert!(is_token_start(pinyin, "calc"));
+        assert!(!is_token_start(pinyin, "sj"));
+    }
+
+    /// The "no match → add it" rule and the UWP dedupe share one idea: names are
+    /// compared case- and whitespace-insensitively.
     #[test]
     fn row_detail_falls_back_to_the_target() {
         let mut item = Item {
