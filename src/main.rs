@@ -1601,6 +1601,97 @@ fn consume_bare_digit(ctx: &egui::Context, input_is_empty: bool) -> Option<usize
     None
 }
 
+/// The calculator's mode prefix: `=1+2`.
+///
+/// It used to be implicit (any query that looked like an expression got
+/// evaluated), which the bare-digit rules then broke — from an empty box the
+/// leading `1` of `1+2` runs row 1 instead of being typed. A prefix fixes that
+/// and gives the calculator a discoverable way in. `#` (row selector) works the
+/// same way, and `@` (file search) will join them.
+const CALC_PREFIX: char = '=';
+
+/// Is the box in calculator mode? Leading space is forgiven, nothing else.
+fn is_calc_mode(input: &str) -> bool {
+    input.trim_start().starts_with(CALC_PREFIX)
+}
+
+/// The expression to evaluate: everything after the prefix.
+fn calc_expression(input: &str) -> &str {
+    input.trim().strip_prefix(CALC_PREFIX).unwrap_or("").trim()
+}
+
+/// Evaluate a calculator expression, formatted the way the list shows it.
+///
+/// `evalexpr` does *integer* arithmetic when both sides are integers, so
+/// `100/8` came out as `12` — which is not what a calculator should say. When
+/// the expression divides, the literals are turned into floats first
+/// (`100/8` → `100.0/8.0` → `12.5`). Everything else keeps exact integer math,
+/// which also stops `2^10` from printing as `1024.0000000000002`.
+fn eval_calc(expr: &str) -> Option<String> {
+    if expr.is_empty() {
+        return None;
+    }
+    let source = if expr.contains('/') {
+        floatify(expr)
+    } else {
+        expr.to_string()
+    };
+    let value = evalexpr::eval(&source).ok()?;
+    let n = value.as_number().ok()?;
+    // `1/0` is `inf` once the literals are floats; a calculator says "no"
+    // rather than printing `inf`. Same for NaN.
+    if !n.is_finite() {
+        return None;
+    }
+    Some(format_number(n, expr.contains('/') || expr.contains('.')))
+}
+
+/// Rewrite numeric literals as floats: `100/8` → `100.0/8.0`.
+fn floatify(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len() + 8);
+    let mut digits = String::new();
+    for c in expr.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            digits.push(c);
+            continue;
+        }
+        push_literal(&mut digits, &mut out);
+        out.push(c);
+    }
+    push_literal(&mut digits, &mut out);
+    out
+}
+
+fn push_literal(digits: &mut String, out: &mut String) {
+    if digits.is_empty() {
+        return;
+    }
+    out.push_str(digits);
+    if !digits.contains('.') {
+        out.push_str(".0");
+    }
+    digits.clear();
+}
+
+/// Print a number the way a person would: `3`, not `3.0`; `0.3`, not
+/// `0.30000000000000004`.
+fn format_number(n: f64, float_math: bool) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        return format!("{}", n as i64);
+    }
+    if !float_math {
+        return format!("{n}");
+    }
+    let trimmed = format!("{n:.10}");
+    let trimmed = trimmed.trim_end_matches('0').trim_end_matches('.');
+    // Rounding to ten decimals must not turn a tiny non-zero number into `0`.
+    if trimmed.is_empty() || trimmed == "-" || trimmed.parse::<f64>() == Ok(0.0) {
+        format!("{n}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// What a trailing digit in the search box means.
 ///
 /// AltRun's rule was "a trailing character that kills the search is a command,
@@ -1795,6 +1886,8 @@ struct MxRunApp {
     discovery_note: String,
     /// `Ctrl+L`: show only recently used items (AltRun's 最近列表).
     recent_only: bool,
+    /// The box holds a `=` expression: no list, just a result.
+    calc_mode: bool,
     /// The list one keystroke ago (`ListSnapshot`) — what a trailing digit
     /// points at.
     prev_list: ListSnapshot,
@@ -2051,6 +2144,7 @@ impl MxRunApp {
                 .then_some(false),
             discovery_note: String::new(),
             recent_only: false,
+            calc_mode: false,
             prev_list: ListSnapshot::default(),
             scroll_selected: false,
             cold_start_add: false,
@@ -2115,10 +2209,11 @@ impl MxRunApp {
                     app.refresh_search();
                     app.after_query_change(&cc.egui_ctx);
                     log_line(&format!(
-                        "type: {:?} -> {} rows | {}",
+                        "type: {:?} -> {} rows | {} | calc={:?}",
                         app.input,
                         app.results.len(),
-                        app.status
+                        app.status,
+                        app.calc_result
                     ));
                 }
             }
@@ -2568,6 +2663,19 @@ impl MxRunApp {
     fn refresh_search(&mut self) {
         self.results.clear();
         self.calc_result = None;
+        // `=1+2`: the box is a calculator, so there is no list at all — and no
+        // search, no digit rules, nothing that could hijack the expression.
+        self.calc_mode = is_calc_mode(&self.input);
+        if self.calc_mode {
+            let expr = calc_expression(&self.input);
+            self.calc_result = eval_calc(expr);
+            self.status = if self.calc_result.is_some() {
+                "计算器：回车不做任何事，Esc 清空".to_string()
+            } else {
+                "输入算式，例如 =1+2（支持 + - * / % ^ 与括号）".to_string()
+            };
+            return;
+        }
         // `b#3`: everything from `#` on is a row selector, not search text, so
         // the list keeps showing what you are choosing from while you type it.
         let query = split_selector(self.input.trim()).0;
@@ -2636,15 +2744,10 @@ impl MxRunApp {
             }
 
             // Calculator: pure math expression.
-            if query.chars().all(|c| "0123456789+-*/%^(). ".contains(c))
-                && query.chars().any(|c| "+-*/%^".contains(c))
-            {
-                if let Ok(v) = evalexpr::eval(query) {
-                    if let Ok(n) = v.as_number() {
-                        self.calc_result = Some(format!("{n}"));
-                    }
-                }
-            }
+            // (The calculator used to live here, evaluating any query that
+            // looked like an expression. It moved behind the `=` prefix — see
+            // `is_calc_mode` — because the bare-digit rules ate the leading
+            // number of `1+2` from an empty box.)
         }
         // The sorting below has to know what "most recent" means for Ctrl+L.
         if recent_only {
@@ -4028,6 +4131,10 @@ impl eframe::App for MxRunApp {
                 return;
             }
             if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                // A `=` expression is not an item to add and has nothing to run.
+                if self.calc_mode {
+                    return;
+                }
                 // Nothing matched: offer to add it, the way AltRun did
                 // ("无此项 "%s", 添加它?"). This is the launcher's own way in,
                 // next to the right-click one.
@@ -4223,6 +4330,16 @@ impl MxRunApp {
         ui.add_space(6.0);
 
         // --- Calculator result ---
+        if self.calc_mode && self.calc_result.is_none() {
+            // A `=` mode with nothing to show: say what it wants rather than
+            // falling through to "no matches".
+            ui.label(
+                RichText::new("输入算式，例如 =1+2")
+                    .size(15.0)
+                    .color(Color32::from_gray(140)),
+            );
+            ui.add_space(4.0);
+        }
         if let Some(result) = &self.calc_result {
             ui.label(
                 RichText::new(format!("= {result}"))
@@ -4231,7 +4348,6 @@ impl MxRunApp {
             );
             ui.add_space(4.0);
         }
-
         // --- Result list ---
         //
         // Scrollable: eight rows at the current row height are more than a
@@ -4403,7 +4519,7 @@ impl MxRunApp {
             }
         }
 
-        if self.results.is_empty() && self.calc_result.is_none() {
+        if self.results.is_empty() && self.calc_result.is_none() && !self.calc_mode {
             ui.label(
                 RichText::new("无匹配结果 · 网页搜索等兜底功能将在后续版本加入")
                     .size(13.0)
@@ -5426,6 +5542,38 @@ mod tests {
             digit_verdict("zz3", "zz", 0, 0, false),
             DigitVerdict::NoPreviousList
         );
+    }
+
+    /// `=N` — the calculator, behind its own prefix.
+    #[test]
+    fn calculator_prefix() {
+        assert!(is_calc_mode("=1+2"));
+        assert!(is_calc_mode("  = 1 + 2"), "leading space is forgiven");
+        assert!(!is_calc_mode("1+2"), "no prefix, no calculator");
+        assert!(is_calc_mode("=x"), "still the calculator, just a bad expression");
+        assert!(!is_calc_mode(""));
+
+        assert_eq!(calc_expression("=1+2"), "1+2");
+        assert_eq!(calc_expression("= 1 + 2 "), "1 + 2");
+        assert_eq!(calc_expression("="), "");
+        assert_eq!(calc_expression("1+2"), "", "not in calc mode");
+
+        // The whole point: expressions that start with a digit work now, which
+        // the bare-digit rules made impossible without a prefix.
+        assert_eq!(eval_calc("1+2").as_deref(), Some("3"));
+        assert_eq!(eval_calc("(1+2)*3").as_deref(), Some("9"));
+        assert_eq!(eval_calc("2^10").as_deref(), Some("1024"));
+        assert_eq!(eval_calc("7%4").as_deref(), Some("3"));
+        assert_eq!(eval_calc(""), None, "an empty expression is not a number");
+        assert_eq!(eval_calc("hello"), None);
+        assert_eq!(eval_calc("1/0"), None, "division by zero has no answer");
+        // Division must not be integer division (`100/8` was `12`).
+        assert_eq!(eval_calc("100/8").as_deref(), Some("12.5"));
+        assert_eq!(eval_calc("10/4").as_deref(), Some("2.5"));
+        assert_eq!(eval_calc("8/2").as_deref(), Some("4"), "no trailing .0");
+        // Float noise is trimmed, tiny values are not rounded away.
+        assert_eq!(eval_calc("0.1+0.2").as_deref(), Some("0.3"));
+        assert_eq!(eval_calc("1e-15").as_deref(), Some("0.000000000000001"));
     }
 
     /// `#N` — the explicit way, which works no matter what the search does.
