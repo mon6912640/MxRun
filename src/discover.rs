@@ -106,6 +106,8 @@ pub struct ScanReport {
     pub removed_duplicates: usize,
     /// Stored system tools dropped because today's rules filter them out.
     pub removed_filtered: usize,
+    /// Ambiguously named entries that got a folder hint appended.
+    pub renamed_ambiguous: usize,
     /// How long the scan took, in milliseconds.
     pub millis: u128,
 }
@@ -114,7 +116,7 @@ impl ScanReport {
     /// One line for the log.
     pub fn summary(&self) -> String {
         format!(
-            "seen={} cached={} added={} existing={} tombstoned={} dropped(dupes={} filtered={}) skipped(junk={} web={} missing={} system={}) uwp(seen={} existing={} in {}ms) in {}ms",
+            "seen={} cached={} added={} existing={} tombstoned={} dropped(dupes={} filtered={}) renamed={} skipped(junk={} web={} missing={} system={}) uwp(seen={} existing={} in {}ms) in {}ms",
             self.seen,
             self.cached,
             self.added,
@@ -122,6 +124,7 @@ impl ScanReport {
             self.tombstoned,
             self.removed_duplicates,
             self.removed_filtered,
+            self.renamed_ambiguous,
             self.skipped_junk,
             self.skipped_web,
             self.skipped_missing,
@@ -463,6 +466,71 @@ pub fn cleanup_filtered_discovered(store: &mut Store) -> usize {
     removed
 }
 
+/// Give discovered items that share a name a hint of where they came from.
+///
+/// `Settings` is the real case (2026-09-19): TortoiseGit and TortoiseSVN both
+/// ship a shortcut by that name, so the manager showed two identical rows. The
+/// Start Menu folder a shortcut lives in is the natural disambiguator, and it is
+/// recoverable from the stored `external_id` (the `.lnk` path), so this repairs
+/// existing lists too.
+///
+/// Idempotent: a title that already carries a hint is left alone, so running it
+/// after every scan cannot grow `Settings · TortoiseGit · TortoiseGit`.
+pub fn disambiguate_titles(store: &mut Store) -> usize {
+    let items = store.load_items().unwrap_or_default();
+    let mut groups: std::collections::HashMap<String, Vec<&Item>> = std::collections::HashMap::new();
+    for item in &items {
+        if item.source.provider == PROVIDER {
+            groups
+                .entry(normalize_name(&item.title))
+                .or_default()
+                .push(item);
+        }
+    }
+    let mut renamed = 0usize;
+    for (_, group) in groups.iter().filter(|(_, g)| g.len() > 1) {
+        for item in group {
+            if item.title.contains(" · ") {
+                continue; // already disambiguated by an earlier run
+            }
+            let Some(hint) = folder_hint(&item.source.external_id) else {
+                continue;
+            };
+            if normalize_name(&hint) == normalize_name(&item.title) {
+                continue; // the folder says nothing new
+            }
+            let mut updated: Item = (*item).clone();
+            updated.title = format!("{} · {}", item.title.trim(), hint);
+            if store.upsert_item(&updated).is_ok() {
+                renamed += 1;
+                crate::log_line(&format!(
+                    "discover: {:?} -> {:?} (name was ambiguous)",
+                    item.title, updated.title
+                ));
+            }
+        }
+    }
+    renamed
+}
+
+/// The Start Menu folder a `.lnk` path sits in, as a disambiguation hint.
+fn folder_hint(lnk_path: &str) -> Option<String> {
+    let path = Path::new(lnk_path);
+    let folder = path.parent()?.file_name()?.to_string_lossy().into_owned();
+    // Generic containers say nothing useful.
+    const GENERIC: &[&str] = &[
+        "programs",
+        "start menu",
+        "programdata",
+        "microsoft",
+        "windows",
+    ];
+    if GENERIC.contains(&folder.to_lowercase().as_str()) {
+        return None;
+    }
+    Some(folder)
+}
+
 /// Scan the Start Menu: pure filesystem + COM work, no database access.
 pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
     let started = std::time::Instant::now();
@@ -586,6 +654,7 @@ pub fn apply(store: &mut Store, mut out: ScanOutput) -> ScanReport {
     }
     out.report.removed_duplicates = cleanup_duplicate_titles(store);
     out.report.removed_filtered += cleanup_filtered_discovered(store);
+    out.report.renamed_ambiguous = disambiguate_titles(store);
     out.report
 }
 
@@ -883,6 +952,74 @@ mod tests {
         )));
         assert!(!is_system_tool(&p(r"S:\games\Steam\Steam.exe")));
         assert!(!is_system_tool(&p(r"R:\apps\AltRun\Bin\AltRun.exe")));
+    }
+
+    /// Two apps with the same name (TortoiseGit's and TortoiseSVN's `Settings`)
+    /// get told apart by the Start Menu folder they came from — and running the
+    /// pass twice must not keep appending to the name.
+    #[test]
+    fn ambiguous_names_get_a_folder_hint() {
+        let dir = temp_dir("disambiguate");
+        let mut store = Store::open_at(dir.clone()).expect("store");
+
+        let mk = |id: &str, lnk: &str| {
+            let mut item = uwp_item_for("Settings", "ignored");
+            item.id = id.to_string();
+            item.source.provider = PROVIDER.to_string();
+            item.source.external_id = lnk.to_string();
+            item
+        };
+        let a = mk("startmenu:a", r"R:\Menu\TortoiseGit\Settings.lnk");
+        let b = mk("startmenu:b", r"R:\Menu\TortoiseSVN\Settings.lnk");
+        let lone = {
+            let mut item = mk("startmenu:c", r"R:\Menu\TortoiseGit\Steam.lnk");
+            item.title = "Steam".to_string();
+            item
+        };
+        store.upsert_item(&a).unwrap();
+        store.upsert_item(&b).unwrap();
+        store.upsert_item(&lone).unwrap();
+
+        assert_eq!(disambiguate_titles(&mut store), 2, "both rows are ambiguous");
+        let titles: Vec<String> = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.title)
+            .collect();
+        assert!(titles.contains(&"Settings · TortoiseGit".to_string()));
+        assert!(titles.contains(&"Settings · TortoiseSVN".to_string()));
+        assert!(
+            titles.contains(&"Steam".to_string()),
+            "an unambiguous name is left alone"
+        );
+
+        // Second run: nothing left to do, and no `· TortoiseGit · TortoiseGit`.
+        assert_eq!(disambiguate_titles(&mut store), 0);
+        assert!(
+            store
+                .load_items()
+                .unwrap()
+                .iter()
+                .all(|i| !i.title.contains(" · TortoiseGit · "))
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The folder hint must not fire on the generic containers, or every scanned
+    /// item in `Programs` would get a pointless suffix.
+    #[test]
+    fn folder_hint_ignores_generic_folders() {
+        assert_eq!(
+            folder_hint(r"R:\roaming\Microsoft\Windows\Start Menu\Programs\Steam.lnk"),
+            None
+        );
+        assert_eq!(
+            folder_hint(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\TortoiseGit\Settings.lnk"),
+            Some("TortoiseGit".to_string())
+        );
+        assert_eq!(folder_hint(""), None);
     }
 
     #[test]

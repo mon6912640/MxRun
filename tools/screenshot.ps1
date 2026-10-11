@@ -6,11 +6,17 @@
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File tools\screenshot.ps1 -Out shot.png [-KeepOpen]
+#   powershell -ExecutionPolicy Bypass -File tools\screenshot.ps1 -Out shot.png -KeepOpen -Profile D:\tmp\my-profile
 # 前提：MxRun 正在运行（或用 -KeepOpen 自己起一个临时档案的实例）。
+#
+# `-Profile` 指定 -KeepOpen 实例用的数据目录（%APPDATA% 会被指向它）。不指定就用一个
+# 一次性的空档案；**需要"预置了特定数据"的截图（比如一条失效条目、一条已删除条目）必须
+# 自己指定**，否则脚本会用空档案启动，截出来什么都没有。
 
 param(
   [string]$Out = "$env:TEMP\mxrun-shot.png",
-  [switch]$KeepOpen
+  [switch]$KeepOpen,
+  [string]$Profile = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +33,11 @@ public class MxShot {
 $started = $null
 if ($KeepOpen) {
   $exe = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\mxrun.exe'
-  $env:APPDATA = Join-Path $env:TEMP 'mxrun-shot-profile'
+  if ($Profile -ne '') {
+    $env:APPDATA = $Profile
+  } else {
+    $env:APPDATA = Join-Path $env:TEMP 'mxrun-shot-profile'
+  }
   $env:MXRUN_KEEP_OPEN = '1'
   Get-Process *mxrun* -ErrorAction SilentlyContinue | Stop-Process -Force
   $started = Start-Process -FilePath $exe -PassThru

@@ -382,6 +382,19 @@ const SCAN_PREFIX: &str = "scan:";
 /// Meta key remembering that the user deleted a source.///
 /// Keyed by `(provider, external_id)` rather than by id, because that is what
 /// an import can recognise — the id it would have used is gone with the row.
+/// One tombstone: something the user deleted, with enough to show it in a list
+/// and (when the payload is there) to put it back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeletedSource {
+    pub provider: String,
+    pub external_id: String,
+    pub title: String,
+    /// Unix seconds.
+    pub at: u64,
+    /// The item as it was, when the record carries it.
+    pub item: Option<Item>,
+}
+
 fn gone_key(provider: &str, external_id: &str) -> String {
     format!("gone:{provider}:{external_id}")
 }
@@ -647,6 +660,29 @@ impl Store {
         Ok(())
     }
 
+    /// Write many items in **one** transaction (the health check's batch).
+    ///
+    /// One transaction per item cost ~2.5 ms each: the first health check over
+    /// 159 items took 408 ms, a visible freeze the moment the manager opened.
+    pub fn save_items(&self, items: &[Item]) {
+        if items.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.db.begin_write() else {
+            return;
+        };
+        {
+            if let Ok(mut table) = tx.open_table(COMMANDS) {
+                for item in items {
+                    if let Ok(json) = serde_json::to_string(item) {
+                        let _ = table.insert(item.id.as_str(), json.as_str());
+                    }
+                }
+            }
+        }
+        let _ = tx.commit();
+    }
+
     /// Import seam: store an item coming from a provider, keyed by
     /// `(provider, external_id)` so re-importing updates instead of
     /// duplicating — and so the local frecency (keyed by id) survives.
@@ -847,9 +883,14 @@ impl Store {
     }
 
     fn mark_deleted(&self, item: &Item) -> Result<(), Box<dyn std::error::Error>> {
+        // The whole item is kept, not just its name: that is what makes "恢复"
+        // work for a hand-made entry, whose data exists nowhere else once the
+        // row is gone. Rows deleted by an older build only have title/at, and
+        // restoring those can still lift the block (the next scan re-adds them).
         let record = serde_json::json!({
             "title": item.title,
             "at": now_secs(),
+            "item": item,
         });
         self.write_meta(
             &gone_key(&item.source.provider, &item.source.external_id),
@@ -858,10 +899,12 @@ impl Store {
         Ok(())
     }
 
-    /// Everything the user has deleted, newest first — the raw material for a
-    /// future "已删除" list / undo.
-    #[allow(dead_code)] // exercised by the tests; a "已删除 / 撤销" view will read it
-    pub fn deleted_sources(&self) -> Vec<(String, String, String)> {
+    /// Everything the user has deleted — the "已删除" panel reads this.
+    ///
+    /// Newest first. `item` is `Some` when the tombstone predates this build or
+    /// was written by it with the full payload; older records carry only the
+    /// title, and those can still be un-blocked even if the data is gone.
+    pub fn deleted_sources(&self) -> Vec<DeletedSource> {
         let mut out = Vec::new();
         let mut scan = || -> Option<()> {
             let tx = self.db.begin_read().ok()?;
@@ -872,16 +915,59 @@ impl Store {
                     break;
                 };
                 let (provider, external_id) = rest.split_once(':').unwrap_or((rest, ""));
-                let title = serde_json::from_str::<serde_json::Value>(v.value())
-                    .ok()
+                let parsed: Option<serde_json::Value> = serde_json::from_str(v.value()).ok();
+                let title = parsed
+                    .as_ref()
                     .and_then(|j| j.get("title").and_then(|t| t.as_str()).map(String::from))
                     .unwrap_or_default();
-                out.push((provider.to_string(), external_id.to_string(), title));
+                let at = parsed
+                    .as_ref()
+                    .and_then(|j| j.get("at").and_then(|t| t.as_u64()))
+                    .unwrap_or(0);
+                let item = parsed
+                    .as_ref()
+                    .and_then(|j| j.get("item"))
+                    .and_then(|i| serde_json::from_value::<Item>(i.clone()).ok());
+                out.push(DeletedSource {
+                    provider: provider.to_string(),
+                    external_id: external_id.to_string(),
+                    title,
+                    at,
+                    item,
+                });
             }
             Some(())
         };
         let _ = scan();
+        out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.title.cmp(&b.title)));
         out
+    }
+
+    /// Undo a deletion: lift the block, and put the item back when the record
+    /// still carries it.
+    ///
+    /// Returns whether an item was actually re-inserted (false means only the
+    /// block was lifted — a scanned item then returns on the next scan).
+    pub fn restore_deleted(
+        &mut self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let record = self.read_meta(&gone_key(provider, external_id));
+        let restored = record
+            .as_deref()
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+            .and_then(|j| j.get("item").cloned())
+            .and_then(|i| serde_json::from_value::<Item>(i).ok());
+        let had_item = restored.is_some();
+        if let Some(mut item) = restored {
+            if item.id.is_empty() {
+                item.id = format!("{}:{}", item.source.provider, item.source.external_id);
+            }
+            self.upsert_item(&item)?;
+        }
+        self.clear_deleted(provider, external_id);
+        Ok(had_item)
     }
 
     // ----- frecency -----------------------------------------------------
@@ -939,6 +1025,16 @@ impl Store {
         entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         entries.truncate(limit);
         entries
+    }
+
+    /// Stop remembering one parameter for an item (the prompt's `Delete`).
+    ///
+    /// Only that one entry goes; the rest of the history is untouched.
+    pub fn remove_param(&self, item_id: &str, value: &str) {
+        if item_id.is_empty() || value.is_empty() {
+            return;
+        }
+        self.remove_meta(&param_key(item_id, value));
     }
 
     /// `(value, count)` for one item, in key order.
@@ -1223,9 +1319,13 @@ mod tests {
         // The deleted list is available for a future "undo".
         let deleted = store.deleted_sources();
         assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].0, "shortcutlist");
-        assert_eq!(deleted[0].1, "line:43");
-        assert_eq!(deleted[0].2, "Steam", "title recorded");
+        assert_eq!(deleted[0].provider, "shortcutlist");
+        assert_eq!(deleted[0].external_id, "line:43");
+        assert_eq!(deleted[0].title, "Steam", "title recorded");
+        assert!(
+            deleted[0].item.is_some(),
+            "the whole item is kept, so undo can restore a hand-made entry"
+        );
 
         // …until the user adds the same thing on purpose, which forgets it.
         store.clear_deleted("shortcutlist", "line:43");
@@ -1291,6 +1391,75 @@ mod tests {
         assert_eq!(steam.len(), 1, "no duplicate row");
         assert_eq!(steam[0].title, "Steam 客户端", "second import wins");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Undo has to work for a hand-made entry too, whose data exists nowhere
+    /// else once the row is gone — that is why the tombstone keeps the item.
+    #[test]
+    fn a_deleted_item_can_be_restored() {
+        let dir = temp_dir("restore-deleted");
+        let mut store = Store::open_at(dir.clone()).expect("store");
+
+        let mut item = seed_items()[0].clone();
+        item.id = "manual:restore-me".to_string();
+        item.title = "Restore Me".to_string();
+        item.source.provider = "manual".to_string();
+        item.source.external_id = "restore-me".to_string();
+        store.upsert_item(&item).unwrap();
+
+        store.delete_item(&item).unwrap();
+        assert!(store.is_deleted("manual", "restore-me"));
+        assert!(
+            store
+                .load_items()
+                .unwrap()
+                .iter()
+                .all(|i| i.title != "Restore Me")
+        );
+
+        let listed = store.deleted_sources();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Restore Me");
+        assert!(listed[0].item.is_some(), "payload kept for undo");
+        assert!(listed[0].at > 0, "timestamp kept for the list");
+
+        assert!(store.restore_deleted("manual", "restore-me").unwrap());
+        assert!(!store.is_deleted("manual", "restore-me"));
+        assert!(
+            store
+                .load_items()
+                .unwrap()
+                .iter()
+                .any(|i| i.title == "Restore Me"),
+            "the item itself comes back"
+        );
+        assert!(store.deleted_sources().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `Delete` in the parameter prompt forgets one value, not the whole history.
+    #[test]
+    fn one_parameter_can_be_forgotten() {
+        let dir = temp_dir("forget-param");
+        let store = Store::open_at(dir.clone()).expect("store");
+        let id = "manual:p";
+
+        store.bump_param(id, "alpha");
+        store.bump_param(id, "alpha");
+        store.bump_param(id, "beta");
+
+        assert_eq!(store.param_history(id, 10).len(), 2);
+        store.remove_param(id, "alpha");
+        let left = store.param_history(id, 10);
+        assert_eq!(left.len(), 1, "only the one entry went");
+        assert_eq!(left[0].0, "beta");
+
+        // Removing something that is not there is harmless.
+        store.remove_param(id, "gamma");
+        assert_eq!(store.param_history(id, 10).len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Parameter history: per item, most used first, blanks ignored.

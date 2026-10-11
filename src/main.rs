@@ -40,7 +40,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use store::{Action, BuiltinVerb, Effect, Item, PARAM_HISTORY_LIMIT, Store, frecency_bonus};
+use store::{Action, BuiltinVerb, Effect, Health, Item, PARAM_HISTORY_LIMIT, Store, frecency_bonus};
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem},
@@ -1126,6 +1126,24 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
     if name.is_empty() || name.contains(['\\', '/']) {
         return None;
     }
+    // Memoised: the health check asks about the same handful of bare commands
+    // (`calc`, `notepad`, `cmd`) over and over, and each miss costs every PATH
+    // entry × every PATHEXT extension — that alone made the first check 2.5 ms
+    // per item.
+    thread_local! {
+        static CACHE: std::cell::RefCell<
+            std::collections::HashMap<String, Option<std::path::PathBuf>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(name).cloned()) {
+        return hit;
+    }
+    let found = resolve_in_path_uncached(name);
+    CACHE.with(|c| c.borrow_mut().insert(name.to_string(), found.clone()));
+    found
+}
+
+fn resolve_in_path_uncached(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = std::env::var("PATHEXT")
         .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
@@ -1661,6 +1679,96 @@ fn rank_all(items: &[Indexed], query: &str, limit: usize) -> Vec<(String, f64, b
             )
         })
         .collect()
+}
+
+/// Does this item still point at something that exists?
+///
+/// `Health::Broken` existed from the start but nothing ever set it, so the
+/// manager could not tell a working entry from one whose program had been
+/// uninstalled. Rules, in the order they are checked:
+///
+/// * a built-in verb or a clipboard grab has no path at all → `Ok`;
+/// * shell namespace targets (`shell:AppsFolder\…`, `::{CLSID}`), URLs and
+///   unexpanded variables cannot be checked cheaply → `Ok` (never cry wolf);
+/// * a path (quoted or with arguments) that exists → `Ok`, otherwise the head
+///   token gets one more chance through `PATH` (`calc`, `notepad`);
+/// * anything else → `Broken`.
+/// "3 分钟前" / "2 天前" for the deleted list; anything unparseable shows nothing.
+fn deleted_when(at: u64) -> String {
+    if at == 0 {
+        return String::new();
+    }
+    let now = unix_now_secs();
+    let secs = now.saturating_sub(at);
+    match secs {
+        0..=59 => format!("{secs} 秒前"),
+        60..=3599 => format!("{} 分钟前", secs / 60),
+        3600..=86_399 => format!("{} 小时前", secs / 3600),
+        86_400..=2_592_000 => format!("{} 天前", secs / 86_400),
+        _ => format!("{} 天前", secs / 86_400),
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// "3 分钟前" / "2 天前" for the deleted list. Anything older than a month is
+/// dated instead, because "37 天前" helps nobody.
+/// Does this item still point at something that exists?
+///
+/// `Health::Broken` existed from the start but nothing ever set it, so the
+/// manager could not tell a working entry from one whose program had been
+/// uninstalled. Rules, in the order they are checked:
+///
+/// * a built-in verb or a clipboard grab has no path at all → `Ok`;
+/// * shell namespace targets (`shell:AppsFolder\…`, `::{CLSID}`), URLs and
+///   unexpanded variables cannot be checked cheaply → `Ok` (never cry wolf);
+/// * a path (quoted or with arguments) that exists → `Ok`, otherwise the head
+///   token gets one more chance through `PATH` (`calc`, `notepad`);
+/// * anything else → `Broken`.
+fn health_of(item: &Item) -> Health {
+    let Some(action) = item.default_action() else {
+        return Health::Unknown;
+    };
+    let target = match &action.effect {
+        Effect::Builtin { .. } | Effect::Copy { .. } => return Health::Ok,
+        Effect::Open { target } | Effect::Reveal { path: target } => target.clone(),
+        Effect::Run { line } => line.clone(),
+    };
+    let expanded = exec::expand_env(&target);
+    let t = expanded.trim();
+    if t.is_empty() {
+        return Health::Unknown;
+    }
+    let lower = t.to_lowercase();
+    // Not a filesystem path: the shell, the browser or a variable decides.
+    if lower.starts_with("shell:")
+        || lower.starts_with("::")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+        || lower.starts_with("www.")
+        || t.contains('%')
+    {
+        return Health::Ok;
+    }
+    match icon_source(t) {
+        Some(path) if path.is_file() || path.is_dir() => Health::Ok,
+        Some(_) => Health::Broken,
+        // No path shape at all (an unquoted command line, say): try PATH by the
+        // head token before calling it broken.
+        None => {
+            let head = t.split([' ', '\t']).next().unwrap_or(t);
+            if resolve_in_path(head.trim_matches('"')).is_some() {
+                Health::Ok
+            } else {
+                Health::Broken
+            }
+        }
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -2352,6 +2460,14 @@ struct MxRunApp {
     hotkey_manager: GlobalHotKeyManager,
     _tray: TrayIcon,
     status: String,
+    /// Items whose target no longer exists, as of the last health check. Shown
+    /// in the manager as a "失效" tag plus a one-click cleanup.
+    broken_count: usize,
+    /// The "已删除" panel is open (manager view).
+    view_deleted: bool,
+    /// Cached `deleted_sources()` for that panel — reading it per frame would
+    /// scan the meta table during painting.
+    deleted_rows: Vec<store::DeletedSource>,
     /// One-off log of when the first frame rendered (cold-start breakdown).
     first_frame_logged: bool,
 }
@@ -2550,6 +2666,9 @@ impl MxRunApp {
 
         let mut app = Self {
             items: Vec::new(),
+            broken_count: 0,
+            view_deleted: false,
+            deleted_rows: Vec::new(),
             icons: Icons::new(&cc.egui_ctx),
             matcher: Matcher::new(Config::DEFAULT),
             input: String::new(),
@@ -2735,7 +2854,7 @@ impl MxRunApp {
                 Ok("curated") => app.manage_source = Some(SourceFilter::Curated),
                 _ => {}
             }
-            app.enter_manage();
+            app.enter_manage(&cc.egui_ctx);
             log_line(&format!(
                 "selftest: manage rows={} items={}",
                 app.results.len(),
@@ -2760,7 +2879,8 @@ impl MxRunApp {
                     app.store
                         .deleted_sources()
                         .iter()
-                        .any(|(p, ext, _)| *ext == id || format!("{p}:{ext}") == id)
+                        .any(|d| d.external_id == id
+                            || format!("{}:{}", d.provider, d.external_id) == id)
                 ));
             }
         }
@@ -3134,6 +3254,77 @@ impl MxRunApp {
             indexed.frec_bonus = frecency_bonus(&frec);
             indexed.last_used = frec.last_used;
         }
+    }
+
+    /// Re-check every item's target and remember what changed.
+    ///
+    /// Runs when the manager opens and after a scan — both are user-initiated or
+    /// already off the hot path. Cost is one `stat` per item (~1 ms at 170), which
+    /// is why it is not run per frame.
+    fn refresh_health(&mut self) {
+        let started = std::time::Instant::now();
+        let mut broken = 0usize;
+        let mut changed: Vec<Item> = Vec::new();
+        let mut examples: Vec<String> = Vec::new();
+        for indexed in self.items.iter_mut() {
+            let health = health_of(&indexed.item);
+            if health == Health::Broken {
+                broken += 1;
+                if examples.len() < 5 {
+                    // Title *and* target: knowing which file vanished is the
+                    // whole point of the check (the log is local-only).
+                    examples.push(format!(
+                        "{} -> {}",
+                        indexed.item.title,
+                        truncate_chars(indexed.item.icon_target().unwrap_or("(无)"), 70)
+                    ));
+                }
+            }
+            if health != indexed.item.health {
+                indexed.item.health = health;
+                changed.push(indexed.item.clone());
+            }
+        }
+        // One write transaction for the lot: per-item writes made the first
+        // check 408 ms.
+        self.store.save_items(&changed);
+        self.broken_count = broken;
+        if !changed.is_empty() || broken > 0 {
+            log_line(&format!(
+                "health: {broken} broken of {} items ({} changed) in {}ms{}",
+                self.items.len(),
+                changed.len(),
+                started.elapsed().as_millis(),
+                if examples.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", examples.join(", "))
+                }
+            ));
+        }
+    }
+
+    /// Delete every item whose target is gone.
+    ///
+    /// No tombstone on purpose: the entry is dead because its program is gone,
+    /// and if the user reinstalls it, discovery should be free to add it again.
+    fn purge_broken_items(&mut self, ctx: &egui::Context) {
+        let doomed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|it| it.item.health == Health::Broken)
+            .map(|it| it.item.id.clone())
+            .collect();
+        let mut removed = 0usize;
+        for id in &doomed {
+            if self.store.delete_item_by_id(id).is_ok() {
+                removed += 1;
+            }
+        }
+        log_line(&format!("health: removed {removed} broken items"));
+        self.broken_count = 0;
+        self.rebuild_index(ctx);
+        self.status = format!("已清理 {removed} 个失效条目");
     }
 
     /// Ask the icon worker for the icons of whatever the list currently shows.
@@ -3889,7 +4080,7 @@ impl MxRunApp {
     /// Same window, a different list: everything instead of the top eight, no
     /// score gate, a scrollbar instead of a cap. The filter box is the familiar
     /// search box, so narrowing 59 rows works the way everything else does.
-    fn enter_manage(&mut self) {
+    fn enter_manage(&mut self, ctx: &egui::Context) {
         if self.manage {
             return;
         }
@@ -3898,12 +4089,29 @@ impl MxRunApp {
         self.input.clear();
         self.pending_delete = None;
         self.selected = 0;
+        // The manager is where a dead entry gets noticed, so this is where the
+        // check runs: one `stat` per item, off the launcher's hot path.
+        self.refresh_health();
         self.refresh_search();
         self.want_focus = true;
+        let hint = if self.broken_count > 0 {
+            format!(" · {} 条失效（可一键清理）", self.broken_count)
+        } else {
+            String::new()
+        };
         self.status = format!(
-            "快捷项管理 · 共 {} 条 · 回车/F2 编辑 · Delete 删除 · Insert 新建 · Ctrl+D 定位 · Esc 返回",
-            self.items.len()
+            "快捷项管理 · 共 {} 条{} · 回车/F2 编辑 · Delete 删除 · Insert 新建 · Ctrl+D 定位 · Esc 返回",
+            self.items.len(),
+            hint
         );
+        let _ = ctx;
+        // Debug: `MXRUN_SELFTEST_VIEW=deleted` opens the "最近删除" panel, so a
+        // screenshot script can reach it without clicking. Lives here, not at a
+        // call site, because the manager has three ways in (tray, hotkey, test).
+        if std::env::var("MXRUN_SELFTEST_VIEW").is_ok_and(|v| v == "deleted") {
+            self.view_deleted = true;
+            self.deleted_rows = self.store.deleted_sources();
+        }
     }
 
     fn leave_manage(&mut self) {
@@ -4011,8 +4219,11 @@ impl MxRunApp {
         let report = discover::apply(&mut self.store, output);
         log_line(&format!("discover: {}", report.summary()));
         self.discovery_note = report.human();
+        // The scan also drops items today's rules filter out, and a scan is a
+        // natural moment to re-check what the remaining ones point at.
+        self.rebuild_index(ctx);
+        self.refresh_health();
         if report.added > 0 {
-            self.rebuild_index(ctx);
             self.refresh_search();
             self.status = format!("{} · 可在设置里关闭，或在快捷项管理里清理", self.discovery_note);
         }
@@ -4082,6 +4293,28 @@ impl MxRunApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
             if let Some(p) = self.prompt.as_mut() {
                 p.move_cursor(-1);
+            }
+        }
+        // Delete removes the highlighted history entry, permanently. Only when a
+        // row is highlighted: otherwise Delete belongs to the text field (it is
+        // "delete the character", and stealing it would be a bug).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
+            let doomed = self.prompt.as_ref().and_then(|p| {
+                let row = p.cursor?;
+                p.suggestions.get(row).map(|h| p.history[*h].0.clone())
+            });
+            if let Some(value) = doomed {
+                if let Some(p) = self.prompt.as_mut() {
+                    let id = p.item.id.clone();
+                    self.store.remove_param(&id, &value);
+                    p.history.retain(|(v, _)| v != &value);
+                    // `suggestions` indexes into `history`, so recompute rather
+                    // than patch: a stale index would panic on the next frame.
+                    p.refilter();
+                    p.cursor = None;
+                }
+                log_line("prompt: history entry removed");
+                self.status = "已从历史参数中删除该条".to_string();
             }
         }
         // Space is deliberately *not* consumed here: unlike the main box (where
@@ -4517,7 +4750,7 @@ impl eframe::App for MxRunApp {
         }
         // Tray menu asked for the manager.
         if self.open_manage.swap(false, Ordering::Relaxed) {
-            self.enter_manage();
+            self.enter_manage(&ctx);
         }
 
         // Paths handed over by another process (right-click → 发送到, shell menu,
@@ -5073,6 +5306,9 @@ impl MxRunApp {
                 None => ("•", "条目"),
             };
             let desc = row_detail(&item.item);
+            // A row whose program is gone says so — in the manager only: the
+            // launcher's eight rows are for launching, not for tidying up.
+            let broken = item.item.health == Health::Broken;
             // Ask for the icon of this row; the worker delivers it a frame or
             // two later and the emoji stands in until then.
             let icon = match item.item.icon_target() {
@@ -5116,7 +5352,21 @@ impl MxRunApp {
                     }
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
-                        ui.label(job);
+                        if broken {
+                            // The tag goes next to the name, where the eye
+                            // already is, and it is the reason the cleanup
+                            // button above exists.
+                            ui.horizontal(|ui| {
+                                ui.label(job);
+                                ui.label(
+                                    RichText::new("失效")
+                                        .size(11.0)
+                                        .color(pal().danger),
+                                );
+                            });
+                        } else {
+                            ui.label(job);
+                        }
                         // Items that need a typed argument are marked with `*`:
                         // AltRun's own convention for "this one asks for input",
                         // and here it warns that Enter will open the parameter
@@ -5338,6 +5588,92 @@ impl MxRunApp {
         });
     }
 
+    /// The "最近删除" panel: what the tombstones remember, with undo.
+    ///
+    /// A separate list rather than a fourth filter tab, because deleted items are
+    /// **not** in the item list any more — they cannot be rows of the same model.
+    fn render_deleted_panel(&mut self, ui: &mut egui::Ui) {
+        if self.deleted_rows.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("还没有删除过任何条目。")
+                    .size(13.0)
+                    .color(pal().text_dim),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("这里列出的东西会被自动发现跳过，恢复后才会重新出现。")
+                    .size(12.0)
+                    .color(pal().text_faint),
+            );
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("{} 条已删除 · 点「恢复」撤销", self.deleted_rows.len()))
+                .size(12.0)
+                .color(pal().text_dim),
+        );
+        ui.add_space(6.0);
+
+        let mut restore: Option<(String, String)> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for row in &self.deleted_rows {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(truncate_chars(&row.title, 40))
+                                .size(14.0)
+                                .color(pal().text),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(deleted_when(row.at))
+                                .size(11.0)
+                                .color(pal().text_faint),
+                        );
+                        ui.add_space(8.0);
+                        let what = if row.item.is_some() {
+                            "可完整恢复"
+                        } else {
+                            "解除封锁（下次扫描找回）"
+                        };
+                        ui.label(RichText::new(what).size(11.0).color(pal().text_faint));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("恢复").size(12.0)).clicked() {
+                                restore = Some((row.provider.clone(), row.external_id.clone()));
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+
+        if let Some((provider, external_id)) = restore {
+            match self.store.restore_deleted(&provider, &external_id) {
+                Ok(true) => {
+                    log_line(&format!("manage: restored {provider}:{external_id}"));
+                    self.status = "已恢复该条目".to_string();
+                }
+                Ok(false) => {
+                    log_line(&format!("manage: unblocked {provider}:{external_id}"));
+                    self.status = "已解除封锁：下次扫描会重新发现它".to_string();
+                }
+                Err(e) => self.status = format!("恢复失败：{e}"),
+            }
+            self.deleted_rows = self.store.deleted_sources();
+            self.rebuild_index(ui.ctx());
+            self.refresh_search();
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Esc 返回")
+                .size(12.0)
+                .color(pal().text_faint),
+        );
+    }
+
     /// The manager: AltRun's `frmShortCutMan`, as a view of the same window.
     ///
     /// Columns follow the original's four (ShortCut / Name / Param Type /
@@ -5400,8 +5736,41 @@ impl MxRunApp {
                     );
                 }
             }
+            // Two housekeeping actions, on the right of the same row: entries
+            // whose program is gone, and the list of things that were deleted
+            // (undo lives there).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.view_deleted, RichText::new("最近删除").size(12.0))
+                    .clicked()
+                {
+                    self.view_deleted = !self.view_deleted;
+                    if self.view_deleted {
+                        self.deleted_rows = self.store.deleted_sources();
+                        log_line(&format!("manage: deleted view ({} rows)", self.deleted_rows.len()));
+                    }
+                }
+                if self.broken_count > 0 {
+                    if ui
+                        .selectable_label(
+                            false,
+                            RichText::new(format!("清理失效 {} 条", self.broken_count))
+                                .size(12.0)
+                                .color(pal().danger),
+                        )
+                        .clicked()
+                    {
+                        self.purge_broken_items(ui.ctx());
+                    }
+                }
+            });
         });
         ui.separator();
+
+        if self.view_deleted {
+            self.render_deleted_panel(ui);
+            return;
+        }
 
         // --- rows ---
         let mut clicked: Option<usize> = None;
@@ -5819,8 +6188,16 @@ impl MxRunApp {
                 ui.id().with(("prompt-row", row)),
                 egui::Sense::click(),
             );
-            if resp.hovered() {
-                prompt.cursor = Some(row);
+            // Hover *tints*, it does not move the highlight — same rule as the
+            // candidate rows (the user hit this on 2026-09-19: `↑↓` stopped
+            // working because the mouse happened to rest over the list). Only a
+            // click fills the field.
+            if resp.hovered() && !selected {
+                ui.painter().rect_filled(
+                    inner.response.rect,
+                    egui::CornerRadius::same(8),
+                    pal().hover_bg,
+                );
             }
             if resp.clicked() {
                 picked = Some(row);
@@ -5967,7 +6344,7 @@ mod tests {
                     .push(it);
             }
             let mut dupes: Vec<_> = by_title.iter().filter(|(_, v)| v.len() > 1).collect();
-            dupes.sort_by_key(|(t, _)| t.clone());
+            dupes.sort_by_key(|(t, _)| (*t).clone());
             println!("\n-- titles appearing more than once: {} --", dupes.len());
             for (title, group) in dupes {
                 println!("{title:?}");
@@ -6062,6 +6439,100 @@ mod tests {
         assert!(is_token_start(pinyin, "js"));
         assert!(is_token_start(pinyin, "calc"));
         assert!(!is_token_start(pinyin, "sj"));
+    }
+
+    /// `Health::Broken` is only useful if the check is honest: it must catch a
+    /// missing target, and must never accuse something it cannot verify.
+    #[test]
+    fn health_check_rules() {
+        let mk = |effect: Effect| Item {
+            id: "t".to_string(),
+            title: "t".to_string(),
+            subtitle: String::new(),
+            keywords: vec![],
+            actions: vec![Action {
+                label: String::new(),
+                effect,
+            }],
+            arg: Default::default(),
+            launch: Default::default(),
+            source: Default::default(),
+            health: Health::Unknown,
+        };
+
+        let here = std::env::current_exe().expect("current exe");
+        assert_eq!(
+            health_of(&mk(Effect::Open {
+                target: here.to_string_lossy().into_owned()
+            })),
+            Health::Ok
+        );
+        assert_eq!(
+            health_of(&mk(Effect::Open {
+                target: r"R:\nowhere\ghost.exe".to_string()
+            })),
+            Health::Broken
+        );
+        // Quoted path plus arguments: the path is what counts.
+        assert_eq!(
+            health_of(&mk(Effect::Run {
+                line: format!("\"{}\" --flag", here.display())
+            })),
+            Health::Ok
+        );
+        // A bare command, found through PATH.
+        assert_eq!(
+            health_of(&mk(Effect::Open {
+                target: "cmd".to_string()
+            })),
+            Health::Ok
+        );
+        assert_eq!(
+            health_of(&mk(Effect::Run {
+                line: "cmd /k echo hi".to_string()
+            })),
+            Health::Ok
+        );
+        // Things with no file behind them are never called broken: shell
+        // namespace (UWP apps, CLSIDs), URLs, unexpanded variables.
+        for target in [
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+            "https://example.com",
+            r"%WINDIR%\notepad.exe",
+        ] {
+            assert_eq!(
+                health_of(&mk(Effect::Open {
+                    target: target.to_string()
+                })),
+                Health::Ok,
+                "{target} must not be called broken"
+            );
+        }
+        assert_eq!(
+            health_of(&mk(Effect::Builtin {
+                verb: BuiltinVerb::HideForegroundWindow
+            })),
+            Health::Ok
+        );
+        // A directory is a fine target too (the "open a folder" kind of entry).
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            health_of(&mk(Effect::Open {
+                target: dir.to_string_lossy().into_owned()
+            })),
+            Health::Ok
+        );
+    }
+
+    #[test]
+    fn deleted_when_reads_like_a_person_wrote_it() {
+        let now = unix_now_secs();
+        assert_eq!(deleted_when(0), "", "no timestamp, nothing to say");
+        assert_eq!(deleted_when(now - 5), "5 秒前");
+        assert_eq!(deleted_when(now - 120), "2 分钟前");
+        assert_eq!(deleted_when(now - 7200), "2 小时前");
+        assert_eq!(deleted_when(now - 172_800), "2 天前");
     }
 
     /// The "no match → add it" rule and the UWP dedupe share one idea: names are
