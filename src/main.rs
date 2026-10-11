@@ -4345,9 +4345,14 @@ impl MxRunApp {
                 .size(12.0)
                 .color(Color32::from_gray(135)),
         );
+        const GRIP_W: f32 = 26.0;
+        // Centred (user's pick, 2026-09-19): the title names the card, the grip
+        // is a handle on the strip itself, so it reads as a handle rather than
+        // as punctuation stuck to the name. Flush-right looked stray, and the
+        // name-adjacent version was fine but this is the one they asked for.
         let grip = egui::Rect::from_center_size(
-            egui::pos2(title.rect.right() + 10.0 + 13.0, title.rect.center().y),
-            egui::vec2(26.0, 3.0),
+            egui::pos2(ui.max_rect().center().x, title.rect.center().y),
+            egui::vec2(GRIP_W, 3.0),
         );
         ui.painter()
             .rect_filled(grip, egui::CornerRadius::same(2), Color32::from_gray(74));
