@@ -817,17 +817,28 @@ fn apply_backdrop(hwnd: HWND, mode: &str) {
     ));
 }
 
-/// Ask DWM for its own rounded corners (Win11 22H2+).
+/// Did DWM accept our request for native rounded corners? (Logged; the card's
+/// own radius no longer depends on it — see `CARD_RADIUS`.)
+static DWM_ROUNDED: AtomicBool = AtomicBool::new(false);
+
+/// Our own corner radius.
 ///
-/// Our corners are currently made by leaving the panel's four corners
-/// transparent — which is exactly what stops working the moment a system
-/// material fills the whole window rect (see §2.2 and the Acrylic batch). This
-/// is the forward-compatible path, and on Win11 it also gets DWM's drop shadow
-/// (which a PrintWindow capture cannot show, so it needs a human eye).
+/// **Deliberately the same as Win11's `DWMWCP_ROUND`** (8px): the two arcs then
+/// coincide instead of leaving a crescent of desktop between them — which is
+/// exactly what "the wallpaper bleeds into the corner" was (user, 2026-09-19).
+/// Painting it even when DWM is doing the clipping also means we cannot end up
+/// with square corners if DWM decides not to round a transparent window.
+const CARD_RADIUS: u8 = 8;
+
+/// Ask DWM for its own rounded corners (Win11 22H2+) and remember the answer.
 ///
-/// `MXRUN_ROUND=0` turns it off (the corners then come from our own radius).
+/// On Win11 this is also what gets the window its drop shadow (which a
+/// PrintWindow capture cannot show, so it needs a human eye).
+///
+/// `MXRUN_ROUND=0` turns it off (the corners then come from `CARD_RADIUS`).
 fn apply_round_corners(hwnd: HWND) {
     if std::env::var("MXRUN_ROUND").is_ok_and(|v| v == "0") {
+        log_line("corners: disabled by MXRUN_ROUND=0");
         return;
     }
     // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2 (Win11 22H2+).
@@ -841,7 +852,11 @@ fn apply_round_corners(hwnd: HWND) {
             std::mem::size_of::<i32>() as u32,
         )
     };
-    log_line(&format!("corners: DwmSetWindowAttribute(CORNER_PREFERENCE=ROUND) -> {r:?}"));
+    let ok = r.is_ok();
+    DWM_ROUNDED.store(ok, Ordering::Relaxed);
+    log_line(&format!(
+        "corners: DwmSetWindowAttribute(CORNER_PREFERENCE=ROUND) -> {r:?} (dwm_owns_corners={ok})"
+    ));
 }
 
 /// How long the summon animation runs; `MXRUN_ANIM_MS=0` disables it.
@@ -4447,7 +4462,7 @@ impl eframe::App for MxRunApp {
                 CARD_BG.b(),
                 (self.card_alpha as f32 * self.anim_t) as u8,
             ))
-            .corner_radius(egui::CornerRadius::same(14))
+            .corner_radius(egui::CornerRadius::same(CARD_RADIUS))
             .inner_margin(egui::Margin::same(18))
             // The hairline fades with everything else, or an empty card would
             // still show its outline at the start of the fade.
