@@ -76,8 +76,9 @@ const SETTINGS_SIZE: [f32; 2] = [680.0, 560.0];
 // hunting for numbers.
 /// Card background. Opaque on purpose: translucency hurt reading (2026-09-19).
 const CARD_BG: Color32 = Color32::from_rgb(26, 27, 34);
-/// 1px hairline around the card.
-const CARD_STROKE: Color32 = Color32::from_rgba_premultiplied(24, 24, 24, 24);
+/// 1px hairline around the card. Scaled by the summon animation, so it is a
+/// plain value here rather than a `Color32`.
+const CARD_STROKE_ALPHA: f32 = 24.0;
 /// Primary text: item titles, headings.
 const TEXT: Color32 = Color32::from_gray(235);
 /// Secondary text: the detail line, notes, hints that must stay readable.
@@ -96,6 +97,14 @@ const SELECTED_BG: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 15);
 const HOVER_BG: Color32 = Color32::from_rgba_premultiplied(8, 8, 8, 8);
 /// Row height driver: the icon, and the space before it.
 const ICON_SIZE: f32 = 26.0;
+
+/// Summon animation: fade in over this long while rising this far.
+///
+/// Kept deliberately short — a launcher's animation budget is stricter than any
+/// other app's (the design note says "跟手但不拖沓"). `MXRUN_ANIM_MS=0` turns it
+/// off entirely for anyone who wants the AltRun snap.
+const ANIM_MS_DEFAULT: f32 = 100.0;
+const ANIM_RISE: f32 = 4.0;
 
 /// Paths this instance was started with (before eframe owns the process).
 static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -806,6 +815,51 @@ fn apply_backdrop(hwnd: HWND, mode: &str) {
     log_line(&format!(
         "backdrop: DwmSetWindowAttribute(SYSTEMBACKDROP_TYPE={value}) -> {r:?}"
     ));
+}
+
+/// Ask DWM for its own rounded corners (Win11 22H2+).
+///
+/// Our corners are currently made by leaving the panel's four corners
+/// transparent — which is exactly what stops working the moment a system
+/// material fills the whole window rect (see §2.2 and the Acrylic batch). This
+/// is the forward-compatible path, and on Win11 it also gets DWM's drop shadow
+/// (which a PrintWindow capture cannot show, so it needs a human eye).
+///
+/// `MXRUN_ROUND=0` turns it off (the corners then come from our own radius).
+fn apply_round_corners(hwnd: HWND) {
+    if std::env::var("MXRUN_ROUND").is_ok_and(|v| v == "0") {
+        return;
+    }
+    // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2 (Win11 22H2+).
+    const DWMWA_WINDOW_CORNER_PREFERENCE: i32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+    let r = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE),
+            &DWMWCP_ROUND as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    log_line(&format!("corners: DwmSetWindowAttribute(CORNER_PREFERENCE=ROUND) -> {r:?}"));
+}
+
+/// How long the summon animation runs; `MXRUN_ANIM_MS=0` disables it.
+fn anim_ms() -> f32 {
+    std::env::var("MXRUN_ANIM_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(ANIM_MS_DEFAULT)
+}
+
+/// The window's current size in points — used to re-place it during the rise.
+fn applied_size_of(hwnd: HWND) -> [f32; 2] {
+    let mut rect = unsafe { std::mem::zeroed() };
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok();
+    [
+        (rect.right - rect.left) as f32,
+        (rect.bottom - rect.top) as f32,
+    ]
 }
 
 /// AltRun behaviour: the window hides the moment it loses focus
@@ -1931,6 +1985,11 @@ struct MxRunApp {
     recent_only: bool,
     /// The box holds a `=` expression: no list, just a result.
     calc_mode: bool,
+    /// When the current summon animation started (`None` = settled).
+    anim: Option<std::time::Instant>,
+    /// Animation progress 0..1, and the window offset that goes with it.
+    anim_t: f32,
+    anim_dy: f32,
     /// One-shot flag for the `MXRUN_SELFTEST_RECTS` bookkeeping.
     logged_drag_rect: bool,
     /// Which row the pointer was over last frame — only for the faint hover
@@ -2196,6 +2255,9 @@ impl MxRunApp {
             discovery_note: String::new(),
             recent_only: false,
             calc_mode: false,
+            anim: None,
+            anim_t: 1.0,
+            anim_dy: 0.0,
             logged_drag_rect: false,
             hover_row: None,
             prev_list: ListSnapshot::default(),
@@ -2692,6 +2754,69 @@ impl MxRunApp {
         if let Some(idx) = self.items.iter().position(|it| it.item.id == id) {
             self.execute_index(idx, ctx);
         }
+    }
+
+    /// Advance the summon animation one frame.
+    ///
+    /// Only ever runs for ~100ms after a summon, and asks for the frames it
+    /// needs itself — the launcher must stay "no work while idle" (the wake
+    /// latency budget is measured from the hotkey to the first frame, and this
+    /// runs *after* that frame has already been painted).
+    fn step_anim(&mut self, ctx: &egui::Context) {
+        let Some(t0) = self.anim else {
+            return;
+        };
+        let ms = anim_ms();
+        let raw = (t0.elapsed().as_secs_f32() * 1000.0 / ms.max(1.0)).clamp(0.0, 1.0);
+        // Ease-out cubic: quick off the mark, settles gently.
+        let eased = 1.0 - (1.0 - raw).powi(3);
+        self.anim_t = eased;
+        self.anim_dy = (1.0 - eased) * ANIM_RISE;
+        if raw >= 1.0 {
+            self.anim = None;
+            self.anim_dy = 0.0;
+        } else {
+            ctx.request_repaint();
+        }
+        // The rise: move the window while it fades, then land exactly on the
+        // spot `show_window_sized` chose.
+        if let (Some(hwnd), true) = (main_hwnd(), self.anim_dy > 0.3) {
+            let size = applied_size_of(hwnd);
+            let (x, y) = place_for(size);
+            let target = y + self.anim_dy.round() as i32;
+            if std::env::var_os("MXRUN_SELFTEST_RECTS").is_some() {
+                log_line(&format!(
+                    "anim: t={:.2} dy={:.1} -> y {target} (settles at {y})",
+                    self.anim_t, self.anim_dy
+                ));
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    x,
+                    target,
+                    size[0] as i32,
+                    size[1] as i32,
+                    SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// A quiet chip naming the current input mode, so a vanished list (the
+    /// calculator) or a filtered one (the recent list) never looks like a bug.
+    fn mode_chip(&self) -> Option<(&'static str, Color32)> {
+        if self.calc_mode {
+            return Some(("计算器", OK_GREEN));
+        }
+        if self.recent_only {
+            return Some(("最近列表", ACCENT));
+        }
+        if self.input.contains('#') {
+            return Some(("按序号选行", ACCENT));
+        }
+        None
     }
 
     /// Pull one item's statistics back out of the store.
@@ -3957,6 +4082,7 @@ impl eframe::App for MxRunApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         apply_card_style(&ctx);
+        self.step_anim(&ctx);
 
         // Alt+F4 / the system close button hide the launcher instead of exiting
         // it — AltRun's own behaviour (docs/AltRun交互规格.md), and the only
@@ -3995,7 +4121,11 @@ impl eframe::App for MxRunApp {
             show_window(&ctx);
             if let Some(hwnd) = main_hwnd() {
                 apply_backdrop(hwnd, &std::env::var("MXRUN_BACKDROP").unwrap_or_default());
+                apply_round_corners(hwnd);
             }
+            // Cold start gets the same fade-in as a summon: the window is not
+            // transitioning from hidden here, so the block below would miss it.
+            self.anim = (anim_ms() > 0.0).then(std::time::Instant::now);
         }
 
         // Tray menu asked for the settings view.
@@ -4052,6 +4182,8 @@ impl eframe::App for MxRunApp {
         if visible && !self.prev_visible {
             self.want_focus = true;
             self.shown_at = Some(std::time::Instant::now());
+            // Start the summon animation (fade + a small rise).
+            self.anim = (anim_ms() > 0.0).then(std::time::Instant::now);
         }
         if !visible && self.prev_visible {
             // Just got hidden — by the hotkey, Esc, or focus loss. AltRun clears
@@ -4313,15 +4445,28 @@ impl eframe::App for MxRunApp {
                 CARD_BG.r(),
                 CARD_BG.g(),
                 CARD_BG.b(),
-                self.card_alpha,
+                (self.card_alpha as f32 * self.anim_t) as u8,
             ))
             .corner_radius(egui::CornerRadius::same(14))
             .inner_margin(egui::Margin::same(18))
-            .stroke(egui::Stroke::new(1.0, CARD_STROKE));
+            // The hairline fades with everything else, or an empty card would
+            // still show its outline at the start of the fade.
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_premultiplied(
+                    (CARD_STROKE_ALPHA * self.anim_t) as u8,
+                    (CARD_STROKE_ALPHA * self.anim_t) as u8,
+                    (CARD_STROKE_ALPHA * self.anim_t) as u8,
+                    (CARD_STROKE_ALPHA * self.anim_t) as u8,
+                ),
+            ));
 
         egui::CentralPanel::default()
             .frame(panel)
             .show(ui, |ui| {
+                // Fade the *contents* too: the frame's own alpha is handled
+                // above, and `set_opacity` covers everything drawn inside.
+                ui.set_opacity(self.anim_t);
                 // Dragging the card moves the window: the OS runs its own move
                 // loop (`drag_window`), which is why the position can be saved
                 // the moment the call returns. Registered before the views so
@@ -4399,24 +4544,40 @@ impl MxRunApp {
         // small grip right behind it, like a nameplate with a handle. (It was
         // centred first, then flush right — both read as a stray underline,
         // because nothing anchored them; next to the name it looks deliberate.)
-        let title = ui.label(
-            RichText::new("MxRun")
-                .size(12.0)
-                .color(TEXT_DIM),
-        );
+        // The strip is one *row*: the name, the grip on the card's centre line,
+        // and the mode chip at the right end. (Wrapping it in `horizontal` is
+        // load-bearing: a bare `with_layout` here would claim the whole rest of
+        // the card and push the search box to the bottom — seen and fixed
+        // 2026-09-19.) The grip sits at the card's centre because that is where
+        // the user asked for it: flush right looked stray, and next to the name
+        // read like punctuation.
         const GRIP_W: f32 = 26.0;
-        // Centred (user's pick, 2026-09-19): the title names the card, the grip
-        // is a handle on the strip itself, so it reads as a handle rather than
-        // as punctuation stuck to the name. Flush-right looked stray, and the
-        // name-adjacent version was fine but this is the one they asked for.
-        let grip = egui::Rect::from_center_size(
-            egui::pos2(ui.max_rect().center().x, title.rect.center().y),
-            egui::vec2(GRIP_W, 3.0),
-        );
-        ui.painter()
-            .rect_filled(grip, egui::CornerRadius::same(2), Color32::from_gray(74));
+        ui.horizontal(|ui| {
+            let title = ui.label(
+                RichText::new("MxRun")
+                    .size(12.0)
+                    .color(TEXT_DIM),
+            );
+            let grip = egui::Rect::from_center_size(
+                egui::pos2(ui.max_rect().center().x, title.rect.center().y),
+                egui::vec2(GRIP_W, 3.0),
+            );
+            ui.painter()
+                .rect_filled(grip, egui::CornerRadius::same(2), Color32::from_gray(74));
+            // Right side: the mode chip (only while a mode is on).
+            if let Some((label, color)) = self.mode_chip() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_premultiplied(10, 10, 10, 10))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(6, 1))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(label).size(11.0).color(color));
+                        });
+                });
+            }
+        });
         ui.add_space(3.0);
-
         // --- Search box ---
         //
         // `event_filter`: egui's focus navigation reads the raw events at the
