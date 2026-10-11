@@ -2155,35 +2155,93 @@ const QUOTE_ROW: usize = 2;
 /// Which row a `Ctrl`/`Alt` + digit asks for, reading the keyboard. Our own
 /// keys are *consumed* so the digits never reach the search box.
 fn consume_digit(ctx: &egui::Context) -> Option<usize> {
-    use egui::Key::*;
-    const DIGITS: [Key; 10] = [Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
-    for key in DIGITS {
-        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::ALT] {
-            if ctx.input_mut(|i| i.consume_key(modifiers, key))
-                && let Some(row) = digit_row(key, modifiers.ctrl, modifiers.alt)
-            {
-                return Some(row);
+    let mut found = None;
+    ctx.input_mut(|i| {
+        i.events.retain(|event| {
+            if found.is_some() {
+                return true;
             }
-        }
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if !modifier_is_clean_digit_command(modifiers) {
+                return true;
+            }
+            let Some(row) = digit_row(*key, modifiers.ctrl, modifiers.alt) else {
+                return true;
+            };
+            found = Some(row);
+            false
+        });
+    });
+    found
+}
+
+/// May this key event be read as a row-selector command?
+///
+/// `Ctrl`/`Alt` only, and **never with Shift**. The reason is not taste: egui's
+/// `Modifiers::matches_logically` only checks the modifiers the *pattern* asks
+/// for, so `consume_key(Modifiers::NONE, Key::Num2)` happily matched `Shift+2` —
+/// which on this keyboard types `@`, the file-search prefix. Typing `@` ran row 2
+/// and the prefix was unreachable; `#` (`Shift+3`) and `!@#$%^&*()` were the same
+/// bug waiting (user report, 2026-09-19). Filtering on the real modifier set here
+/// is the fix; the digits that *are* text must reach the box as text.
+fn modifier_is_clean_digit_command(modifiers: &egui::Modifiers) -> bool {
+    if modifiers.shift || modifiers.command {
+        return false;
     }
-    None
+    modifiers.ctrl || modifiers.alt
 }
 
 /// The same for a bare digit with an empty search box (`bare_digit_row`).
+///
+/// "Bare" now means what it says: no Shift, no Ctrl, no Alt — the key really does
+/// type that digit. Anything else is text (or another shortcut) and is left alone.
 fn consume_bare_digit(ctx: &egui::Context, input_is_empty: bool) -> Option<usize> {
     if !input_is_empty {
         return None;
     }
-    use egui::Key::*;
-    const DIGITS: [Key; 10] = [Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
-    for key in DIGITS {
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
-            && let Some(row) = bare_digit_row(key, input_is_empty)
-        {
-            return Some(row);
+    let mut found = None;
+    ctx.input_mut(|i| {
+        i.events.retain(|event| {
+            if found.is_some() {
+                return true;
+            }
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            // `@` is `Shift+2` here: it must stay text, or the file-search prefix
+            // can never be typed.
+            if modifiers.shift || modifiers.ctrl || modifiers.alt || modifiers.command {
+                return true;
+            }
+            let Some(row) = bare_digit_row(*key, input_is_empty) else {
+                return true;
+            };
+            found = Some(row);
+            false
+        });
+        // Swallow the character too, so the box does not flash the digit before
+        // the row runs (`execute` clears the box anyway).
+        if found.is_some() {
+            i.events.retain(|event| {
+                !matches!(event, egui::Event::Text(t) if t.len() == 1 && t.chars().all(|c| c.is_ascii_digit()))
+            });
         }
-    }
-    None
+    });
+    found
 }
 
 /// Noise-exclusion fragments are stored as one config string. `;` separates them
@@ -7215,6 +7273,25 @@ mod tests {
         assert!(is_token_start(pinyin, "js"));
         assert!(is_token_start(pinyin, "calc"));
         assert!(!is_token_start(pinyin, "sj"));
+    }
+
+    /// The digit-modifier rule, which a real bug made necessary: `Shift+2` types
+    /// `@` (the file-search prefix on this keyboard) and used to run row 2,
+    /// because egui's `consume_key(Modifiers::NONE, Key::Num2)` also matches
+    /// events that carry *extra* modifiers.
+    #[test]
+    fn shift_digits_are_text_not_commands() {
+        use egui::Modifiers;
+        // A bare digit: typeable, and (with an empty box) a row selector.
+        assert!(!modifier_is_clean_digit_command(&Modifiers::NONE));
+        // Shift+2 / Shift+3 / Shift+1 produce `@`, `#`, `!`: text, never a row.
+        assert!(!modifier_is_clean_digit_command(&Modifiers::SHIFT));
+        assert!(!modifier_is_clean_digit_command(&(Modifiers::CTRL | Modifiers::SHIFT)));
+        assert!(!modifier_is_clean_digit_command(&(Modifiers::ALT | Modifiers::SHIFT)));
+        assert!(!modifier_is_clean_digit_command(&Modifiers::COMMAND));
+        // The two AltRun-intended forms still count.
+        assert!(modifier_is_clean_digit_command(&Modifiers::CTRL));
+        assert!(modifier_is_clean_digit_command(&Modifiers::ALT));
     }
 
     /// The prefix table is the one place that decides which mode the box is in,
