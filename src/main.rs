@@ -1848,7 +1848,9 @@ struct MxRunApp {
     prompt: Option<Prompt>,
     calc_result: Option<String>,
     selected: usize,
-    /// E2 spike: card opacity, `MXRUN_CARD_ALPHA` (0-255, default 235).
+    /// Card opacity, `MXRUN_CARD_ALPHA` (0-255). **Default 255 = opaque**: a
+    /// translucent card let the desktop bleed through and made the list tiring
+    /// to read (reported 2026-09-19). 235 was the old look.
     card_alpha: u8,
     want_focus: bool,
     centered: bool,
@@ -2116,7 +2118,10 @@ impl MxRunApp {
             card_alpha: std::env::var("MXRUN_CARD_ALPHA")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(235),
+                // Opaque by default: at 235 the desktop showed through the card
+                // and reading the list got tiring (reported 2026-09-19). The env
+                // var stays as the knob for the visual work later on.
+                .unwrap_or(255),
             want_focus: true,
             centered: false,
             prev_visible: true,
