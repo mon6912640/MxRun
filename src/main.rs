@@ -53,8 +53,58 @@ use tray_icon::{
 const MAX_ROWS: usize = 8;
 const DEFAULT_HOTKEY: &str = "Alt+F1";
 
+/// When was the running `mxrun.exe` built?
+///
+/// Added after a user reported "typing `@` closes the window" (2026-09-19) — it
+/// was the *previous* binary still running from the tray, where `Shift+2` ran row
+/// 2 and the window hid as usual after launching. Nothing in the log said which
+/// binary was in memory, so the first question ("am I even running the fix?")
+/// could not be answered. Now it can: this string goes into the log at startup
+/// and onto the settings page.
+///
+/// Uses the exe's own modification time: it is the one fact that always matches
+/// what is actually on disk, with no build script to keep in sync.
+fn exe_build_stamp() -> String {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+    let Ok(exe) = std::env::current_exe() else {
+        return "未知".to_string();
+    };
+    let Ok(modified) = std::fs::metadata(&exe).and_then(|m| m.modified()) else {
+        return "未知".to_string();
+    };
+    let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return "未知".to_string();
+    };
+    // Windows FILETIME counts 100-ns ticks from 1601-01-01.
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    let ticks = (since_epoch.as_secs() + EPOCH_DIFF_SECS) * 10_000_000
+        + since_epoch.subsec_nanos() as u64 / 100;
+    let ft = FILETIME {
+        dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut st = SYSTEMTIME::default();
+    unsafe {
+        // `FileTimeToSystemTime` alone hands back **UTC** — the first version of
+        // this showed a build time eight hours off, which is worse than nothing
+        // when the whole point is "is this the build I just made?".
+        let mut local = FILETIME::default();
+        if FileTimeToLocalFileTime(&ft, &mut local).is_err()
+            || FileTimeToSystemTime(&local, &mut st).is_err()
+        {
+            return "未知".to_string();
+        }
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+    )
+}
 /// The folder a file lives in, shortened from the left so the interesting end
-/// (the last two levels) survives: `…\Network\Reporting`.
+/// (the last two levels) survives: `…\Network\Reporting`. Used as a file row's
+/// detail line — the file name is already the title.
 fn folder_of(path: &str) -> String {
     let parent = std::path::Path::new(path)
         .parent()
@@ -67,7 +117,8 @@ fn folder_of(path: &str) -> String {
     format!("…\\{}", parts[parts.len() - 3..].join("\\"))
 }
 
-/// A throwaway item for running a file action.
+/// The folder a file lives in, shortened from the left so the interesting end
+/// (the last two levels) survives: `…\Network\Reporting`.
 ///
 /// `exec::run` takes an `Item` because most effects need one, but opening a path
 /// only needs the action. This keeps the file rows out of the item model while
@@ -2767,6 +2818,9 @@ impl MxRunApp {
             .map(|hk| manager.register(hk).is_ok())
             .unwrap_or(false);
         log_line(&format!("startup: hotkey={hotkey_str} registered={registered}"));
+        // Which binary is this? Added after "typing @ closed the window" turned
+        // out to be an *older* exe still resident in the tray (2026-09-19).
+        log_line(&format!("startup: exe built {}", exe_build_stamp()));
         if !registered {
             // The configured hotkey is taken by another program (or invalid):
             // fall back to the default instead of leaving no way to summon.
@@ -5000,6 +5054,12 @@ impl MxRunApp {
 
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("⚙ 设置").size(20.0));
+        // Which build is running — the answer to "did my fix actually take?".
+        ui.label(
+            RichText::new(format!("构建时间：{}", exe_build_stamp()))
+                .size(11.0)
+                .color(pal().text_faint),
+        );
         ui.add_space(12.0);
 
         // --- hotkey row ---
