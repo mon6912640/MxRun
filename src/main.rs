@@ -67,6 +67,36 @@ const MANAGER_SIZE: [f32; 2] = [880.0, 560.0];
 /// It scrolls too, so nothing can fall off the bottom again.
 const SETTINGS_SIZE: [f32; 2] = [680.0, 560.0];
 
+// ---------- palette ----------
+//
+// One table for the card's colours. They used to be scattered as
+// `from_gray(78)` … `from_gray(150)` in a couple of dozen places — seven greys
+// with no hierarchy, which is what made the card look muddy. Three tiers now,
+// plus the accent. The light theme (a later batch) swaps this table instead of
+// hunting for numbers.
+/// Card background. Opaque on purpose: translucency hurt reading (2026-09-19).
+const CARD_BG: Color32 = Color32::from_rgb(26, 27, 34);
+/// 1px hairline around the card.
+const CARD_STROKE: Color32 = Color32::from_rgba_premultiplied(24, 24, 24, 24);
+/// Primary text: item titles, headings.
+const TEXT: Color32 = Color32::from_gray(235);
+/// Secondary text: the detail line, notes, hints that must stay readable.
+const TEXT_DIM: Color32 = Color32::from_gray(155);
+/// Tertiary text: status line, launch counts, the "未启动" placeholder.
+const TEXT_FAINT: Color32 = Color32::from_gray(105);
+/// Matched characters and keyword column.
+const ACCENT: Color32 = Color32::from_rgb(255, 190, 80);
+/// Success / enabled state.
+const OK_GREEN: Color32 = Color32::from_rgb(140, 220, 140);
+/// Delete confirmation.
+const DANGER: Color32 = Color32::from_rgb(255, 140, 120);
+/// Selected row: a quiet wash plus a 3px accent bar on the left.
+const SELECTED_BG: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 15);
+/// Hovered row: half of that, and it never moves the selection.
+const HOVER_BG: Color32 = Color32::from_rgba_premultiplied(8, 8, 8, 8);
+/// Row height driver: the icon, and the space before it.
+const ICON_SIZE: f32 = 26.0;
+
 /// Paths this instance was started with (before eframe owns the process).
 static PENDING_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
@@ -2261,6 +2291,13 @@ impl MxRunApp {
             log_line(&format!("selftest: after row {row}: {}", app.status));
         }
 
+        // Debug hook: open the settings view at startup
+        // (`MXRUN_SELFTEST_SETTINGS=1`) — the only way to screenshot it without
+        // clicking the tray menu.
+        if std::env::var("MXRUN_SELFTEST_SETTINGS").is_ok() {
+            app.open_settings.store(true, Ordering::Relaxed);
+        }
+
         // Debug hook: switch to the recent list at startup
         // (`MXRUN_SELFTEST_RECENT=1`), the only way to check it from a script.
         if std::env::var("MXRUN_SELFTEST_RECENT").is_ok() {
@@ -3618,8 +3655,8 @@ impl MxRunApp {
         let name = &item.item.title;
         let mut job = LayoutJob::default();
         let font = FontId::proportional(17.0);
-        let normal = Color32::from_gray(225);
-        let hit = Color32::from_rgb(255, 190, 80);
+        let normal = TEXT;
+        let hit = ACCENT;
 
         // Convert char indices to byte ranges.
         let char_to_byte: Vec<usize> = name.char_indices().map(|(b, _)| b).collect();
@@ -3697,7 +3734,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(display)
                     .size(15.0)
-                    .color(Color32::from_rgb(255, 190, 80)),
+                    .color(ACCENT),
             );
         });
         ui.add_space(8.0);
@@ -3738,7 +3775,7 @@ impl MxRunApp {
             RichText::new("支持修饰键组合：Alt / Ctrl / Shift + F1-F12、字母、数字、Space、Tab\n\
                            保存后立即生效，无需重启；如组合键被其他程序占用会提示注册失败。")
                 .size(12.0)
-                .color(Color32::from_gray(140)),
+                .color(TEXT_DIM),
         );
 
         ui.add_space(16.0);
@@ -3793,7 +3830,7 @@ impl MxRunApp {
                 self.status = "正在扫描开始菜单…".into();
             }
             if running {
-                ui.label(RichText::new("扫描中…").size(12.0).color(Color32::from_gray(150)));
+                ui.label(RichText::new("扫描中…").size(12.0).color(TEXT_DIM));
             }
         });
 
@@ -3802,7 +3839,7 @@ impl MxRunApp {
         } else {
             self.discovery_note.clone()
         };
-        ui.label(RichText::new(note).size(12.0).color(Color32::from_gray(140)));
+        ui.label(RichText::new(note).size(12.0).color(TEXT_DIM));
         ui.label(
             RichText::new(
                 "只扫开始菜单里的程序（跳过卸载程序、帮助文档和网页快捷方式），\
@@ -3810,7 +3847,7 @@ impl MxRunApp {
                  不想要的可以在「快捷项管理」里删掉，删过的不会再被扫回来。",
             )
             .size(12.0)
-            .color(Color32::from_gray(140)),
+            .color(TEXT_DIM),
         );
     }
 
@@ -3832,7 +3869,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(if sendto { "✓ 已加入「发送到」菜单" } else { "· 未加入「发送到」菜单" })
                     .size(13.0)
-                    .color(if sendto { Color32::from_rgb(140, 220, 140) } else { Color32::from_gray(150) }),
+                    .color(if sendto { OK_GREEN } else { TEXT_DIM }),
             );
             if ui.button(if sendto { "移除" } else { "加入" }).clicked() {
                 let outcome = if sendto {
@@ -3860,7 +3897,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(if menu { "✓ 已注册文件和目录右键菜单" } else { "· 未注册右键菜单" })
                     .size(13.0)
-                    .color(if menu { Color32::from_rgb(140, 220, 140) } else { Color32::from_gray(150) }),
+                    .color(if menu { OK_GREEN } else { TEXT_DIM }),
             );
             if ui.button(if menu { "移除" } else { "注册" }).clicked() {
                 let outcome = if menu {
@@ -3891,9 +3928,25 @@ impl MxRunApp {
             RichText::new("两种方式都只会调起一个小确认框，主窗口不会弹出来打扰你。\n\
                            右键菜单写在 HKCU 下，不需要管理员权限。")
                 .size(12.0)
-                .color(Color32::from_gray(140)),
+                .color(TEXT_DIM),
         );
     }
+}
+
+/// Card-wide styling: a scroll bar that does not shout.
+///
+/// The list is keyboard-driven most of the time, so the bar is only a hint that
+/// there is more — egui's default is wide and bright enough to pull the eye away
+/// from the rows. (eframe 0.36 has no `style` hook on `App`, so this runs once
+/// per frame from `ui`; it is a handful of field writes.)
+fn apply_card_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.scroll.bar_width = 6.0;
+        style.spacing.scroll.floating = true;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_gray(52);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_gray(78);
+        style.visuals.widgets.active.bg_fill = Color32::from_gray(96);
+    });
 }
 
 impl eframe::App for MxRunApp {
@@ -3903,6 +3956,7 @@ impl eframe::App for MxRunApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        apply_card_style(&ctx);
 
         // Alt+F4 / the system close button hide the launcher instead of exiting
         // it — AltRun's own behaviour (docs/AltRun交互规格.md), and the only
@@ -4255,10 +4309,15 @@ impl eframe::App for MxRunApp {
         }
 
         let panel = egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(26, 27, 34, self.card_alpha))
+            .fill(Color32::from_rgba_unmultiplied(
+                CARD_BG.r(),
+                CARD_BG.g(),
+                CARD_BG.b(),
+                self.card_alpha,
+            ))
             .corner_radius(egui::CornerRadius::same(14))
             .inner_margin(egui::Margin::same(18))
-            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(24)));
+            .stroke(egui::Stroke::new(1.0, CARD_STROKE));
 
         egui::CentralPanel::default()
             .frame(panel)
@@ -4343,7 +4402,7 @@ impl MxRunApp {
         let title = ui.label(
             RichText::new("MxRun")
                 .size(12.0)
-                .color(Color32::from_gray(135)),
+                .color(TEXT_DIM),
         );
         const GRIP_W: f32 = 26.0;
         // Centred (user's pick, 2026-09-19): the title names the card, the grip
@@ -4404,7 +4463,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new("输入算式，例如 =1+2")
                     .size(15.0)
-                    .color(Color32::from_gray(140)),
+                    .color(TEXT_DIM),
             );
             ui.add_space(4.0);
         }
@@ -4412,7 +4471,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(format!("= {result}"))
                     .size(20.0)
-                    .color(Color32::from_rgb(140, 220, 140)),
+                    .color(OK_GREEN),
             );
             ui.add_space(4.0);
         }
@@ -4425,7 +4484,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new("无匹配结果 · 网页搜索等兜底功能将在后续版本加入")
                     .size(13.0)
-                    .color(Color32::from_gray(130)),
+                    .color(TEXT_DIM),
             );
             return;
         }
@@ -4459,11 +4518,11 @@ impl MxRunApp {
             let item = &self.items[sc.idx];
             let selected = row == self.selected;
             let bg = if selected {
-                Color32::from_white_alpha(18)
+                SELECTED_BG
             } else if hover_row == Some(row) {
                 // Much fainter than the selection: the pointer says "clickable",
                 // it does not say "this is what Enter will run".
-                Color32::from_white_alpha(7)
+                HOVER_BG
             } else {
                 Color32::TRANSPARENT
             };
@@ -4498,22 +4557,25 @@ impl MxRunApp {
                         egui::Label::new(
                             RichText::new(format!("{}", row + 1))
                                 .size(11.0)
-                                .color(Color32::from_gray(if selected { 150 } else { 85 })),
+                                .color(if selected { TEXT_DIM } else { TEXT_FAINT }),
                         ),
                     );
                     match &icon {
                         // Real shell icon at the display resolution (the texture
-                        // is fetched at 24 * pixels_per_point physical pixels and
-                        // drawn at 24 points, so it stays sharp when scaled).
+                        // is fetched at ICON_SIZE * pixels_per_point physical
+                        // pixels and drawn at ICON_SIZE points, so it stays sharp
+                        // when scaled).
                         Some(tex) => {
                             ui.add(
-                                egui::Image::new(tex).fit_to_exact_size(egui::vec2(24.0, 24.0)),
+                                egui::Image::new(tex)
+                                    .fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE)),
                             );
                         }
                         None => {
-                            ui.label(RichText::new(emoji).size(17.0));
+                            ui.label(RichText::new(emoji).size(ICON_SIZE - 7.0));
                         }
                     }
+                    ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.label(job);
                         // Items that need a typed argument are marked with `*`:
@@ -4524,7 +4586,7 @@ impl MxRunApp {
                         ui.label(
                             RichText::new(format!("{}  ·  {}{}", category, desc, needs_input))
                                 .size(12.0)
-                                .color(Color32::from_gray(140)),
+                                .color(TEXT_DIM),
                         );
                     });
                     // Launch counter, flush right — this is what fills the wide
@@ -4532,19 +4594,13 @@ impl MxRunApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         match &launches {
                             Some(text) => {
-                                ui.label(
-                                    RichText::new(text)
-                                        .size(11.0)
-                                        .color(Color32::from_gray(120)),
-                                );
+                                ui.label(RichText::new(text).size(11.0).color(TEXT_DIM));
                             }
                             None => {
                                 // Never launched: say so quietly rather than
                                 // leaving the column looking broken.
                                 ui.label(
-                                    RichText::new("未启动")
-                                        .size(11.0)
-                                        .color(Color32::from_gray(78)),
+                                    RichText::new("未启动").size(11.0).color(TEXT_FAINT),
                                 );
                             }
                         }
@@ -4552,6 +4608,20 @@ impl MxRunApp {
                 });
             });
             let rect = inner.response.rect;
+            // The selection is a quiet wash plus a short accent bar on the left —
+            // one glance at the bar says which row Enter will run, which a
+            // slightly-lighter rectangle never did.
+            if selected {
+                let bar = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 1.0, rect.top() + 8.0),
+                    egui::vec2(3.0, rect.height() - 16.0),
+                );
+                ui.painter()
+                    .rect_filled(bar, egui::CornerRadius::same(2), ACCENT);
+            }
+            // A hair of air between rows: they used to butt right up against
+            // each other, which read as a table rather than a list.
+            ui.add_space(2.0);
             // `click_and_drag`: a click still selects, a drag moves the window —
             // the list is the biggest piece of the card, and AltRun let you drag
             // by its list background too. egui only calls it a drag past its own
@@ -4632,7 +4702,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new("无匹配结果 · 网页搜索等兜底功能将在后续版本加入")
                     .size(13.0)
-                    .color(Color32::from_gray(130)),
+                    .color(TEXT_DIM),
             );
         }
     }
@@ -4654,7 +4724,7 @@ impl MxRunApp {
                 ui.label(
                     RichText::new(status)
                         .size(11.0)
-                        .color(Color32::from_gray(110)),
+                        .color(TEXT_FAINT),
                 );
             })
             .response
@@ -4709,7 +4779,7 @@ impl MxRunApp {
         let Some(toast) = self.toast.as_ref() else {
             return;
         };
-        let green = Color32::from_rgb(140, 220, 140);
+        let green = OK_GREEN;
         ui.add_space(18.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(&toast.title).size(19.0).color(green));
@@ -4717,14 +4787,14 @@ impl MxRunApp {
             ui.label(
                 RichText::new(&toast.body)
                     .size(13.0)
-                    .color(Color32::from_gray(170)),
+                    .color(TEXT_DIM),
             );
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.label(
                 RichText::new("这条提示 2 秒后自己消失")
                     .size(11.0)
-                    .color(Color32::from_gray(110)),
+                    .color(TEXT_FAINT),
             );
         });
     }
@@ -4759,7 +4829,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(format!("共 {} 条", self.results.len()))
                     .size(12.0)
-                    .color(Color32::from_gray(150)),
+                    .color(TEXT_DIM),
             );
             ui.add_space(10.0);
             // Which half of the list to look at. Auto-discovered entries are
@@ -4787,7 +4857,7 @@ impl MxRunApp {
                     ui.label(
                         RichText::new(format!("再按一次 Delete 删除「{}」", it.item.title))
                             .size(12.0)
-                            .color(Color32::from_rgb(255, 140, 120)),
+                            .color(DANGER),
                     );
                 }
             }
@@ -4817,7 +4887,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new("没有匹配的条目")
                     .size(13.0)
-                    .color(Color32::from_gray(130)),
+                    .color(TEXT_DIM),
             );
             return;
         }
@@ -4841,9 +4911,9 @@ impl MxRunApp {
                     let bg = if is_armed {
                         Color32::from_rgba_unmultiplied(200, 60, 50, 60)
                     } else if is_selected {
-                        Color32::from_white_alpha(18)
+                        SELECTED_BG
                     } else if hover_row == Some(row) {
-                        Color32::from_white_alpha(7)
+                        HOVER_BG
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -4873,7 +4943,7 @@ impl MxRunApp {
                                 egui::Label::new(
                                     RichText::new(truncate_chars(&keyword, 12))
                                         .size(13.0)
-                                        .color(Color32::from_rgb(255, 190, 80)),
+                                        .color(ACCENT),
                                 )
                                 .truncate(),
                             );
@@ -4885,18 +4955,29 @@ impl MxRunApp {
                             ui.label(
                                 RichText::new(format!("{category} · {detail}"))
                                     .size(11.0)
-                                    .color(Color32::from_gray(140)),
+                                    .color(TEXT_DIM),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(
                                     RichText::new(launches)
                                         .size(11.0)
-                                        .color(Color32::from_gray(120)),
+                                        .color(TEXT_FAINT),
                                 );
                             });
                         });
                     });
                     let rect = inner.response.rect;
+                    // The same selection cue as the launcher: the accent bar says
+                    // which row Enter / F2 acts on. (The armed-for-delete row is
+                    // already red, so it does not need one.)
+                    if is_selected && !is_armed {
+                        let bar = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 1.0, rect.top() + 7.0),
+                            egui::vec2(3.0, rect.height() - 14.0),
+                        );
+                        ui.painter()
+                            .rect_filled(bar, egui::CornerRadius::same(2), ACCENT);
+                    }
                     // Same as the launcher's rows: click selects, drag moves the
                     // window (the manager fills the card too) — and hover does
                     // **not** select, or the arrow keys would fight the pointer.
@@ -4982,7 +5063,7 @@ impl MxRunApp {
             ui.label(
                 RichText::new(line)
                     .size(13.0)
-                    .color(Color32::from_gray(if line.is_empty() { 90 } else { 170 })),
+                    .color(if line.is_empty() { TEXT_FAINT } else { TEXT_DIM }),
             );
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
@@ -5019,7 +5100,7 @@ impl MxRunApp {
                     ui.label(
                         RichText::new(format!("还有 {} 个待添加", form.queue.len()))
                             .size(12.0)
-                            .color(Color32::from_gray(140)),
+                            .color(TEXT_DIM),
                     );
                 });
             }
@@ -5077,12 +5158,12 @@ impl MxRunApp {
         } else {
             format!("来自 {} · 回车添加 · Esc 取消", truncate_chars(&form.source_path, 46))
         };
-        ui.label(RichText::new(note).size(11.0).color(Color32::from_gray(120)));
+        ui.label(RichText::new(note).size(11.0).color(TEXT_FAINT));
         if !form.error.is_empty() {
             ui.label(
                 RichText::new(&form.error)
                     .size(12.0)
-                    .color(Color32::from_rgb(255, 190, 80)),
+                    .color(ACCENT),
             );
         }
 
@@ -5117,7 +5198,7 @@ impl MxRunApp {
         let want_focus = &mut self.want_focus;
         let prompt = self.prompt.as_mut().expect("caller checked");
 
-        let accent = Color32::from_rgb(255, 190, 80);
+        let accent = ACCENT;
 
         // --- top box: "which command is asking" + what was typed ---
         ui.horizontal(|ui| {
@@ -5163,7 +5244,7 @@ impl MxRunApp {
             } else {
                 "没有匹配的历史参数"
             };
-            ui.label(RichText::new(msg).size(13.0).color(Color32::from_gray(130)));
+            ui.label(RichText::new(msg).size(13.0).color(TEXT_DIM));
         }
         for row in 0..prompt.suggestions.len().min(MAX_ROWS) {
             let h = prompt.suggestions[row];
@@ -5184,13 +5265,13 @@ impl MxRunApp {
                     ui.label(
                         RichText::new(truncate_chars(&value, 60))
                             .size(14.0)
-                            .color(if selected { accent } else { Color32::from_gray(225) }),
+                            .color(if selected { accent } else { TEXT }),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("用过 {uses} 次"))
                                 .size(11.0)
-                                .color(Color32::from_gray(120)),
+                                .color(TEXT_FAINT),
                         );
                     });
                 });
@@ -5226,7 +5307,7 @@ impl MxRunApp {
             "↑↓ 选历史参数 · 回车执行 · Esc 返回".to_string()
         };
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label(RichText::new(hint).size(11.0).color(Color32::from_gray(110)));
+            ui.label(RichText::new(hint).size(11.0).color(TEXT_FAINT));
         });
     }
 }
