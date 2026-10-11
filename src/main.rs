@@ -1596,6 +1596,140 @@ fn consume_bare_digit(ctx: &egui::Context, input_is_empty: bool) -> Option<usize
     None
 }
 
+/// What a trailing digit in the search box means.
+///
+/// AltRun's rule was "a trailing character that kills the search is a command,
+/// not input" (`frmALTRun.pas:1411-1470`): digit = the Nth row of the list you
+/// were just looking at, space = the row you had highlighted. We keep the idea
+/// but adapt the trigger to a fuzzy matcher, which almost never returns nothing
+/// (measured: even `zz` returns eight rows) — so "the digit changed nothing"
+/// counts as well as "the digit killed the list".
+#[derive(Debug, PartialEq, Eq)]
+enum DigitVerdict {
+    /// Run this zero-based row of the *previous* list.
+    Run(usize),
+    /// Not a digit at the end — nothing to decide.
+    NotADigit,
+    /// The prefix is not what the previous list was built from: the input
+    /// changed by more than one appended character (paste, delete, a click).
+    NotAnAppend,
+    /// The digit is part of a name that has digits in it (`pycharm64`, `x64`,
+    /// `Python 3.12`): the user is *typing* a number, not picking a row.
+    PrefixHasDigit,
+    /// The digit is doing real filtering (`b` → `b3` went 8 rows → 2).
+    DigitFilters,
+    /// The previous list did not reach that row (AltRun's second guard).
+    NoSuchRow,
+    /// There was no previous list to point at.
+    NoPreviousList,
+}
+
+/// Decide what a trailing digit means. Pure, so the rules can be tested without
+/// a keyboard (which Windows makes impossible to automate here).
+///
+/// - `input` — the search box as it is now
+/// - `prev_input` — the search box as it was one keystroke ago
+/// - `prev_rows` — how many rows that list showed
+/// - `cur_rows` — how many rows the list shows now
+/// - `same_as_prev` — the current rows are the very same items as before
+fn digit_verdict(
+    input: &str,
+    prev_input: &str,
+    prev_rows: usize,
+    cur_rows: usize,
+    same_as_prev: bool,
+) -> DigitVerdict {
+    let Some(digit) = input.chars().last().and_then(|c| c.to_digit(10)) else {
+        return DigitVerdict::NotADigit;
+    };
+    // The digit has to be the one character that was just appended, otherwise
+    // the "previous list" is not the list this digit was typed against.
+    let prefix = &input[..input.len() - 1];
+    if prefix != prev_input {
+        return DigitVerdict::NotAnAppend;
+    }
+    if prefix.is_empty() {
+        // The empty box is its own rule (`consume_bare_digit`): the list on
+        // screen is the one to count rows in.
+        return DigitVerdict::NoPreviousList;
+    }
+    // Safety belt the original did not need: in a fuzzy matcher the digit the
+    // user is *typing* usually does not change anything either (`pycharm` →
+    // `pycharm6` still matches `pycharm64`), and 19 of 177 titles here contain
+    // digits. A prefix that already has one is a name being typed.
+    if prefix.chars().any(|c| c.is_ascii_digit()) {
+        return DigitVerdict::PrefixHasDigit;
+    }
+    if prev_rows == 0 {
+        return DigitVerdict::NoPreviousList;
+    }
+    // AltRun: the digit killed the search. Ours: or it changed nothing at all.
+    if cur_rows > 0 && !same_as_prev {
+        return DigitVerdict::DigitFilters;
+    }
+    // `0` is the tenth row, exactly as AltRun's index column printed it.
+    let row = if digit == 0 { 10 } else { digit as usize };
+    if prev_rows < row {
+        return DigitVerdict::NoSuchRow;
+    }
+    DigitVerdict::Run(row - 1)
+}
+
+/// The explicit selector: `b#3` = the third row of the results for `b`, `#3` =
+/// the third row of the whole list. Returns the query to search for and, once a
+/// digit follows the `#`, the zero-based row it names.
+///
+/// `#` is a *mode marker*, not a key binding: both characters are still typed
+/// normally, we just stop treating everything from `#` on as search text. The
+/// cost is that `#` cannot start a query (nothing in the real lists does).
+fn split_selector(input: &str) -> (&str, Option<usize>) {
+    let Some((query, sel)) = input.split_once('#') else {
+        return (input, None);
+    };
+    // `#` alone, or `#x`: the selector is being typed (or was a typo). The query
+    // half still drives the list, which is what makes `b#3` readable while you
+    // type it.
+    let digits: String = sel.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() != sel.len() {
+        return (query, None);
+    }
+    match digits.parse::<usize>() {
+        // 1-based on screen; `0` is the tenth row, like everywhere else here.
+        Ok(0) => (query, Some(9)),
+        Ok(n) => (query, Some(n - 1)),
+        Err(_) => (query, None),
+    }
+}
+
+/// The list as it was one keystroke ago — AltRun's `m_LastShortCutPointerList`
+/// (`frmALTRun.pas:2350`), which is what its digit and space commands point at.
+///
+/// Kept by item **id**, not by index: deleting an item shifts every index after
+/// it, and firing at the wrong row is exactly the kind of bug that is invisible
+/// until it launches something embarrassing.
+#[derive(Clone, Default)]
+struct ListSnapshot {
+    /// The search box's text when this list was built.
+    input: String,
+    /// Visible rows, in display order.
+    ids: Vec<String>,
+}
+
+/// What the last keystroke decided, for the log.
+impl DigitVerdict {
+    fn reason(&self) -> &'static str {
+        match self {
+            DigitVerdict::Run(_) => "run",
+            DigitVerdict::NotADigit => "not-a-digit",
+            DigitVerdict::NotAnAppend => "not-an-append",
+            DigitVerdict::PrefixHasDigit => "prefix-has-digit",
+            DigitVerdict::DigitFilters => "digit-filters",
+            DigitVerdict::NoSuchRow => "no-such-row",
+            DigitVerdict::NoPreviousList => "no-previous-list",
+        }
+    }
+}
+
 /// Where the last discovery run ended up, shared with the UI thread.
 #[derive(Default)]
 struct DiscoveryState {
@@ -1656,6 +1790,9 @@ struct MxRunApp {
     discovery_note: String,
     /// `Ctrl+L`: show only recently used items (AltRun's 最近列表).
     recent_only: bool,
+    /// The list one keystroke ago (`ListSnapshot`) — what a trailing digit
+    /// points at.
+    prev_list: ListSnapshot,
     /// Set when the selection moved by keyboard, so the list can scroll it back
     /// into view (the launcher list scrolls now that eight rows no longer fit).
     scroll_selected: bool,
@@ -1909,6 +2046,7 @@ impl MxRunApp {
                 .then_some(false),
             discovery_note: String::new(),
             recent_only: false,
+            prev_list: ListSnapshot::default(),
             scroll_selected: false,
             cold_start_add: false,
             add_note_shown: false,
@@ -1953,6 +2091,32 @@ impl MxRunApp {
         // rule can be verified without clicking 现在扫一次.
         if let Ok(mode) = std::env::var("MXRUN_SELFTEST_DISCOVER") {
             app.discovery_pending = Some(mode == "force");
+        }
+
+        // Debug hook: type a string one character at a time through the same
+        // code path a keyboard drives (`MXRUN_SELFTEST_TYPE=b#3`). Windows will
+        // not deliver keys to a background window, so this is the only way to
+        // verify the digit rules from a script — **it really runs items**, so
+        // point it at a scratch profile only. Several specs can be chained with
+        // `|` (`al2|lab1|q55`); the box is reset between them.
+        if let Ok(spec) = std::env::var("MXRUN_SELFTEST_TYPE") {
+            for spec in spec.split('|') {
+                app.input.clear();
+                app.prev_list = ListSnapshot::default();
+                app.refresh_search();
+                log_line(&format!("type: --- spec {spec:?} ---"));
+                for ch in spec.chars() {
+                    app.input.push(ch);
+                    app.refresh_search();
+                    app.after_query_change(&cc.egui_ctx);
+                    log_line(&format!(
+                        "type: {:?} -> {} rows | {}",
+                        app.input,
+                        app.results.len(),
+                        app.status
+                    ));
+                }
+            }
         }
 
         // Debug hook: run row N the way a digit key does
@@ -2246,6 +2410,130 @@ impl MxRunApp {
         ));
     }
 
+    /// What a keystroke in the search box means beyond "search".
+    ///
+    /// Called after `refresh_search`, so `self.results` is the list as the user
+    /// sees it right now. Order matters: the explicit `#3` wins over the
+    /// implicit trailing-digit rule, so `b#3` can never be read as "row 3 of
+    /// whatever `b#` matches".
+    fn after_query_change(&mut self, ctx: &egui::Context) {
+        // 1) Explicit selector: `#3`, `b#3`.
+        if self.input.contains('#') {
+            let row = split_selector(self.input.trim()).1;
+            if let Some(row) = row {
+                self.run_selector(row, ctx);
+                return;
+            }
+            // Mid-typing (`b#`): the list is already the right one, just say so.
+            self.status = format!(
+                "输入序号执行对应项（1..{}，0 = 第 10 项）· 再按一次退格可返回搜索",
+                self.results.len()
+            );
+            self.snapshot_list();
+            return;
+        }
+
+        // 2) AltRun's rule, adapted: a digit that did not help the search is a
+        //    command.
+        let prev = self.prev_list.clone();
+        let same_as_prev = !prev.ids.is_empty()
+            && prev.ids.len() == self.results.len()
+            && prev.ids.iter().zip(&self.results).all(|(id, sc)| {
+                self.items.get(sc.idx).is_some_and(|it| &it.item.id == id)
+            });
+        let verdict = digit_verdict(
+            &self.input,
+            &prev.input,
+            prev.ids.len(),
+            self.results.len(),
+            same_as_prev,
+        );
+        match verdict {
+            DigitVerdict::Run(row) => {
+                let id = prev.ids.get(row).cloned();
+                let title = id
+                    .as_ref()
+                    .and_then(|id| self.items.iter().find(|i| &i.item.id == id))
+                    .map(|i| i.item.title.clone());
+                log_line(&format!(
+                    "digit: {:?} -> run row {} of {:?} ({} rows) [{:?}]",
+                    self.input,
+                    row + 1,
+                    prev.input,
+                    prev.ids.len(),
+                    title
+                ));
+                if let Some(id) = id {
+                    self.run_item_id(&id, ctx);
+                }
+                self.prev_list = ListSnapshot::default();
+                return;
+            }
+            DigitVerdict::NotADigit | DigitVerdict::NotAnAppend => {}
+            other => {
+                // Only worth a line when a digit was actually involved.
+                if self.input.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+                    log_line(&format!(
+                        "digit: {:?} -> keep input ({}; prev={:?} {} rows, now {} rows)",
+                        self.input,
+                        other.reason(),
+                        prev.input,
+                        prev.ids.len(),
+                        self.results.len()
+                    ));
+                }
+            }
+        }
+        self.snapshot_list();
+    }
+
+    /// Remember the list on screen, for the next keystroke's trailing digit.
+    fn snapshot_list(&mut self) {
+        let ids = self
+            .results
+            .iter()
+            .filter_map(|sc| self.items.get(sc.idx).map(|it| it.item.id.clone()))
+            .collect();
+        self.prev_list = ListSnapshot {
+            input: self.input.clone(),
+            ids,
+        };
+    }
+
+    /// `#N`: run the Nth row of what the list shows for the query before `#`.
+    ///
+    /// The current `self.results` are already that list — `refresh_search` uses
+    /// the text before `#` as the query.
+    fn run_selector(&mut self, row: usize, ctx: &egui::Context) {
+        if row >= self.results.len() {
+            self.status = format!("没有第 {} 项（当前 {} 项）", row + 1, self.results.len());
+            log_line(&format!(
+                "selector: {:?} -> no row {}",
+                self.input,
+                row + 1
+            ));
+            return;
+        }
+        let id = self.items[self.results[row].idx].item.id.clone();
+        log_line(&format!(
+            "selector: {:?} -> run row {} ({} rows shown)",
+            self.input,
+            row + 1,
+            self.results.len()
+        ));
+        self.input.clear();
+        self.run_item_id(&id, ctx);
+        self.prev_list = ListSnapshot::default();
+    }
+
+    /// Run an item by id — used by the digit rules, which point at a row of a
+    /// list that may have been rebuilt (or emptied) since.
+    fn run_item_id(&mut self, id: &str, ctx: &egui::Context) {
+        if let Some(idx) = self.items.iter().position(|it| it.item.id == id) {
+            self.execute_index(idx, ctx);
+        }
+    }
+
     /// Pull one item's statistics back out of the store.
     ///
     /// `bump_frecency` writes to the database, but the in-memory index holds its
@@ -2275,7 +2563,9 @@ impl MxRunApp {
     fn refresh_search(&mut self) {
         self.results.clear();
         self.calc_result = None;
-        let query = self.input.trim();
+        // `b#3`: everything from `#` on is a row selector, not search text, so
+        // the list keeps showing what you are choosing from while you type it.
+        let query = split_selector(self.input.trim()).0;
         let manage = self.manage;
         let filter = self.manage_source;
         let recent_only = self.recent_only;
@@ -2389,7 +2679,27 @@ impl MxRunApp {
         let Some(sc) = self.results.get(self.selected) else {
             return;
         };
-        let item = self.items[sc.idx].item.clone();
+        self.execute_index(sc.idx, ctx);
+    }
+
+    /// Run the item at `self.items[idx]`.
+    ///
+    /// Split out from `execute_selected` because the digit rules point at a row
+    /// of the list from one keystroke ago — a list that the current search may
+    /// not contain any more (the digit usually kills it).
+    fn execute_index(&mut self, idx: usize, ctx: &egui::Context) {
+        let Some(indexed) = self.items.get(idx) else {
+            return;
+        };
+        // Debug hook: decide everything, launch nothing
+        // (`MXRUN_SELFTEST_DRYRUN=1`). Lets the digit rules be measured against
+        // a real list without starting the programs in it.
+        if std::env::var_os("MXRUN_SELFTEST_DRYRUN").is_some() {
+            log_line(&format!("dryrun: would execute {:?}", indexed.item.title));
+            self.input.clear();
+            return;
+        }
+        let item = indexed.item.clone();
         let Some(action) = item.default_action().cloned() else {
             return;
         };
@@ -3845,6 +4155,7 @@ impl MxRunApp {
         }
         if resp.changed() {
             self.refresh_search();
+            self.after_query_change(&ctx);
         }
 
         ui.add_space(6.0);
@@ -4989,6 +5300,89 @@ mod tests {
         }
         assert_eq!(bare_digit_row(Key::A, true), None);
         assert_eq!(bare_digit_row(Key::Enter, true), None);
+    }
+
+    // ---- AltRun's trailing-digit rule, adapted to a fuzzy matcher ---------
+
+    /// The happy paths: the digit did not help the search, so it is a command.
+    #[test]
+    fn trailing_digit_runs_a_row_of_the_previous_list() {
+        // `steam` showed 5 rows and `steam3` matches nothing (AltRun's case).
+        assert_eq!(
+            digit_verdict("steam3", "steam", 5, 0, false),
+            DigitVerdict::Run(2)
+        );
+        // Or the digit changed nothing at all — what a fuzzy matcher needs,
+        // because it rarely returns zero (`pycharm6` still matches `pycharm64`).
+        assert_eq!(
+            digit_verdict("pycharm6", "pycharm", 8, 8, true),
+            DigitVerdict::Run(5)
+        );
+        // `0` is the tenth row, as AltRun's index column printed it.
+        assert_eq!(
+            digit_verdict("steam0", "steam", 10, 0, false),
+            DigitVerdict::Run(9)
+        );
+    }
+
+    /// …and every guard that keeps the rule from eating a number the user is
+    /// typing.
+    #[test]
+    fn digit_rules_keep_their_guardrails() {
+        // The digit is filtering for real (`b` 8 rows → `b3` 2 rows).
+        assert_eq!(
+            digit_verdict("b3", "b", 8, 2, false),
+            DigitVerdict::DigitFilters
+        );
+        // A name with digits in it: the prefix already carries one, so the user
+        // is typing `pycharm64`, not picking row 4.
+        assert_eq!(
+            digit_verdict("pycharm64", "pycharm6", 1, 1, true),
+            DigitVerdict::PrefixHasDigit
+        );
+        // AltRun's second guard: the previous list never reached that row.
+        assert_eq!(
+            digit_verdict("godot4", "godot", 2, 0, false),
+            DigitVerdict::NoSuchRow
+        );
+        // The empty box is its own rule (`consume_bare_digit`).
+        assert_eq!(
+            digit_verdict("3", "", 8, 8, true),
+            DigitVerdict::NoPreviousList
+        );
+        // The character was not appended to what the previous list was built
+        // from (paste, backspace, a click elsewhere).
+        assert_eq!(
+            digit_verdict("steam3", "stea", 5, 0, false),
+            DigitVerdict::NotAnAppend
+        );
+        // No digit involved.
+        assert_eq!(
+            digit_verdict("steam", "stea", 8, 5, false),
+            DigitVerdict::NotADigit
+        );
+        // The previous query matched nothing, so there is no list to point at.
+        assert_eq!(
+            digit_verdict("zz3", "zz", 0, 0, false),
+            DigitVerdict::NoPreviousList
+        );
+    }
+
+    /// `#N` — the explicit way, which works no matter what the search does.
+    #[test]
+    fn explicit_row_selector() {
+        assert_eq!(split_selector("b#3"), ("b", Some(2)));
+        assert_eq!(split_selector("#3"), ("", Some(2)), "the whole list");
+        assert_eq!(split_selector("#1"), ("", Some(0)));
+        assert_eq!(split_selector("#0"), ("", Some(9)), "0 is the tenth row");
+        assert_eq!(split_selector("#12"), ("", Some(11)), "two digits are fine");
+        // Still typing it: the list stays put, nothing fires.
+        assert_eq!(split_selector("b#"), ("b", None));
+        assert_eq!(split_selector("b#x"), ("b", None));
+        assert_eq!(split_selector("a#2b"), ("a", None), "not a pure number");
+        // No selector at all: the search box is just a search box.
+        assert_eq!(split_selector("plain"), ("plain", None));
+        assert_eq!(split_selector(""), ("", None));
     }
 
     /// `;` and `'` are AltRun's second and third rows.
