@@ -4334,6 +4334,10 @@ impl MxRunApp {
         ui.separator();
         ui.add_space(6.0);
 
+        // Reserve the status line first, so the list below can never draw over
+        // it (see `render_status_bar`).
+        let status_rect = self.render_status_bar(ui);
+
         // --- Calculator result ---
         if self.calc_mode && self.calc_result.is_none() {
             // A `=` mode with nothing to show: say what it wants rather than
@@ -4355,6 +4359,18 @@ impl MxRunApp {
         }
         // --- Result list ---
         //
+        // The empty-state message goes *before* the scroll area: with
+        // `auto_shrink(false)` the area takes every pixel left, so anything
+        // drawn after it would be pushed off the card.
+        if self.results.is_empty() && self.calc_result.is_none() && !self.calc_mode {
+            ui.label(
+                RichText::new("无匹配结果 · 网页搜索等兜底功能将在后续版本加入")
+                    .size(13.0)
+                    .color(Color32::from_gray(130)),
+            );
+            return;
+        }
+        //
         // Scrollable: eight rows at the current row height are more than a
         // 400px card holds, so the last one or two used to be cut off with no
         // way to reach them (the list only ever scrolls when the selection is
@@ -4363,7 +4379,7 @@ impl MxRunApp {
         let mut run_now: Option<usize> = None;
         let mut menu_action: Option<(usize, MenuAction)> = None;
         let scroll_selected = std::mem::take(&mut self.scroll_selected);
-        egui::ScrollArea::vertical()
+        let list_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             // Wheel and scroll bar scroll it; dragging scrolls nothing — on a
             // frameless card, dragging anywhere should move the window (see the
@@ -4504,6 +4520,7 @@ impl MxRunApp {
             });
         }
         });
+        self.check_status_overlap(status_rect, list_area.inner_rect);
         if let Some(row) = clicked {
             // Select only — running is the double click below.
             self.selected = row;
@@ -4531,15 +4548,57 @@ impl MxRunApp {
                     .color(Color32::from_gray(130)),
             );
         }
+    }
 
-        // --- Status bar ---
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label(
-                RichText::new(&self.status)
-                    .size(11.0)
-                    .color(Color32::from_gray(110)),
-            );
-        });
+    /// The status line, as a bottom panel of the card.
+    ///
+    /// It has to be laid out **before** the list. A `bottom_up` layout placed
+    /// after a `ScrollArea` gets no space left — the scroll area has already
+    /// taken the whole card — so the text was drawn on top of the last row
+    /// (the overlap in the 2026-09-19 screenshot).
+    fn render_status_bar(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let status = self.status.clone();
+        // egui 0.36 unified the panel types: this used to be `TopBottomPanel`,
+        // and `show_inside` is now `show`.
+        egui::Panel::bottom("mxrun-status")
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(status)
+                        .size(11.0)
+                        .color(Color32::from_gray(110)),
+                );
+            })
+            .response
+            .rect
+    }
+
+    /// Complain in the log if the list is drawn over the status line — the
+    /// overlap a user found in a screenshot on 2026-09-19. Cheap (two rects),
+    /// and it turns a "looks wrong" report into a line of evidence.
+    fn check_status_overlap(&self, status: egui::Rect, list: egui::Rect) {
+        // A shared edge is not an overlap — the scroll area and the panel meet
+        // at exactly the same y, and `Rect::intersects` counts that. Only a
+        // real intrusion (more than a pixel) is worth reporting.
+        let intrudes = list.bottom() - status.top() > 1.0;
+        if intrudes {
+            log_line(&format!(
+                "layout: list ({:.0}..{:.0}) overlaps the status bar ({:.0}..{:.0})",
+                list.top(),
+                list.bottom(),
+                status.top(),
+                status.bottom()
+            ));
+        } else if std::env::var_os("MXRUN_SELFTEST_RECTS").is_some() {
+            log_line(&format!(
+                "layout: list {:.0}..{:.0}, status {:.0}..{:.0} (no overlap)",
+                list.top(),
+                list.bottom(),
+                status.top(),
+                status.bottom()
+            ));
+        }
     }
 
     /// The short note that follows an add which left MxRun resident.
@@ -4640,7 +4699,23 @@ impl MxRunApp {
         let selected = self.selected;
         let mut new_selected = selected;
 
-        egui::ScrollArea::vertical()
+        // Same as the launcher: the status line reserves its space before the
+        // scroll area, otherwise the rows draw over it.
+        ui.add_space(4.0);
+        let status_rect = self.render_status_bar(ui);
+
+        // A filter can empty the manager; say so before the scroll area takes
+        // the rest of the card (a label after it would be pushed off).
+        if self.results.is_empty() {
+            ui.label(
+                RichText::new("没有匹配的条目")
+                    .size(13.0)
+                    .color(Color32::from_gray(130)),
+            );
+            return;
+        }
+
+        let manager_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             // Wheel and scroll bar scroll it; dragging scrolls nothing — on a
             // frameless card, dragging anywhere should move the window (see the
@@ -4765,22 +4840,7 @@ impl MxRunApp {
                 MenuAction::Reveal => self.reveal_selected(),
             }
         }
-
-        if self.results.is_empty() {
-            ui.label(
-                RichText::new("没有匹配的条目")
-                    .size(13.0)
-                    .color(Color32::from_gray(130)),
-            );
-        }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label(
-                RichText::new(&self.status)
-                    .size(11.0)
-                    .color(Color32::from_gray(110)),
-            );
-        });
+        self.check_status_overlap(status_rect, manager_area.inner_rect);
     }
 
     /// The first-run question: MxRun has never been registered on this machine.
