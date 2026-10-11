@@ -683,6 +683,33 @@ impl Store {
         let _ = tx.commit();
     }
 
+    /// How often each file was opened from `@` mode, in one read transaction.
+    ///
+    /// Files are not items, so their history lives under `frec:file:<path>` and
+    /// never appears in the item list. The ranking wants all of them at once
+    /// (asking per candidate would be one transaction per row).
+    pub fn file_open_counts(&self) -> std::collections::HashMap<String, u32> {
+        let mut out = std::collections::HashMap::new();
+        let mut scan = || -> Option<()> {
+            let tx = self.db.begin_read().ok()?;
+            let table = tx.open_table(META).ok()?;
+            for row in table.range("frec:file:"..).ok()? {
+                let (k, v) = row.ok()?;
+                let key = k.value();
+                let Some(path) = key.strip_prefix("frec:file:") else {
+                    break;
+                };
+                let frec: Frecency = serde_json::from_str(v.value()).ok()?;
+                if frec.count > 0 {
+                    out.insert(path.to_string(), frec.count);
+                }
+            }
+            Some(())
+        };
+        let _ = scan();
+        out
+    }
+
     /// Import seam: store an item coming from a provider, keyed by
     /// `(provider, external_id)` so re-importing updates instead of
     /// duplicating — and so the local frecency (keyed by id) survives.
