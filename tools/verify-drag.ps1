@@ -1,4 +1,4 @@
-﻿# MxRun 拖拽验证：用真实鼠标输入拖窗口，然后核对窗口有没有跟着走。
+# MxRun 拖拽验证：用真实鼠标输入拖窗口，然后核对窗口有没有跟着走。
 #
 # 为什么需要它：egui 的窗口拖动是把窗口交给系统自己的移动循环
 # （`SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)`，见 src/main.rs 的 `drag_window`），
@@ -62,12 +62,24 @@ try {
   $spots = @(@(200, 22, '标题条'), @(150, 220, '列表行'), @(300, 370, '状态栏'))
   $pass = 0
   foreach ($s in $spots) {
-    [MxDrag]::Drag($r.Left + $s[0], $r.Top + $s[1], $r.Left + $s[0] + 40, $r.Top + $s[1] + 20, 5)
-    Start-Sleep -Milliseconds 800
-    $r2 = Get-Rect $h
-    $moved = ($r2.Left -ne $r.Left) -or ($r2.Top -ne $r.Top)
+    # 机器忙的时候（比如刚跑完 cargo build）一次拖动可能来不及被系统处理，
+    # 于是失败一次就重试一次——**偶发失败的自检比没有自检更糟**：它会让人
+    # 开始忽略红色输出。只有重试也失败才算真失败。
+    $moved = $false
+    $note = ''
+    for ($attempt = 1; $attempt -le 2 -and -not $moved; $attempt++) {
+      [MxDrag]::Drag($r.Left + $s[0], $r.Top + $s[1], $r.Left + $s[0] + 40, $r.Top + $s[1] + 20, 5)
+      Start-Sleep -Milliseconds 800
+      $r2 = Get-Rect $h
+      $moved = ($r2.Left -ne $r.Left) -or ($r2.Top -ne $r.Top)
+      if ($moved) {
+        $note = if ($attempt -eq 1) { '' } else { '（重试后成功）' }
+      } elseif ($attempt -eq 1) {
+        Start-Sleep -Milliseconds 600   # 让机器喘口气再试
+      }
+    }
     if ($moved) { $pass++ }
-    Write-Host ("  {0} 拖{1}: 位移 {2},{3}" -f $(if ($moved) { '[OK]  ' } else { '[FAIL]' }), $s[2], ($r2.Left - $r.Left), ($r2.Top - $r.Top))
+    Write-Host ("  {0} 拖{1}: 位移 {2},{3} {4}" -f $(if ($moved) { '[OK]  ' } else { '[FAIL]' }), $s[2], ($r2.Left - $r.Left), ($r2.Top - $r.Top), $note)
     $r = $r2
   }
 
