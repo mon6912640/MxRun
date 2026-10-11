@@ -4336,26 +4336,21 @@ impl MxRunApp {
 
         // --- Title strip ---
         //
-        // The card is frameless, so this is its title bar: the app name on the
-        // left, a grip on the right, and — like everywhere else on the card —
-        // the strip drags the window (see the drag handle in `App::ui`). A
-        // frameless card has to say what it is and where it can be grabbed.
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("MxRun")
-                    .size(12.0)
-                    .color(Color32::from_gray(135)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(26.0, 3.0), egui::Sense::hover());
-                ui.painter().rect_filled(
-                    rect,
-                    egui::CornerRadius::same(2),
-                    Color32::from_gray(74),
-                );
-            });
-        });
+        // The card is frameless, so this is its title bar: the app name, with a
+        // small grip right behind it, like a nameplate with a handle. (It was
+        // centred first, then flush right — both read as a stray underline,
+        // because nothing anchored them; next to the name it looks deliberate.)
+        let title = ui.label(
+            RichText::new("MxRun")
+                .size(12.0)
+                .color(Color32::from_gray(135)),
+        );
+        let grip = egui::Rect::from_center_size(
+            egui::pos2(title.rect.right() + 10.0 + 13.0, title.rect.center().y),
+            egui::vec2(26.0, 3.0),
+        );
+        ui.painter()
+            .rect_filled(grip, egui::CornerRadius::same(2), Color32::from_gray(74));
         ui.add_space(3.0);
 
         // --- Search box ---
