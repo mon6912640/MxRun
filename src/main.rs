@@ -1153,6 +1153,13 @@ fn icon_source(target: &str) -> Option<std::path::PathBuf> {
     if t.is_empty() {
         return None;
     }
+    // Shell namespace paths have no file behind them but the shell still knows
+    // how to image them — this is how a UWP app's logo is obtained
+    // (`shell:AppsFolder\<AUMID>`). Passing them through unchanged is the whole
+    // trick; `exists()` would always say no.
+    if t.len() > 6 && t[..6].eq_ignore_ascii_case("shell:") {
+        return Some(std::path::PathBuf::from(t));
+    }
     // "C:\path with spaces\app.exe" -arg
     if let Some(rest) = t.strip_prefix('"') {
         let end = rest.find('"')?;
@@ -1194,8 +1201,22 @@ fn icon_pixels(path: &std::path::Path, px: u32) -> Option<(usize, usize, Vec<u8>
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        let item: IShellItemImageFactory =
-            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        // Debug: UWP app entries (`shell:AppsFolder\<AUMID>`) are the one kind of
+        // target with no file behind it, so say out loud how far the shell gets
+        // with one.
+        let app_entry = path.to_string_lossy().starts_with("shell:AppsFolder");
+        let created: windows::core::Result<IShellItemImageFactory> =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None);
+        if app_entry && created.is_err() {
+            // Worth a line: the app entry failed to resolve, so this row will
+            // keep its emoji placeholder.
+            crate::log_line(&format!(
+                "icons: app entry {:?} not resolvable ({:?})",
+                path,
+                created.as_ref().err().map(|e| e.code().0)
+            ));
+        }
+        let item = created.ok()?;
         let hbmp: HBITMAP = item
             .GetImage(
                 windows::Win32::Foundation::SIZE {
@@ -1508,6 +1529,11 @@ fn row_detail(item: &Item) -> String {
         return item.subtitle.clone();
     }
     let target = item.icon_target().unwrap_or_default();
+    // A UWP app's target is its AUMID (`shell:AppsFolder\Microsoft.Windows…!App`),
+    // which is machine noise in a row. Say what it is instead.
+    if target.starts_with("shell:AppsFolder\\") {
+        return "Windows 应用".to_string();
+    }
     truncate_chars(target, 64)
 }
 
@@ -1757,8 +1783,8 @@ enum SourceFilter {
 impl SourceFilter {
     fn matches(self, provider: &str) -> bool {
         match self {
-            SourceFilter::Discovered => provider == discover::PROVIDER,
-            SourceFilter::Curated => provider != discover::PROVIDER,
+            SourceFilter::Discovered => discover::is_discovered_provider(provider),
+            SourceFilter::Curated => !discover::is_discovered_provider(provider),
         }
     }
 }
@@ -5336,11 +5362,10 @@ impl MxRunApp {
                         None => ("•", "条目"),
                     };
                     let keyword = item.keywords.first().cloned().unwrap_or_default();
-                    let detail = item
-                        .default_action()
-                        .and_then(action_command)
-                        .map(|c| truncate_chars(c, 70))
-                        .unwrap_or_default();
+                    // Same wording as the launcher's rows: a UWP app's target is
+                    // an AUMID, which is machine noise in a table (`row_detail`
+                    // says "Windows 应用" for those).
+                    let detail = truncate_chars(&row_detail(item), 70);
                     let launches = launch_label(indexed.launches).unwrap_or_else(|| "未启动".into());
 
                     let frame = egui::Frame::new()

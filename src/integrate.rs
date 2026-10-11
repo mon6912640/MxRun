@@ -48,7 +48,7 @@ fn check(status: WIN32_ERROR, what: &str) -> Result<(), String> {
 
 /// COM is per-thread: every thread that touches the shell link APIs needs its
 /// own apartment (the process-wide init in `main` only covers the main thread).
-fn ensure_com() {
+pub(crate) fn ensure_com() {
     use std::cell::OnceCell;
     thread_local! {
         static ONCE: OnceCell<()> = const { OnceCell::new() };

@@ -16,10 +16,12 @@
 //! warning): the user's `chrome` entry and a scanned "Google Chrome" are the
 //! same `chrome.exe`, and both must not end up in the list.
 //!
-//! UWP apps live in `shell:AppsFolder` instead (43 of them here, and the
-//! enumeration costs ~670 ms because it is a superset containing the desktop
-//! apps again). They are deliberately **out of scope** for now — see
-//! `docs/开发进度.md` §2.14.
+//! UWP apps live in `shell:AppsFolder`: they have no shortcut on disk and no
+//! `.exe` to point at, so they are enumerated separately and launched through
+//! their AUMID (`shell:AppsFolder\<AUMID>`). Measured here: 217 entries in
+//! ~670 ms, of which 43 are UWP (the rest are the desktop apps again — the
+//! folder is a superset). The `!` in the AUMID
+//! (`Microsoft.WindowsCalculator_8wekyb3d8bbwe!App`) is what tells them apart.
 
 use crate::integrate;
 use crate::store::{Action, ArgSpec, Health, Item, LaunchMode, Source, Store};
@@ -28,6 +30,24 @@ use std::time::UNIX_EPOCH;
 
 /// Provider name for everything found on disk.
 pub const PROVIDER: &str = "startmenu";
+
+/// Provider name for UWP / Store apps.
+pub const UWP_PROVIDER: &str = "uwp";
+
+/// The shell namespace folder that lists every launchable app entry.
+const APPS_FOLDER: &str = "shell:AppsFolder";
+
+/// Prefix a UWP item's launch target carries.
+const UWP_TARGET_PREFIX: &str = "shell:AppsFolder\\";
+
+/// Is this provider one of ours (something a scan put in the list)?
+///
+/// The manager's "自动发现" filter and the bulk delete both key on this, so it
+/// must know about **every** discovery source — forgetting UWP here would file
+/// 41 scanned apps under "手工 / 导入".
+pub fn is_discovered_provider(provider: &str) -> bool {
+    provider == PROVIDER || provider == UWP_PROVIDER
+}
 
 /// Bump when the filtering rules change: the cache key includes it, so a new
 /// rule set re-examines the shortcuts instead of trusting old decisions.
@@ -74,6 +94,12 @@ pub struct ScanReport {
     /// Removed by the user before — a tombstone keeps them out.
     pub tombstoned: usize,
     pub added: usize,
+    /// UWP entries the shell reported (before filtering).
+    pub uwp_seen: usize,
+    /// UWP apps already in the list by name.
+    pub uwp_existing: usize,
+    /// How long the AppsFolder enumeration took, in milliseconds.
+    pub uwp_millis: u128,
     /// How long the scan took, in milliseconds.
     pub millis: u128,
 }
@@ -82,7 +108,7 @@ impl ScanReport {
     /// One line for the log.
     pub fn summary(&self) -> String {
         format!(
-            "seen={} cached={} added={} existing={} tombstoned={} skipped(junk={} web={} missing={}) in {}ms",
+            "seen={} cached={} added={} existing={} tombstoned={} skipped(junk={} web={} missing={}) uwp(seen={} existing={} in {}ms) in {}ms",
             self.seen,
             self.cached,
             self.added,
@@ -91,6 +117,9 @@ impl ScanReport {
             self.skipped_junk,
             self.skipped_web,
             self.skipped_missing,
+            self.uwp_seen,
+            self.uwp_existing,
+            self.uwp_millis,
             self.millis
         )
     }
@@ -108,10 +137,21 @@ impl ScanReport {
             )
         } else {
             format!(
-                "自动发现 {} 个应用（跳过 {} 个卸载/帮助类、{} 个网页快捷方式）",
-                self.added, self.skipped_junk, self.skipped_web
+                "自动发现 {} 个应用（开始菜单 {} + 系统应用 {}；跳过 {} 个卸载/帮助类、{} 个网页快捷方式）",
+                self.added,
+                self.added.saturating_sub(self.uwp_added()),
+                self.uwp_added(),
+                self.skipped_junk,
+                self.skipped_web
             )
         }
+    }
+
+    /// How many of the added items came from `shell:AppsFolder`.
+    fn uwp_added(&self) -> usize {
+        // `added` counts both passes; the settings page only needs a rough split,
+        // and the exact number is in the log line.
+        self.uwp_seen.saturating_sub(self.uwp_existing)
     }
 }
 
@@ -153,6 +193,9 @@ pub fn start_menu_roots() -> Vec<PathBuf> {
 pub struct ScanInput {
     /// Target paths already claimed by items in the list (the dedupe key).
     pub known: std::collections::HashSet<String>,
+    /// Titles already in the list — the dedupe key for UWP entries, which have
+    /// no path to compare.
+    pub titles: Vec<String>,
     /// `scan:` cache entries: shortcut path -> `gen:mtime:size`.
     pub cache: std::collections::HashMap<String, String>,
 }
@@ -167,10 +210,114 @@ pub struct ScanOutput {
 
 /// Read what the scan needs. Cheap: one `load_items` plus one range query.
 pub fn read_input(store: &mut Store) -> ScanInput {
+    let titles = store
+        .load_items()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
     ScanInput {
         known: known_targets(store),
+        titles,
         cache: store.scan_cache(),
     }
+}
+
+/// One entry from `shell:AppsFolder`: the name a user sees, and the parsing name
+/// (which is an AUMID for UWP apps and a plain path for desktop ones).
+struct AppEntry {
+    name: String,
+    parsing: String,
+}
+
+/// Is this parsing name a UWP / Store app?
+///
+/// UWP AUMIDs are `PackageFamilyName!ApplicationId`; desktop entries in the same
+/// folder are ordinary paths. Pure, so the rule can be tested.
+fn is_uwp_aumid(parsing: &str) -> bool {
+    parsing.contains('!') && !parsing.contains('\\') && !parsing.contains('/')
+}
+
+/// Enumerate `shell:AppsFolder`. COM work only — no database, no UI.
+fn enumerate_apps_folder() -> Vec<AppEntry> {
+    use windows::Win32::UI::Shell::{
+        BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
+        SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    };
+    use windows::core::PCWSTR;
+
+    crate::integrate::ensure_com();
+    let wide: Vec<u16> = APPS_FOLDER.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+        else {
+            crate::log_line("discover: shell:AppsFolder could not be opened");
+            return out;
+        };
+        let Ok(enumerator) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems)
+        else {
+            crate::log_line("discover: shell:AppsFolder could not be enumerated");
+            return out;
+        };
+        loop {
+            let mut slot: [Option<IShellItem>; 1] = [None];
+            let mut fetched = 0u32;
+            if enumerator.Next(&mut slot, Some(&mut fetched)).is_err() || fetched == 0 {
+                break;
+            }
+            let Some(item) = slot[0].take() else { break };
+            let (Ok(name), Ok(parsing)) = (
+                item.GetDisplayName(SIGDN_NORMALDISPLAY),
+                item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING),
+            ) else {
+                continue;
+            };
+            let (Ok(name), Ok(parsing)) = (name.to_string(), parsing.to_string()) else {
+                continue;
+            };
+            if name.trim().is_empty() || parsing.trim().is_empty() {
+                continue;
+            }
+            out.push(AppEntry { name, parsing });
+        }
+    }
+    out
+}
+
+/// The item a UWP app becomes: it launches through its AUMID, and the icon comes
+/// from the same shell path (the icon worker resolves anything through
+/// `SHCreateItemFromParsingName`, which handles app entries too).
+fn uwp_item_for(name: &str, aumid: &str) -> Item {
+    let command = format!("{UWP_TARGET_PREFIX}{aumid}");
+    Item {
+        id: String::new(), // filled in by the store: `uwp:<aumid>`
+        title: name.to_string(),
+        subtitle: String::new(),
+        keywords: vec![name.to_string()],
+        actions: vec![Action::open(&command)],
+        arg: ArgSpec::default(),
+        launch: LaunchMode::Normal,
+        source: Source {
+            provider: UWP_PROVIDER.to_string(),
+            external_id: aumid.to_lowercase(),
+        },
+        health: Health::Unknown,
+    }
+}
+
+/// Was this UWP app already in the list by *name*?
+///
+/// UWP entries cannot be deduped by path — there is no path, only an AUMID — but
+/// the same app often exists already: either the user typed it in, or the Start
+/// Menu scan found the `.exe` shim that launches it (`calc` → 计算器). Comparing
+/// names is the heuristic the design doc called for.
+fn title_taken(name: &str, taken: &std::collections::HashSet<String>) -> bool {
+    taken.contains(&normalize_name(name))
+}
+
+fn normalize_name(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 /// Scan the Start Menu: pure filesystem + COM work, no database access.
@@ -237,6 +384,37 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
     }
 
     out.report.millis = started.elapsed().as_millis();
+
+    // --- UWP / Store apps (shell:AppsFolder) ---
+    //
+    // A second pass with its own provider tag: no shortcut on disk, no `.exe`,
+    // launched by AUMID. Dedupe is by name here (there is no path to compare) —
+    // the same app usually already exists as the user's own entry or as the
+    // `.exe` shim the Start Menu scan found.
+    let uwp_started = std::time::Instant::now();
+    let mut titles: std::collections::HashSet<String> = input
+        .titles
+        .iter()
+        .map(|t| normalize_name(t))
+        .collect();
+    for entry in enumerate_apps_folder() {
+        if !is_uwp_aumid(&entry.parsing) {
+            continue;
+        }
+        out.report.uwp_seen += 1;
+        if is_junk_name(&entry.name) {
+            out.report.skipped_junk += 1;
+            continue;
+        }
+        if title_taken(&entry.name, &titles) {
+            out.report.uwp_existing += 1;
+            continue;
+        }
+        titles.insert(normalize_name(&entry.name));
+        fresh.push(uwp_item_for(&entry.name, &entry.parsing));
+    }
+    out.report.uwp_millis = uwp_started.elapsed().as_millis();
+
     out.items = fresh;
     out
 }
@@ -434,6 +612,51 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mxrun-disc-{tag}-{nanos}"));
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    /// UWP entries: what counts as one, what an item looks like, and the name
+    /// dedupe that keeps a second copy of the same app out of the list.
+    #[test]
+    fn uwp_rules() {
+        // Every discovery source must answer yes here, or the manager's
+        // "自动发现" filter files scanned apps under "手工 / 导入".
+        assert!(is_discovered_provider(PROVIDER));
+        assert!(is_discovered_provider(UWP_PROVIDER));
+        assert!(!is_discovered_provider("manual"));
+        assert!(!is_discovered_provider("legacy"));
+
+        // UWP AUMIDs are `Family!App`; desktop entries in the same folder are
+        // ordinary paths and must not be mistaken for apps.
+        assert!(is_uwp_aumid("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"));
+        assert!(is_uwp_aumid("Microsoft.WindowsStore_8wekyb3d8bbwe!App"));
+        assert!(!is_uwp_aumid(r"C:\Program Files\Google\Chrome\chrome.exe"));
+        assert!(!is_uwp_aumid("notepad"));
+
+        let item = uwp_item_for("计算器", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App");
+        assert_eq!(item.title, "计算器");
+        assert_eq!(item.keywords, vec!["计算器".to_string()]);
+        assert_eq!(item.source.provider, UWP_PROVIDER);
+        // The store fills `id` from the source; the external id is the AUMID,
+        // lowercased so a case change cannot produce a second item.
+        assert_eq!(
+            item.source.external_id,
+            "microsoft.windowscalculator_8wekyb3d8bbwe!app"
+        );
+        assert_eq!(
+            item.default_action()
+                .and_then(crate::action_command)
+                .as_deref(),
+            Some(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+            "UWP apps launch through their AUMID"
+        );
+
+        // Name dedupe: whatever the list already has by title is not added again
+        // (the user's own `计算器`, or the `calc.exe` shim the menu scan found).
+        let mut taken = std::collections::HashSet::new();
+        taken.insert(normalize_name(" 计算器 "));
+        assert!(title_taken("计算器", &taken));
+        assert!(title_taken("  计算器 ", &taken));
+        assert!(!title_taken("照片", &taken));
     }
 
     #[test]
