@@ -793,7 +793,12 @@ fn toggle_window(ctx: &egui::Context) {
 }
 
 /// Ask winit to close the window (clean exit) from any thread.
+/// Set by the tray's 退出 just before it closes the window, so the close handler
+/// knows this one is meant (see the `close_requested` check in `App::ui`).
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn close_window() {
+    QUITTING.store(true, Ordering::Relaxed);
     if let Some(hwnd) = main_hwnd() {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -3773,6 +3778,18 @@ impl eframe::App for MxRunApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // Alt+F4 / the system close button hide the launcher instead of exiting
+        // it — AltRun's own behaviour (docs/AltRun交互规格.md), and the only
+        // sane one for a resident launcher: exiting takes the tray icon and the
+        // global hotkey with it, so the user has no way back short of finding
+        // the exe. The tray's 退出 sets QUITTING and closes for real.
+        if ctx.input(|i| i.viewport().close_requested()) && !QUITTING.load(Ordering::Relaxed) {
+            log_line("hide: close requested (Alt+F4) -> hiding, not exiting");
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hide_window(&ctx);
+            return;
+        }
+
         // Pick up any icons the worker finished since the last frame.
         self.icons.drain(&ctx);
 
@@ -3976,6 +3993,10 @@ impl eframe::App for MxRunApp {
                 self.input.clear();
                 self.selected = 0;
                 self.refresh_search();
+                // egui surrenders a text box's focus on Escape, so without this
+                // the next keystroke went nowhere (reported 2026-09-19).
+                self.want_focus = true;
+                ctx.request_repaint();
             }
             // Space runs the selected item (AltRun §1.2). consume_key takes the
             // keystroke away from the text box so a space never reaches the
@@ -4077,6 +4098,30 @@ impl eframe::App for MxRunApp {
                 self.toggle_recent();
                 return;
             }
+            // Safety net: whatever the box lost its focus to (a click on a row,
+            // a context menu, an Escape egui handled before we could claim it),
+            // the next thing you type still goes into the search box. Without
+            // this the launcher looked frozen until you clicked the box — the
+            // exact complaint that came in on 2026-09-19.
+            if ctx.memory(|m| m.focused()).is_none() && !ctx.any_popup_open() {
+                let typed: String = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect()
+                });
+                if !typed.is_empty() && !typed.chars().all(char::is_control) {
+                    log_line(&format!("focus: recovered typed text {typed:?}"));
+                    self.input.push_str(&typed);
+                    self.selected = 0;
+                    self.refresh_search();
+                    self.after_query_change(&ctx);
+                }
+                self.want_focus = true;
+            }
         }
 
         let panel = egui::Frame::new()
@@ -4143,10 +4188,25 @@ impl MxRunApp {
         }
 
         // --- Search box ---
+        //
+        // `event_filter`: egui's focus navigation reads the raw events at the
+        // *start* of a frame, before this widget exists — with the stock filter
+        // it takes Tab (moves focus to the next widget) and Escape (surrenders
+        // focus) for itself, so the box silently stopped accepting input until
+        // you clicked it again (reported 2026-09-19, and it bit after every Esc).
+        // Claiming them here keeps both keys ours: Tab walks the list, Escape
+        // clears the box.
         let edit = egui::TextEdit::singleline(&mut self.input)
             .font(FontId::proportional(22.0))
             .hint_text("输入以搜索命令、拼音、网址…")
             .desired_width(f32::INFINITY)
+            .event_filter(egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                tab: true,
+                escape: true,
+                ..Default::default()
+            })
             .frame(egui::Frame::default());
         let resp = ui.add(edit);
         if self.want_focus {
