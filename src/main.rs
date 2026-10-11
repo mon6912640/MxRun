@@ -1903,6 +1903,9 @@ struct MxRunApp {
     calc_mode: bool,
     /// One-shot flag for the `MXRUN_SELFTEST_RECTS` bookkeeping.
     logged_drag_rect: bool,
+    /// Which row the pointer was over last frame — only for the faint hover
+    /// tint. It deliberately does **not** move the selection.
+    hover_row: Option<usize>,
     /// The list one keystroke ago (`ListSnapshot`) — what a trailing digit
     /// points at.
     prev_list: ListSnapshot,
@@ -2164,6 +2167,7 @@ impl MxRunApp {
             recent_only: false,
             calc_mode: false,
             logged_drag_rect: false,
+            hover_row: None,
             prev_list: ListSnapshot::default(),
             scroll_selected: false,
             cold_start_add: false,
@@ -4435,6 +4439,11 @@ impl MxRunApp {
         let mut menu_action: Option<(usize, MenuAction)> = None;
         let mut drag_now = false;
         let scroll_selected = std::mem::take(&mut self.scroll_selected);
+        // Hover is drawn from the previous frame's state: the background has to
+        // be painted before the row's `Response` exists. One frame of lag on a
+        // faint tint is invisible.
+        let hover_row = self.hover_row;
+        let mut hovered_next = None;
         let list_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             // Wheel and scroll bar scroll it; dragging scrolls nothing — on a
@@ -4451,6 +4460,10 @@ impl MxRunApp {
             let selected = row == self.selected;
             let bg = if selected {
                 Color32::from_white_alpha(18)
+            } else if hover_row == Some(row) {
+                // Much fainter than the selection: the pointer says "clickable",
+                // it does not say "this is what Enter will run".
+                Color32::from_white_alpha(7)
             } else {
                 Color32::TRANSPARENT
             };
@@ -4544,8 +4557,14 @@ impl MxRunApp {
             // by its list background too. egui only calls it a drag past its own
             // threshold, so selection and the double click are unaffected.
             let resp = ui.interact(rect, ui.id().with(row), egui::Sense::click_and_drag());
+            // **Hover does not select.** AltRun's list had no mouse-move handler
+            // at all: the selection moved only with the keyboard, a left click, or
+            // a right click (which fakes a left one first). Selecting on hover
+            // meant a mouse resting anywhere over the list stole the selection
+            // back after every ↑↓ — the arrow keys looked broken (reported
+            // 2026-09-19). A faint tint is left as the click affordance.
             if resp.hovered() {
-                self.selected = row;
+                hovered_next = Some(row);
             }
             if resp.drag_started() {
                 drag_now = true;
@@ -4584,6 +4603,7 @@ impl MxRunApp {
         }
         });
         self.check_status_overlap(status_rect, list_area.inner_rect);
+        self.hover_row = hovered_next;
         if drag_now && let Some(hwnd) = main_hwnd() {
             drag_window(hwnd);
             self.save_position();
@@ -4780,8 +4800,11 @@ impl MxRunApp {
         let mut menu_action: Option<MenuAction> = None;
         let armed = self.pending_delete.clone();
         let selected = self.selected;
-        let mut new_selected = selected;
+        // The keyboard arrows move this; hover no longer does.
+        let new_selected = selected;
         let mut drag_now = false;
+        let hover_row = self.hover_row;
+        let mut hovered_next = None;
 
         // Same as the launcher: the status line reserves its space before the
         // scroll area, otherwise the rows draw over it.
@@ -4819,6 +4842,8 @@ impl MxRunApp {
                         Color32::from_rgba_unmultiplied(200, 60, 50, 60)
                     } else if is_selected {
                         Color32::from_white_alpha(18)
+                    } else if hover_row == Some(row) {
+                        Color32::from_white_alpha(7)
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -4873,14 +4898,15 @@ impl MxRunApp {
                     });
                     let rect = inner.response.rect;
                     // Same as the launcher's rows: click selects, drag moves the
-                    // window (the manager fills the card too).
+                    // window (the manager fills the card too) — and hover does
+                    // **not** select, or the arrow keys would fight the pointer.
                     let resp = ui.interact(
                         rect,
                         ui.id().with(("manage-row", row)),
                         egui::Sense::click_and_drag(),
                     );
                     if resp.hovered() {
-                        new_selected = row;
+                        hovered_next = Some(row);
                     }
                     if resp.drag_started() {
                         drag_now = true;
@@ -4930,6 +4956,7 @@ impl MxRunApp {
             }
         }
         self.check_status_overlap(status_rect, manager_area.inner_rect);
+        self.hover_row = hovered_next;
         if drag_now && let Some(hwnd) = main_hwnd() {
             drag_window(hwnd);
             self.save_position();
