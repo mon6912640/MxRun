@@ -1890,6 +1890,8 @@ struct MxRunApp {
     recent_only: bool,
     /// The box holds a `=` expression: no list, just a result.
     calc_mode: bool,
+    /// One-shot flag for the `MXRUN_SELFTEST_RECTS` bookkeeping.
+    logged_drag_rect: bool,
     /// The list one keystroke ago (`ListSnapshot`) — what a trailing digit
     /// points at.
     prev_list: ListSnapshot,
@@ -2150,6 +2152,7 @@ impl MxRunApp {
             discovery_note: String::new(),
             recent_only: false,
             calc_mode: false,
+            logged_drag_rect: false,
             prev_list: ListSnapshot::default(),
             scroll_selected: false,
             cold_start_add: false,
@@ -4245,16 +4248,33 @@ impl eframe::App for MxRunApp {
         egui::CentralPanel::default()
             .frame(panel)
             .show(ui, |ui| {
-                // Dragging the card's empty space moves the window: the OS runs
-                // its own move loop (`drag_window`), which is why the position
-                // can be saved the moment the call returns. Registered before
-                // the views so that rows, buttons and text fields — added later
-                // and therefore on top — keep their own drag behaviour.
+                // Dragging the card moves the window: the OS runs its own move
+                // loop (`drag_window`), which is why the position can be saved
+                // the moment the call returns. Registered before the views so
+                // that text fields and buttons — added later and therefore on
+                // top — keep their own drag behaviour (text selection).
+                //
+                // The rect is the *whole window*, not `ui.max_rect()`: with the
+                // card now full of content (search box, a list that fills the
+                // card, the status strip), the frame's 18px margin was the only
+                // thing left to grab, which read as "there is nowhere to drag"
+                // (reported 2026-09-19).
                 let bg = ui.interact(
-                    ui.max_rect(),
+                    ctx.content_rect(),
                     ui.id().with("card-drag"),
                     egui::Sense::drag(),
                 );
+                // Rect bookkeeping for the "where can I drag?" question: the
+                // handle must cover the whole card, not just the content area.
+                if std::env::var_os("MXRUN_SELFTEST_RECTS").is_some() && !self.logged_drag_rect {
+                    self.logged_drag_rect = true;
+                    log_line(&format!(
+                        "layout: drag handle {:?}, window {:?}, content clip {:?}",
+                        bg.rect,
+                        ctx.content_rect(),
+                        ui.clip_rect()
+                    ));
+                }
                 if bg.drag_started()
                     && let Some(hwnd) = main_hwnd()
                 {
@@ -4298,6 +4318,19 @@ impl MxRunApp {
             self.render_prompt(ui);
             return;
         }
+
+        // --- Drag grip ---
+        //
+        // A frameless card needs to say where it can be grabbed, and the card
+        // is otherwise full of things that want the pointer (search box, rows,
+        // buttons). This thin pill at the top is the answer — the whole strip
+        // around it is draggable too, as is any row.
+        ui.vertical_centered(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 3.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(2), Color32::from_gray(72));
+        });
+        ui.add_space(4.0);
 
         // --- Search box ---
         //
@@ -4378,6 +4411,7 @@ impl MxRunApp {
         let mut clicked: Option<usize> = None;
         let mut run_now: Option<usize> = None;
         let mut menu_action: Option<(usize, MenuAction)> = None;
+        let mut drag_now = false;
         let scroll_selected = std::mem::take(&mut self.scroll_selected);
         let list_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -4483,9 +4517,16 @@ impl MxRunApp {
                 });
             });
             let rect = inner.response.rect;
-            let resp = ui.interact(rect, ui.id().with(row), egui::Sense::click());
+            // `click_and_drag`: a click still selects, a drag moves the window —
+            // the list is the biggest piece of the card, and AltRun let you drag
+            // by its list background too. egui only calls it a drag past its own
+            // threshold, so selection and the double click are unaffected.
+            let resp = ui.interact(rect, ui.id().with(row), egui::Sense::click_and_drag());
             if resp.hovered() {
                 self.selected = row;
+            }
+            if resp.drag_started() {
+                drag_now = true;
             }
             // Keep the selection on screen when ↑↓/Tab/digits move it.
             if selected && scroll_selected {
@@ -4521,6 +4562,10 @@ impl MxRunApp {
         }
         });
         self.check_status_overlap(status_rect, list_area.inner_rect);
+        if drag_now && let Some(hwnd) = main_hwnd() {
+            drag_window(hwnd);
+            self.save_position();
+        }
         if let Some(row) = clicked {
             // Select only — running is the double click below.
             self.selected = row;
@@ -4698,6 +4743,7 @@ impl MxRunApp {
         let armed = self.pending_delete.clone();
         let selected = self.selected;
         let mut new_selected = selected;
+        let mut drag_now = false;
 
         // Same as the launcher: the status line reserves its space before the
         // scroll area, otherwise the rows draw over it.
@@ -4788,13 +4834,18 @@ impl MxRunApp {
                         });
                     });
                     let rect = inner.response.rect;
+                    // Same as the launcher's rows: click selects, drag moves the
+                    // window (the manager fills the card too).
                     let resp = ui.interact(
                         rect,
                         ui.id().with(("manage-row", row)),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
                     if resp.hovered() {
                         new_selected = row;
+                    }
+                    if resp.drag_started() {
+                        drag_now = true;
                     }
                     if resp.clicked() {
                         clicked = Some(row);
@@ -4841,6 +4892,10 @@ impl MxRunApp {
             }
         }
         self.check_status_overlap(status_rect, manager_area.inner_rect);
+        if drag_now && let Some(hwnd) = main_hwnd() {
+            drag_window(hwnd);
+            self.save_position();
+        }
     }
 
     /// The first-run question: MxRun has never been registered on this machine.
