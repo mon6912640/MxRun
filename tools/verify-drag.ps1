@@ -1,4 +1,4 @@
-# MxRun 拖拽验证：用真实鼠标输入拖窗口，然后核对窗口有没有跟着走。
+﻿# MxRun 拖拽验证：用真实鼠标输入拖窗口，然后核对窗口有没有跟着走。
 #
 # 为什么需要它：egui 的窗口拖动是把窗口交给系统自己的移动循环
 # （`SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)`，见 src/main.rs 的 `drag_window`），
@@ -73,7 +73,7 @@ try {
       $r2 = Get-Rect $h
       $moved = ($r2.Left -ne $r.Left) -or ($r2.Top -ne $r.Top)
       if ($moved) {
-        $note = if ($attempt -eq 1) { '' } else { '（重试后成功）' }
+        if ($attempt -ne 1) { $note = '（重试后成功）' }
       } elseif ($attempt -eq 1) {
         Start-Sleep -Milliseconds 600   # 让机器喘口气再试
       }
