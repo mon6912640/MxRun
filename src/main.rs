@@ -323,11 +323,14 @@ fn file_rows_for(
 const LAUNCHER_SIZE: [f32; 2] = [680.0, 400.0];
 const ADD_SIZE: [f32; 2] = [540.0, 300.0];
 
-/// `@` mode's card: same width, taller — one row is ~35px (the launcher fits 8
-/// rows in 400px including the search box and the status line).
+/// `@` mode's card: the same width, tall enough for [`FILE_CARD_ROWS`] rows.
+///
+/// Sized from the **measured** row height (see [`ROW_HEIGHT`]), not a guess: the
+/// first version assumed 35 px and the card that claimed 14 rows showed nine and
+/// a half (spotted in the user's own screenshot, 2026-09-19).
 fn file_card_size() -> [f32; 2] {
-    let extra = FILE_CARD_ROWS.saturating_sub(MAX_ROWS) as f32 * 35.0;
-    [LAUNCHER_SIZE[0], LAUNCHER_SIZE[1] + extra]
+    let rows = FILE_CARD_ROWS as f32 * ROW_HEIGHT + LIST_CHROME;
+    [LAUNCHER_SIZE[0], rows.max(LAUNCHER_SIZE[1])]
 }
 /// The manager is wider on purpose: command lines are long, and AltRun's own
 /// manager gave the command column 400px for the same reason.
@@ -535,6 +538,15 @@ static SYSTEM_LIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Row height driver: the icon, and the space before it.
 const ICON_SIZE: f32 = 26.0;
+
+/// The row number in the first column.
+///
+/// It matters twice over: it is what `Ctrl/Alt+N` presses, and AltRun printed it
+/// in the index column. At 11 px in the faintest grey it was hard to read — the
+/// user asked for it bigger (2026-09-19). The column is wide enough for the two
+/// digits `@` mode's taller list produces.
+const INDEX_SIZE: f32 = 15.0;
+const INDEX_COL_W: f32 = 22.0;
 
 /// Summon animation: fade in over this long while rising this far.
 ///
@@ -2614,8 +2626,22 @@ const FILE_DEBOUNCE_MS: u64 = 120;
 /// long list is the point of searching the disk.
 const FILE_ROWS: usize = 40;
 
-/// How many results the card may show at once...
+/// How many rows the card is tall in `@` mode (the user picked a taller card for
+/// file search, 2026-09-19).
 const FILE_CARD_ROWS: usize = 14;
+
+/// How tall one row really is — measured, not guessed.
+///
+/// The first `file_card_size` assumed 35 px per row, so the card that was supposed
+/// to show 14 rows showed about nine and a half — visible in the user's own
+/// `@ever` screenshot (2026-09-19). 51 px is what a row takes: a 17 px title, a
+/// 12 px detail line, the frame's margins and the gap between rows.
+const ROW_HEIGHT: f32 = 51.0;
+
+/// Everything above and below the list: the title strip, the search box and the
+/// status line. Measured the same way as [`ROW_HEIGHT`] — at 115 the fourteenth
+/// row was clipped by the status bar, at 132 the last row still was.
+const LIST_CHROME: f32 = 168.0;
 
 /// The calculator's mode prefix: `=1+2`.
 /// It used to be implicit (any query that looked like an expression got
@@ -6498,17 +6524,24 @@ impl MxRunApp {
             let inner = frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    // The index, the way AltRun printed it in the first column —
-                    // just quieter, so it does not fight the icon and the title.
-                    // `Ctrl/Alt + N` runs this row; `;` and `'` are the second
-                    // and third.
-                    ui.add_sized(
-                        [14.0, 20.0],
-                        egui::Label::new(
-                            RichText::new(format!("{}", row + 1))
-                                .size(11.0)
-                                .color(if selected { pal().text_dim } else { pal().text_faint }),
-                        ),
+                    // The index, the way AltRun printed it in the first column.
+                    // `Ctrl/Alt + N` runs this row; `;` and `'` are the second and
+                    // third — so it is a *control label*, not decoration: 15 px and
+                    // one tier brighter than before, right-aligned so the digits
+                    // line up once `@` mode shows two-digit rows.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(INDEX_COL_W, 20.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new(format!("{}", row + 1))
+                                    .size(INDEX_SIZE)
+                                    // The selected row's number goes amber: it is the
+                                    // row Enter will run, and the number is how you
+                                    // would have reached it by keyboard.
+                                    .color(if selected { pal().accent } else { pal().text_dim }),
+                            );
+                        },
                     );
                     match &icon {
                         // Real shell icon at the display resolution (the texture
