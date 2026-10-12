@@ -323,6 +323,89 @@ fn command_for(exe: &Path, arg: &str) -> String {
     format!("\"{}\" \"{arg}\"", exe.to_string_lossy())
 }
 
+/// Start with Windows: the `Run` key, the way AltRun did it.
+///
+/// `HKCU` — no administrator, no service, and it travels with the user account
+/// rather than the machine. Two details that make it work for a **portable**
+/// copy:
+///
+/// * the command carries [`SILENT_FLAG`], so a login start lands in the tray
+///   instead of throwing the launcher over whatever you were doing;
+/// * the stored path is compared with the running exe ([`autostart_points_at`])
+///   and repaired on every start, because a portable folder that moves (or a USB
+///   stick that changes letter) would otherwise leave a dead entry behind.
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "MxRun";
+
+/// The flag that makes a start silent: resident in the tray, no window.
+pub const SILENT_FLAG: &str = "--tray";
+
+/// The command line an autostart entry should hold.
+///
+/// Built as a pure function so the quoting can be tested without touching the
+/// registry: a path with spaces **must** be quoted or Windows parses it as
+/// `C:\Program` plus arguments.
+fn autostart_command(exe: &Path) -> String {
+    format!("\"{}\" {SILENT_FLAG}", exe.to_string_lossy())
+}
+
+/// Is autostart on for *this* executable (not for the copy this user used to
+/// have)?
+pub fn autostart_points_at(exe: &Path) -> bool {
+    read_reg_string(RUN_KEY, Some(RUN_VALUE))
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case(autostart_command(exe).as_str()))
+}
+
+/// Is any MxRun autostart entry present? (Even a stale one counts: the user
+/// asked for it, so the checkbox should read as on until they say otherwise.)
+pub fn autostart_enabled() -> bool {
+    read_reg_string(RUN_KEY, Some(RUN_VALUE)).is_some()
+}
+
+pub fn enable_autostart(exe: &Path) -> Result<(), String> {
+    write_reg_string(RUN_KEY, Some(RUN_VALUE), &autostart_command(exe))
+}
+
+pub fn disable_autostart() -> Result<(), String> {
+    use windows::Win32::System::Registry::{RegDeleteValueW, RegOpenKeyExW};
+
+    let sub = wide(RUN_KEY);
+    let mut hkey = HKEY::default();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            None,
+            KEY_WRITE,
+            &mut hkey,
+        )
+    };
+    if status.0 != 0 {
+        // No key means nothing to remove — not an error.
+        return Ok(());
+    }
+    let name = wide(RUN_VALUE);
+    let status = unsafe { RegDeleteValueW(hkey, PCWSTR(name.as_ptr())) };
+    let _ = unsafe { RegCloseKey(hkey) };
+    // 2 = ERROR_FILE_NOT_FOUND: the entry was already gone.
+    if status.0 != 0 && status.0 != 2 {
+        return Err(format!("RegDeleteValueW 失败（错误码 {}）", status.0));
+    }
+    Ok(())
+}
+
+/// Point a stale autostart entry at the running copy.
+///
+/// Called at startup when the feature is on: a portable folder that moved leaves
+/// an entry pointing at a path that no longer exists, and Windows would either
+/// skip it silently or complain at login.
+pub fn repair_autostart(exe: &Path) -> bool {
+    if autostart_enabled() && !autostart_points_at(exe) {
+        return enable_autostart(exe).is_ok();
+    }
+    false
+}
+
 /// The value of a registry string, or `None` when it is missing or not a
 /// string. Used to tell "registered for me" from "registered for the copy I
 /// used to have".
@@ -379,13 +462,20 @@ fn read_reg_string(key: &str, name: Option<&str>) -> Option<String> {
     Some(String::from_utf16_lossy(&words))
 }
 
-/// Keep the entries pointing at *this* copy of MxRun.
+/// Keep the entries pointing at *this* copy of MxRun — **but only when they are
+/// dead**.
 ///
-/// This is what makes the folder portable. The registrations themselves are the
-/// record of "the user wanted this": if one exists but aims somewhere else — the
-/// folder moved, the drive letter changed, the exe was renamed — rewrite it
-/// silently. If nothing is registered, do nothing at all (that is a preference,
-/// not an oversight; the first-run question handles a brand-new machine).
+/// This is what makes the folder portable: the registrations are the record of
+/// "the user wanted this", so if one aims at a path that no longer exists (the
+/// folder moved, the drive letter changed, the exe was renamed) it is rewritten
+/// silently. If nothing is registered, nothing happens — that is a preference,
+/// not an oversight; the first-run question handles a brand-new machine.
+///
+/// **And if the entry points at another copy that still exists, it is left
+/// alone.** A portable copy on a USB stick (or a friend's copy you launched once
+/// to try) must not steal the right-click entries from the installed one; the
+/// first version of this did exactly that and the log said so
+/// ("self-heal: 右键菜单 3 处已重新指向 …Temp\mxrun-pkg-test…", 2026-09-19).
 ///
 /// Returns the log lines describing what happened.
 pub fn repair_if_registered() -> Vec<String> {
@@ -395,18 +485,49 @@ pub fn repair_if_registered() -> Vec<String> {
     };
 
     if sendto_installed() && !sendto_points_at(&exe) {
-        match install_sendto() {
-            Ok(path) => notes.push(format!("self-heal: 发送到 已重新指向 {}（{}）", exe.display(), path.display())),
-            Err(e) => notes.push(format!("self-heal: 发送到 修复失败：{e}")),
+        match registered_target_exe() {
+            // Alive and owned by someone else: hands off.
+            Some(other) if other.is_file() => notes.push(format!(
+                "self-heal: 发送到 指向另一个仍在的副本（{}），保持不动",
+                other.display()
+            )),
+            _ => match install_sendto() {
+                Ok(path) => notes.push(format!(
+                    "self-heal: 发送到 已重新指向 {}（{}）",
+                    exe.display(),
+                    path.display()
+                )),
+                Err(e) => notes.push(format!("self-heal: 发送到 修复失败：{e}")),
+            },
         }
     }
     if shell_menu_installed() && !shell_menu_points_at(&exe) {
-        match install_shell_menu() {
-            Ok(n) => notes.push(format!("self-heal: 右键菜单 {n} 处已重新指向 {}", exe.display())),
-            Err(e) => notes.push(format!("self-heal: 右键菜单 修复失败：{e}")),
+        match registered_target_exe() {
+            Some(other) if other.is_file() => notes.push(format!(
+                "self-heal: 右键菜单 指向另一个仍在的副本（{}），保持不动",
+                other.display()
+            )),
+            _ => match install_shell_menu() {
+                Ok(n) => notes.push(format!("self-heal: 右键菜单 {n} 处已重新指向 {}", exe.display())),
+                Err(e) => notes.push(format!("self-heal: 右键菜单 修复失败：{e}")),
+            },
         }
     }
     notes
+}
+
+/// The executable an existing registration names, if we can parse one.
+///
+/// Used to decide "dead path (repair it)" from "another live copy (hands off)".
+fn registered_target_exe() -> Option<std::path::PathBuf> {
+    let raw = shell_menu_entries()
+        .iter()
+        .find_map(|(_, sub)| read_reg_string(sub, None))
+        .or_else(|| read_reg_string(r"Software\Classes\Directory\shell\MxRun\command", None))?;
+    // Command lines look like: "C:\path\mxrun.exe" "%1"
+    let rest = raw.trim().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(std::path::PathBuf::from(&rest[..end]))
 }
 
 /// True when either entry point exists, whatever it points at.
@@ -601,5 +722,20 @@ mod tests {
         let a = item_from_path(r"C:\Tools\App.exe");
         let b = item_from_path(r"c:\tools\app.exe");
         assert_eq!(a.source, b.source);
+    }
+
+    /// The autostart command line, which Windows parses: an unquoted path with a
+    /// space would be read as a program plus arguments.
+    #[test]
+    fn autostart_command_quotes_the_path_and_starts_silently() {
+        let cmd = autostart_command(Path::new(r"D:\Tools\MxRun\mxrun.exe"));
+        assert_eq!(cmd, "\"D:\\Tools\\MxRun\\mxrun.exe\" --tray");
+        let spaced = autostart_command(Path::new(r"C:\Program Files\MxRun\mxrun.exe"));
+        assert!(spaced.starts_with('"'), "quoted: {spaced}");
+        assert!(spaced.ends_with(SILENT_FLAG), "silent: {spaced}");
+        assert!(
+            spaced.contains("\" "),
+            "quote closes before the flag: {spaced}"
+        );
     }
 }

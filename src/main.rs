@@ -819,6 +819,24 @@ fn main() -> eframe::Result<()> {
         panic!("deliberate panic: MXRUN_SELFTEST_PANIC is set");
     }
 
+    // Debug: exercise the autostart registry path without clicking
+    // (`MXRUN_SELFTEST_AUTOSTART=on|off`). Registry writes cannot be unit-tested
+    // without touching the real key, so this is how the packaging check proves the
+    // entry appears, points at the right exe, and goes away again.
+    if let Ok(what) = std::env::var("MXRUN_SELFTEST_AUTOSTART") {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let outcome = if what == "off" {
+            integrate::disable_autostart()
+        } else {
+            integrate::enable_autostart(&exe)
+        };
+        log_line(&format!(
+            "selftest: autostart {what} -> {outcome:?} (now installed={} points_at_me={})",
+            integrate::autostart_enabled(),
+            integrate::autostart_points_at(&exe)
+        ));
+    }
+
     // Debug: isolate the `es.exe` spawn so a human ear can judge it
     // (`MXRUN_SELFTEST_ESSPAWN=5` → five spawns, one per second). Written because
     // a user reported "every keystroke in @ mode plays a sound effect"
@@ -937,7 +955,11 @@ fn main() -> eframe::Result<()> {
             .with_title("MxRun")
             .with_always_on_top()
             .with_inner_size(start_size)
-            .with_min_inner_size([480.0, 200.0]),
+            .with_min_inner_size([480.0, 200.0])
+            // A silent start (autostart at login, `--tray`) must not put anything
+            // on screen. Skipping our own `show_window` was not enough: eframe
+            // shows the viewport itself unless it is told otherwise.
+            .with_visible(!silent_start()),
         ..Default::default()
     };
     eframe::run_native(
@@ -2170,6 +2192,87 @@ fn health_of(item: &Item) -> Health {
     }
 }
 
+/// Is any of this process's top-level windows on screen right now?
+///
+/// Asks Windows by **enumerating windows**, not by looking up "the main window":
+/// started with `--tray`, this process owns ten top-level windows (nine helpers
+/// plus the card), and the class/title lookup behind [`main_hwnd`] was pointing at
+/// a hidden helper — so both the hide and the check were aimed at the wrong window
+/// (measured 2026-09-19: `visible_after=false` in the log while an enumeration
+/// showed `class=W visible=True`).
+fn window_on_screen() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    struct Probe {
+        pid: u32,
+        found: bool,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let probe = unsafe { &mut *(lparam.0 as *mut Probe) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == probe.pid && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            probe.found = true;
+            return windows::core::BOOL(0); // stop early
+        }
+        windows::core::BOOL(1)
+    }
+    let mut probe = Probe {
+        pid: std::process::id(),
+        found: false,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(callback), LPARAM(&mut probe as *mut Probe as isize));
+    }
+    probe.found
+}
+
+/// Hide every visible top-level window this process owns.
+///
+/// The blunt version of [`hide_window`], for the one case where aiming at a single
+/// handle is not reliable: the silent start, where eframe presents a window that
+/// our own lookup does not name.
+fn hide_all_our_windows() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, ShowWindow,
+    };
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let want = unsafe { *(lparam.0 as *const u32) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == want && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let pid = std::process::id();
+    unsafe {
+        let _ = EnumWindows(Some(callback), LPARAM(&pid as *const u32 as isize));
+    }
+}
+
+/// Was this process started by the autostart entry (or asked to stay quiet)?
+///
+/// `--tray` means "resident, no window": the tray icon appears, the hotkey is
+/// registered, and nothing is put in front of the user. Anything handed over on
+/// the command line (a right-click add) still opens its card — that is work the
+/// user just asked for.
+fn silent_start() -> bool {
+    std::env::args().skip(1).any(|a| a == integrate::SILENT_FLAG)
+        || std::env::var_os("MXRUN_SILENT").is_some()
+}
+
+/// The running executable's path.
+///
+/// Used for the autostart entry (and anything else that has to name this copy):
+/// a portable folder can sit anywhere, so the path is asked for, never assumed.
+fn current_exe_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -3037,6 +3140,8 @@ struct MxRunApp {
     /// Items whose target no longer exists, as of the last health check. Shown
     /// in the manager as a "失效" tag plus a one-click cleanup.
     broken_count: usize,
+    /// Deadline for the silent start's window hunt (see the note in `update`).
+    silent_until: Option<std::time::Instant>,
     /// The "已删除" panel is open (manager view).
     view_deleted: bool,
     /// Cached `deleted_sources()` for that panel — reading it per frame would
@@ -3100,12 +3205,22 @@ impl MxRunApp {
         for note in integrate::repair_if_registered() {
             log_line(&format!("integration: {note}"));
         }
+        // Same for the autostart entry: portable means "the folder may move", and
+        // a `Run` value pointing at a path that is gone would either be skipped
+        // silently or complain at login.
+        if let Some(exe) = current_exe_path()
+            && integrate::repair_autostart(&exe)
+        {
+            log_line(&format!("autostart: repointed at {}", exe.display()));
+        }
         log_line(&format!(
-            "startup: data_dir={} portable={} integration(sendto={} menu={})",
+            "startup: data_dir={} portable={} integration(sendto={} menu={}) autostart={} silent={}",
             store::default_data_dir().display(),
             store::is_portable(),
             integrate::sendto_installed(),
-            integrate::shell_menu_installed()
+            integrate::shell_menu_installed(),
+            integrate::autostart_enabled(),
+            silent_start()
         ));
 
         // A machine whose Explorer has never heard of MxRun gets asked once
@@ -3270,6 +3385,7 @@ impl MxRunApp {
 
         let mut app = Self {
             items: Vec::new(),
+            silent_until: None,
             broken_count: 0,
             view_deleted: false,
             deleted_rows: Vec::new(),
@@ -5681,6 +5797,49 @@ impl MxRunApp {
         ui.label(RichText::new("右键集成").size(15.0));
         ui.add_space(6.0);
 
+        // --- start with Windows (portable-friendly, HKCU, no admin) ---
+        let autostart = integrate::autostart_enabled();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if autostart {
+                    "✓ 开机自动启动（静默进托盘）"
+                } else {
+                    "· 未设置开机自启"
+                })
+                .size(13.0)
+                .color(if autostart { pal().ok } else { pal().text_dim }),
+            );
+            if ui.button(if autostart { "关闭自启" } else { "开机自启" }).clicked() {
+                let outcome = if autostart {
+                    integrate::disable_autostart()
+                } else {
+                    match current_exe_path() {
+                        Some(exe) => integrate::enable_autostart(&exe),
+                        None => Err("找不到自身路径".to_string()),
+                    }
+                };
+                self.status = match outcome {
+                    Ok(()) => {
+                        log_line(&format!("autostart: now enabled={}", !autostart));
+                        if autostart { "已关闭开机自启".into() } else { "已设置开机自启（登录后静默进托盘）".to_string() }
+                    }
+                    Err(e) => {
+                        log_line(&format!("autostart: failed: {e}"));
+                        format!("操作失败：{e}")
+                    }
+                };
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "写在 HKCU 下，不需要管理员；便携版把文件夹搬走后，下次启动会自动改写指向新路径。",
+            )
+            .size(11.0)
+            .color(pal().text_faint),
+        );
+        ui.add_space(10.0);
+
         let sendto = integrate::sendto_installed();
         let menu = integrate::shell_menu_installed();
 
@@ -5830,17 +5989,62 @@ impl eframe::App for MxRunApp {
             ));
         }
 
-        // Center the window on the very first frame (initial launch).
+        // Center the window on the very first frame (initial launch) — unless we
+        // were started by the autostart entry, which asks for a **silent** start:
+        // it lands in the tray, and the hotkey is how you get it. Throwing the
+        // launcher over whatever the user was doing at login is the classic
+        // autostart sin (and AltRun did not do it either).
         if !self.centered {
             self.centered = true;
-            show_window(&ctx);
+            if silent_start() {
+                // Started by the autostart entry: hide explicitly rather than just
+                // not showing. `with_visible(false)` and skipping `show_window` were
+                // both not enough — something in the startup path still ended up
+                // presenting the window, and "it pops up at login" is the one thing
+                // a silent start must never do.
+                hide_window(&ctx);
+            } else {
+                show_window(&ctx);
+            }
             if let Some(hwnd) = main_hwnd() {
                 apply_backdrop(hwnd, &std::env::var("MXRUN_BACKDROP").unwrap_or_default());
                 apply_round_corners(hwnd);
             }
+            // Worth a line: "silent" is a promise to the user at login, and the
+            // first version of it did not hold (something still presented the
+            // window), so the log states what actually happened.
+            log_line(&format!(
+                "startup: cold start silent={} visible_after={}",
+                silent_start(),
+                window_visible()
+            ));
             // Cold start gets the same fade-in as a summon: the window is not
             // transitioning from hidden here, so the block below would miss it.
             self.anim = (anim_ms() > 0.0).then(std::time::Instant::now);
+        }
+
+        // Re-assert the silent start.
+        //
+        // Hiding once is not enough: eframe/winit presents the window itself once
+        // creation finishes — about half a second after our first frame, with no
+        // call of ours involved (measured). And the target has to be found by
+        // enumerating windows, because the class/title lookup names a *hidden*
+        // helper in this process (measured: ten top-level windows, one visible).
+        //
+        // Guarded by `WINDOW_VISIBLE`, which is our record of what the user asked
+        // for: a summon flips it and this stops at once. Frames are requested only
+        // during this short hunt, so an idle silent start costs nothing after it.
+        if silent_start() && !window_visible() {
+            if window_on_screen() {
+                hide_all_our_windows();
+                log_line("startup: silent start re-hid a window eframe presented");
+            }
+            if self.silent_until.is_none() {
+                self.silent_until = Some(std::time::Instant::now() + Duration::from_secs(3));
+            }
+            if self.silent_until.is_some_and(|t| std::time::Instant::now() < t) {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
         }
 
         // Tray menu asked for the settings view.
