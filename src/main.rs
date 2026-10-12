@@ -166,19 +166,67 @@ fn process_name_of(pid: u32) -> Option<String> {
     }
 }
 
-/// The folder a file lives in, shortened from the left so the interesting end
-/// (the last two levels) survives: `…\Network\Reporting`. Used as a file row's
-/// detail line — the file name is already the title.
+/// A path that fits one line: complete while it can be, elided in the **middle**
+/// when it cannot.
+///
+/// The first version kept only the last three components (`…\EdgeCore\Optimized`),
+/// which threw away where the file actually lives — the user asked "why is the
+/// path incomplete?" (2026-09-19) and he was right: for finding a file, the drive
+/// and the top level matter as much as the immediate parent.
+///
+/// Middle elision keeps both ends: `C:\…\Microsoft\Edge\Optimized`. The complete
+/// path is still one hover away (see the row's tooltip).
+fn elide_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('\\').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 2 {
+        return truncate_chars(path, max_chars);
+    }
+    let head = parts[0]; // drive or UNC root
+    // Add components from the end until the budget is gone, then join.
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = head.chars().count() + 3; // "…\" around the ellipsis
+    for part in parts[1..].iter().rev() {
+        let cost = part.chars().count() + 1;
+        if used + cost > max_chars {
+            break;
+        }
+        used += cost;
+        tail.push(part);
+    }
+    if tail.is_empty() {
+        return truncate_chars(path, max_chars);
+    }
+    tail.reverse();
+    let joined = format!("{head}\\…\\{}", tail.join("\\"));
+    // Hard cap last: one component can be long all by itself (a Chrome extension
+    // id, a version folder), and the row must stay one line whatever happens.
+    truncate_chars(&joined, max_chars)
+}
+
+/// How many characters a file row's folder line may use.
+///
+/// Measured against the card, not guessed: the row's detail line gets ~500 px and
+/// the font is 12 px, so ~72 characters is where it stops wrapping. The first
+/// attempt used 92 and the screenshot showed exactly the ragged two-line rows the
+/// elision exists to prevent (2026-09-19).
+const PATH_DETAIL_CHARS: usize = 72;
+
+/// Short label for a file row: AltRun's command categories ("应用") say nothing
+/// about a `.dll` or a `.sqlite` — those are just files.
+fn file_category(is_dir: bool) -> (&'static str, &'static str) {
+    if is_dir { ("📁", "文件夹") } else { ("📄", "文件") }
+}
+
+/// The folder a file lives in, ready for a row's detail line.
 fn folder_of(path: &str) -> String {
     let parent = std::path::Path::new(path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let parts: Vec<&str> = parent.split('\\').filter(|p| !p.is_empty()).collect();
-    if parts.len() <= 3 {
-        return parent;
-    }
-    format!("…\\{}", parts[parts.len() - 3..].join("\\"))
+    elide_path(&parent, PATH_DETAIL_CHARS)
 }
 
 /// The folder a file lives in, shortened from the left so the interesting end
@@ -6408,12 +6456,28 @@ impl MxRunApp {
             };
             let job = self.name_layout_job(sc);
             // Category label + emoji are derived from the default action's
-            // effect (there is no stored "kind" any more).
+            // effect (there is no stored "kind" any more) — except in `@` mode,
+            // where the row is a file on disk and "应用" would be a lie.
             let (emoji, category) = match item.item.default_action() {
+                _ if self.file_mode => {
+                    let is_dir = self
+                        .file_hits
+                        .get(sc.idx)
+                        .map(|h| h.is_dir)
+                        .unwrap_or(false);
+                    file_category(is_dir)
+                }
                 Some(a) => (a.effect.icon(), a.effect.label()),
                 None => ("•", "条目"),
             };
             let desc = row_detail(&item.item);
+            // The complete path, for the rows whose detail line had to be elided
+            // (the user asked why the path was cut short, 2026-09-19).
+            let full_path = if self.file_mode {
+                self.file_hits.get(sc.idx).map(|h| h.path.clone())
+            } else {
+                None
+            };
             // A row whose program is gone says so — in the manager only: the
             // launcher's eight rows are for launching, not for tidying up.
             let broken = item.item.health == Health::Broken;
@@ -6483,11 +6547,18 @@ impl MxRunApp {
                         // and here it warns that Enter will open the parameter
                         // prompt instead of running straight away.
                         let needs_input = if item.item.wants_input() { "  ·  需要输入 *" } else { "" };
-                        ui.label(
+                        let detail = ui.label(
                             RichText::new(format!("{}  ·  {}{}", category, desc, needs_input))
                                 .size(12.0)
                                 .color(pal().text_dim),
                         );
+                        // A long path is elided to keep one line per row; hovering
+                        // gives the whole thing back.
+                        if let Some(path) = &full_path
+                            && desc != *path
+                        {
+                            detail.on_hover_text(path);
+                        }
                     });
                     // Launch counter, flush right — this is what fills the wide
                     // empty side of the row.
@@ -7708,13 +7779,34 @@ mod tests {
     }
 
     #[test]
-    fn folder_of_keeps_the_tail() {
+    fn path_detail_keeps_both_ends() {
+        // Short enough: shown complete, no elision at all.
         assert_eq!(folder_of(r"D:\a\report.md"), r"D:\a");
-        assert_eq!(
-            folder_of(r"R:\roaming\Local\Google\Chrome\User Data\Default\Network\x.txt"),
-            r"…\User Data\Default\Network",
-            "the last three parts of the folder survive"
+        let medium = r"D:\work\MxRun\src\main.rs";
+        assert_eq!(folder_of(medium), r"D:\work\MxRun\src", "complete path kept");
+
+        // Past the budget: the drive *and* the immediate parent both survive, the
+        // middle is what gets dropped. (The first version kept only the last three
+        // parts, which is what the user noticed: "why is the path incomplete?",
+        // 2026-09-19.)
+        let edge = r"R:\roaming\AppData\Local\Google\Chrome\User Data\Default\Network\Persistent\Cookies.db";
+        let shown = folder_of(edge);
+        assert!(shown.starts_with(r"R:\"), "the drive stays: {shown}");
+        assert!(
+            shown.ends_with(r"Network\Persistent"),
+            "the parent stays: {shown}"
         );
+        assert!(shown.contains('…'), "the middle is what got dropped: {shown}");
+        assert!(
+            shown.chars().count() <= PATH_DETAIL_CHARS,
+            "and it still fits one line: {shown}"
+        );
+
+        // A path with nothing to elide in the middle falls back to a tail cut.
+        let odd = format!(r"D:\{}", "x".repeat(200));
+        assert!(elide_path(&odd, 40).chars().count() <= 40);
+
+        // Empty path: no panic, no output.
         assert_eq!(folder_of(""), "");
     }
 
