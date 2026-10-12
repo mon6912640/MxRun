@@ -471,6 +471,37 @@ fn log_line(msg: &str) {
         });
 }
 
+/// Log every panic, with its location, before the process dies.
+///
+/// A `windows_subsystem = "windows"` binary has no stderr: an unwinding panic
+/// prints to nothing and the process vanishes, leaving only "the log stopped
+/// here". That is how a user's report ("typing `@ever` exits the program",
+/// 2026-09-19) became undiagnosable, so this is the cheapest permanent fix.
+///
+/// The default hook is kept as well, so `RUST_BACKTRACE=1` still works when the
+/// program is started from a console.
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(no message)".to_string());
+        let thread = std::thread::current();
+        log_line(&format!(
+            "PANIC at {location} in thread {:?}: {payload}",
+            thread.name().unwrap_or("unnamed")
+        ));
+        previous(info);
+    }));
+}
+
 // ---------- startup guards ----------
 //
 // A launcher is started by double-clicking, so "launch it again" is a normal
@@ -653,6 +684,20 @@ fn run_integration(install: bool) -> bool {
 fn main() -> eframe::Result<()> {
     // Anchor the clock the wake probe and the icon timings both read.
     PROC_START.get_or_init(std::time::Instant::now);
+
+    // A windowed program has no console, so a panic message goes *nowhere* and
+    // the process just disappears — which is exactly how a user reported it
+    // ("输入 @ever 就会退出程序了", 2026-09-19) and why that report could not be
+    // diagnosed: the log simply stopped. Log panics from now on, with the
+    // location, so the next one names itself.
+    install_panic_logger();
+
+    // Debug: prove the panic logger works (`MXRUN_SELFTEST_PANIC=1`). A diagnostic
+    // that has never been seen firing is a guess, and this one exists precisely
+    // because an unexplained exit could not be diagnosed.
+    if std::env::var_os("MXRUN_SELFTEST_PANIC").is_some() {
+        panic!("deliberate panic: MXRUN_SELFTEST_PANIC is set");
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1039,23 +1084,22 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
 /// Take the foreground, the way that actually works from a background process.
 ///
 /// `SetForegroundWindow` alone is **refused** unless the calling process already
-/// owns the foreground (Windows' foreground-lock). A launcher summonned by a
+/// owns the foreground (Windows' foreground-lock). A launcher summoned by a
 /// global hotkey is exactly that case, so the plain call left the card *visible
 /// but unfocused* — and the "hide when focus is lost" rule then made it vanish
 /// ~300 ms later. The user saw it as "typing `@` closes the window"
 /// (2026-09-19); the log said `hide: lost focus — explorer.exe · Progman ·
 /// Program Manager`, i.e. the foreground had fallen back to the desktop.
 ///
-/// Two standard steps, cheapest first:
-/// 1. attach to the current foreground thread, set foreground, detach;
-/// 2. if that still failed, tap `Alt` — a synthetic key press is a documented way
-///    to be allowed to steal the foreground.
-///
-/// Every outcome is logged, because "did the card really get the focus?" is
-/// unanswerable from the outside (see [`foreground_report`]).
+/// The fix is `AttachThreadInput` on the current foreground thread, which is the
+/// documented way to be allowed to switch. **No synthetic keystrokes**: the first
+/// version also tapped `Alt`, which is a *global* input event — and this machine
+/// turned out to be running a Unity game (`Fish to Dish.exe · UnityWndClass`)
+/// that grabs the foreground again on stray Alt presses. Provoking other
+/// programs to steal focus in order to take focus is a bad trade; if the attach
+/// fails we stay visible but unfocused and say so in the log.
 fn force_foreground(hwnd: HWND) {
     use windows::Win32::System::Threading::AttachThreadInput;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, keybd_event};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     unsafe {
         if foreground_is_ours() {
@@ -1071,14 +1115,13 @@ fn force_foreground(hwnd: HWND) {
         if attached {
             let _ = AttachThreadInput(target_thread, this, false);
         }
-        if !foreground_is_ours() {
-            // Last resort: the Alt tap.
-            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
-            let _ = SetForegroundWindow(hwnd);
-            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-        }
-        if !foreground_is_ours() {
+        if foreground_is_ours() {
+            if attached {
+                log_line("show: foreground taken (attach)");
+            }
+        } else {
+            // Visible but unfocused. The `FOCUS_EVER_HELD` gate keeps it on
+            // screen; the user can click it, which works every time.
             log_line(&format!(
                 "show: could not take the foreground — {}",
                 foreground_report()
