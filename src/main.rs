@@ -759,6 +759,23 @@ fn main() -> eframe::Result<()> {
         panic!("deliberate panic: MXRUN_SELFTEST_PANIC is set");
     }
 
+    // Debug: isolate the `es.exe` spawn so a human ear can judge it
+    // (`MXRUN_SELFTEST_ESSPAWN=5` → five spawns, one per second). Written because
+    // a user reported "every keystroke in @ mode plays a sound effect"
+    // (2026-09-19) and the agent cannot hear: with this the only variable left is
+    // the child process, and the flags can be A/B'd with `MXRUN_ES_FLAGS`.
+    if let Ok(n) = std::env::var("MXRUN_SELFTEST_ESSPAWN") {
+        let n: u32 = n.parse().unwrap_or(3);
+        let flags = std::env::var("MXRUN_ES_FLAGS").unwrap_or_else(|_| "no_window".to_string());
+        log_line(&format!("esspawn: {n} spawns, flags={flags}"));
+        for i in 0..n {
+            log_line(&format!("esspawn: {}/{}", i + 1, n));
+            let _ = filesearch::probe_spawn(&flags);
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        log_line("esspawn: done");
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Import mode runs headless and is checked *before* the single-instance

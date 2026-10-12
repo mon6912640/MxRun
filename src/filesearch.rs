@@ -381,6 +381,39 @@ pub fn search(
     Ok(rank(filtered, query, opened).into_iter().take(limit).collect())
 }
 
+/// Spawn `es.exe` once, for the "does spawning it make a sound?" A/B.
+///
+/// `flags` selects the creation flags so the question can be answered by ear:
+/// `no_window` (what the app uses), `detached` (`DETACHED_PROCESS`, no console at
+/// all) or `none` (inherit — the case that should be loudest, which is how the
+/// person listening knows the test is working).
+pub fn probe_spawn(flags: &str) -> std::io::Result<()> {
+    // Spawn `es.exe` **directly**: routing through `cmd /c` would put a second
+    // console program into the experiment and the ear could not tell which one
+    // made the noise.
+    let Some(es) = discover_es(None) else {
+        return Err(std::io::Error::other("es.exe not found"));
+    };
+    let mut cmd = std::process::Command::new(es);
+    cmd.arg("-n").arg("1").arg("ever");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let code = match flags {
+            "detached" => 0x0000_0008, // DETACHED_PROCESS: no console at all
+            "none" => 0,               // inherit: the loud case, proves the test runs
+            _ => 0x0800_0000,          // CREATE_NO_WINDOW: what the app uses
+        };
+        cmd.creation_flags(code);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn()?;
+    let _ = child.wait();
+    Ok(())
+}
+
 /// Escape a literal query for Everything's regex mode.
 fn regex_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
