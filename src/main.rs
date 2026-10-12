@@ -204,6 +204,66 @@ fn file_stub_item(path: &str) -> Item {
     }
 }
 
+/// Build `@` mode's transient rows **and** the index list that points at them.
+///
+/// One function for both, deliberately: they are two halves of the same fact, and
+/// keeping them in step by hand is what produced an index-out-of-bounds panic in
+/// the render loop (see [`MxRunApp::build_file_rows`]). Pure, so the invariant is
+/// covered by a test.
+fn file_rows_for(
+    hits: &[filesearch::FileHit],
+    opened: &std::collections::HashMap<String, u32>,
+) -> (Vec<Indexed>, Vec<Scored>) {
+    let rows: Vec<Indexed> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let name = std::path::Path::new(&hit.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| hit.path.clone());
+            let item = Item {
+                // Transient by construction: this id never reaches the store, it
+                // only has to be unique among these rows.
+                id: format!("file:{i}:{}", hit.path),
+                title: name,
+                // The folder, not the whole path: the file name is already the
+                // title, and a full path wraps to two lines, which makes every row
+                // a different height.
+                subtitle: folder_of(&hit.path),
+                keywords: vec![hit.path.clone()],
+                actions: vec![Action::open(&hit.path)],
+                arg: ArgSpec::default(),
+                launch: LaunchMode::Normal,
+                source: Source {
+                    provider: "file".to_string(),
+                    external_id: hit.path.clone(),
+                },
+                health: Health::Ok,
+            };
+            Indexed {
+                searchable: item.haystack().to_lowercase(),
+                title_chars: item.title.chars().count(),
+                keywords_lower: vec![hit.path.to_lowercase()],
+                frec_bonus: 0.0,
+                launches: opened.get(&hit.path).copied().unwrap_or(0),
+                last_used: hit.modified,
+                item,
+            }
+        })
+        .collect();
+    let scores: Vec<Scored> = (0..rows.len())
+        .map(|idx| Scored {
+            idx,
+            // Everything already ranked; the row order *is* the ranking.
+            score: (rows.len() - idx) as f64,
+            strong: true,
+            hit_indices: Vec::new(),
+        })
+        .collect();
+    (rows, scores)
+}
+
 /// The launcher's own size, and the size of the small add/edit card.
 ///
 /// AltRun showed the add dialog as a separate little window and deliberately
@@ -3548,11 +3608,27 @@ impl MxRunApp {
     /// `results` at them. Everything downstream — selection, hover, `Ctrl+N`,
     /// Enter, highlighting — then works unchanged, because it only ever asks for
     /// "the row at this index".
+    ///
+    /// Falls back to the item list when the index is out of range instead of
+    /// panicking: a mis-synced `results`/`file_rows` pair used to take the whole
+    /// process down from inside the render loop (2026-09-19), and a launcher must
+    /// not die because one frame was inconsistent.
     fn row(&self, idx: usize) -> &Indexed {
-        if self.file_mode && idx < self.file_rows.len() {
-            &self.file_rows[idx]
-        } else {
-            &self.items[idx]
+        if self.file_mode
+            && let Some(row) = self.file_rows.get(idx)
+        {
+            return row;
+        }
+        match self.items.get(idx) {
+            Some(row) => row,
+            // Both lists are exhausted: hand back the first row so callers can
+            // keep their signatures. Nothing draws it — `results` is what drives
+            // the loop.
+            None => self
+                .items
+                .first()
+                .or_else(|| self.file_rows.first())
+                .expect("at least one of the two row sources is populated"),
         }
     }
 
@@ -3911,55 +3987,18 @@ impl MxRunApp {
     }
 
     /// Rows for `self.file_hits`, as transient [`Indexed`] entries.
+    ///
+    /// Rows and their `Scored` index list are built **together and assigned
+    /// together**. The previous version pushed onto `self.results` while
+    /// `refresh_search` cleared it, so during typing the two could disagree: the
+    /// list shrank to 7 hits while `results` still held indices from the previous
+    /// 40-hit answer, and the renderer's `file_rows[sc.idx]` panicked with
+    /// `the len is 7 but the index is 7` — killing the process on the spot
+    /// (user report: "输入 @ever 就会退出", 2026-09-19).
     fn build_file_rows(&mut self) {
-        self.file_rows = self
-            .file_hits
-            .iter()
-            .enumerate()
-            .map(|(i, hit)| {
-                let name = std::path::Path::new(&hit.path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| hit.path.clone());
-                let item = Item {
-                    // Transient by construction: this id never reaches the store,
-                    // it only has to be unique among these rows.
-                    id: format!("file:{i}:{}", hit.path),
-                    title: name,
-                    // The folder, not the whole path: the file name is already the
-                    // title, and a full path wraps to two lines, which makes every
-                    // row a different height.
-                    subtitle: folder_of(&hit.path),
-                    keywords: vec![hit.path.clone()],
-                    actions: vec![Action::open(&hit.path)],
-                    arg: ArgSpec::default(),
-                    launch: LaunchMode::Normal,
-                    source: Source {
-                        provider: "file".to_string(),
-                        external_id: hit.path.clone(),
-                    },
-                    health: Health::Ok,
-                };
-                Indexed {
-                    searchable: item.haystack().to_lowercase(),
-                    title_chars: item.title.chars().count(),
-                    keywords_lower: vec![hit.path.to_lowercase()],
-                    frec_bonus: 0.0,
-                    launches: self.file_opened.get(&hit.path).copied().unwrap_or(0),
-                    last_used: hit.modified,
-                    item,
-                }
-            })
-            .collect();
-        for idx in 0..self.file_rows.len() {
-            self.results.push(Scored {
-                idx,
-                // Everything already ranked; the row order *is* the ranking.
-                score: (self.file_rows.len() - idx) as f64,
-                strong: true,
-                hit_indices: Vec::new(),
-            });
-        }
+        let (rows, scores) = file_rows_for(&self.file_hits, &self.file_opened);
+        self.file_rows = rows;
+        self.results = scores;
         self.selected = self.selected.min(self.results.len().saturating_sub(1));
     }
 
@@ -5148,10 +5187,13 @@ impl MxRunApp {
     }
 
     fn name_layout_job(&self, sc: &Scored) -> LayoutJob {
-        let item = if self.file_mode {
-            &self.file_rows[sc.idx]
+        // `get`, never `[]`: a stale index must draw nothing, not kill the app.
+        let Some(item) = (if self.file_mode {
+            self.file_rows.get(sc.idx)
         } else {
-            &self.items[sc.idx]
+            self.items.get(sc.idx)
+        }) else {
+            return LayoutJob::default();
         };
         let name = &item.item.title;
         let mut job = LayoutJob::default();
@@ -6328,10 +6370,14 @@ impl MxRunApp {
             let sc = &self.results[row];
             // A field slice, not `self.row(..)`: a method call borrows all of
             // `self`, and this body needs `self.icons` mutably at the same time.
-            let item = if self.file_mode {
-                &self.file_rows[sc.idx]
+            // `get` + `continue`: this is the line that used to panic and take the
+            // process with it when `results` and `file_rows` disagreed.
+            let Some(item) = (if self.file_mode {
+                self.file_rows.get(sc.idx)
             } else {
-                &self.items[sc.idx]
+                self.items.get(sc.idx)
+            }) else {
+                continue;
             };
             let selected = row == self.selected;
             let bg = if selected {
@@ -6881,10 +6927,14 @@ impl MxRunApp {
             .show(ui, |ui| {
                 for row in 0..self.results.len() {
                     let sc = &self.results[row];
-                    let indexed = if self.file_mode {
-                        &self.file_rows[sc.idx]
+                    // `get` + `continue`, for the same reason as the launcher's
+                    // loop: a stale index skips a row instead of panicking.
+                    let Some(indexed) = (if self.file_mode {
+                        self.file_rows.get(sc.idx)
                     } else {
-                        &self.items[sc.idx]
+                        self.items.get(sc.idx)
+                    }) else {
+                        continue;
                     };
                     let item = &indexed.item;
                     let is_armed = armed.as_deref() == Some(item.id.as_str());
@@ -7531,6 +7581,57 @@ mod tests {
         // The two AltRun-intended forms still count.
         assert!(modifier_is_clean_digit_command(&Modifiers::CTRL));
         assert!(modifier_is_clean_digit_command(&Modifiers::ALT));
+    }
+
+    /// The `@` row builder must keep rows and their index list in step, and must
+    /// not accumulate across rebuilds.
+    ///
+    /// This is the regression test for a real crash: `build_file_rows` used to
+    /// *push* onto `results` while `refresh_search` cleared it, so typing
+    /// `@ever` left indices from the previous 40-hit answer in a 7-row list and
+    /// the renderer panicked with `the len is 7 but the index is 7`, killing the
+    /// process (user report, 2026-09-19).
+    #[test]
+    fn file_rows_and_scores_stay_in_step() {
+        let hit = |name: &str| filesearch::FileHit {
+            path: format!(r"D:\files\{name}"),
+            is_dir: false,
+            modified: 1_700_000_000,
+        };
+        let opened = std::collections::HashMap::new();
+
+        // A wide answer…
+        let wide: Vec<filesearch::FileHit> = (0..40).map(|i| hit(&format!("a{i}.txt"))).collect();
+        let (rows, scores) = file_rows_for(&wide, &opened);
+        assert_eq!(rows.len(), 40);
+        assert_eq!(scores.len(), rows.len(), "one score per row");
+        assert!(scores.iter().all(|sc| sc.idx < rows.len()), "indices in range");
+
+        // …followed by a narrow one: every index must point into the *new* rows.
+        let narrow: Vec<filesearch::FileHit> = (0..7).map(|i| hit(&format!("b{i}.txt"))).collect();
+        let (rows, scores) = file_rows_for(&narrow, &opened);
+        assert_eq!(rows.len(), 7);
+        assert_eq!(scores.len(), 7, "no leftovers from the previous answer");
+        for sc in &scores {
+            assert!(
+                sc.idx < rows.len(),
+                "index {} would panic on a {}-row list",
+                sc.idx,
+                rows.len()
+            );
+        }
+        // The row content follows the hits, and the open-count is carried in.
+        assert!(rows[0].item.title.starts_with('b'), "new hits, not old ones");
+
+        let mut opened = std::collections::HashMap::new();
+        opened.insert(r"D:\files\b3.txt".to_string(), 5u32);
+        let (rows, _) = file_rows_for(&narrow, &opened);
+        assert_eq!(rows[3].launches, 5, "opened-before count reaches the row");
+        assert_eq!(rows[0].launches, 0);
+
+        // An empty answer is a valid, empty pair.
+        let (rows, scores) = file_rows_for(&[], &opened);
+        assert!(rows.is_empty() && scores.is_empty());
     }
 
     /// The prefix table is the one place that decides which mode the box is in,
