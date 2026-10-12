@@ -102,6 +102,70 @@ fn exe_build_stamp() -> String {
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
     )
 }
+/// Who owns the foreground right now, as `class "title" (process)`.
+///
+/// Written into the log when the card hides itself because it lost focus. Without
+/// it, "the window vanished while I typed" cannot be told apart from "another
+/// program grabbed the foreground", and the wrong half gets debugged.
+fn foreground_report() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return "没有前台窗口".to_string();
+        }
+        let mut class = [0u16; 128];
+        let n = GetClassNameW(hwnd, &mut class);
+        let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+        let mut title = [0u16; 160];
+        let n = GetWindowTextW(hwnd, &mut title);
+        let title = String::from_utf16_lossy(&title[..n.max(0) as usize]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let process = if pid == 0 {
+            "?".to_string()
+        } else {
+            process_name_of(pid).unwrap_or_else(|| format!("pid {pid}"))
+        };
+        format!(
+            "{process} · {class} · {}",
+            truncate_chars(title.trim(), 40)
+        )
+    }
+}
+
+/// The image name of a process id, without pulling in a whole process API.
+fn process_name_of(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        PROCESS_NAME_FORMAT,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        if ok.is_err() {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        Some(
+            std::path::Path::new(&full)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(full),
+        )
+    }
+}
+
 /// The folder a file lives in, shortened from the left so the interesting end
 /// (the last two levels) survives: `…\Network\Reporting`. Used as a file row's
 /// detail line — the file name is already the title.
@@ -962,7 +1026,7 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
                 wh as i32,
                 flags,
             );
-            let _ = SetForegroundWindow(hwnd);
+            force_foreground(hwnd);
         },
         // Should not happen now that the handle lookup no longer requires the
         // window to be visible, but if it does the show is a silent no-op —
@@ -970,6 +1034,57 @@ fn show_window_sized(ctx: &egui::Context, size: Option<[f32; 2]>) {
         None => log_line("show: main window handle not found"),
     }
     ctx.request_repaint();
+}
+
+/// Take the foreground, the way that actually works from a background process.
+///
+/// `SetForegroundWindow` alone is **refused** unless the calling process already
+/// owns the foreground (Windows' foreground-lock). A launcher summonned by a
+/// global hotkey is exactly that case, so the plain call left the card *visible
+/// but unfocused* — and the "hide when focus is lost" rule then made it vanish
+/// ~300 ms later. The user saw it as "typing `@` closes the window"
+/// (2026-09-19); the log said `hide: lost focus — explorer.exe · Progman ·
+/// Program Manager`, i.e. the foreground had fallen back to the desktop.
+///
+/// Two standard steps, cheapest first:
+/// 1. attach to the current foreground thread, set foreground, detach;
+/// 2. if that still failed, tap `Alt` — a synthetic key press is a documented way
+///    to be allowed to steal the foreground.
+///
+/// Every outcome is logged, because "did the card really get the focus?" is
+/// unanswerable from the outside (see [`foreground_report`]).
+fn force_foreground(hwnd: HWND) {
+    use windows::Win32::System::Threading::AttachThreadInput;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, keybd_event};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        if foreground_is_ours() {
+            return;
+        }
+        let fg = GetForegroundWindow();
+        let target_thread = GetWindowThreadProcessId(fg, None);
+        let this = windows::Win32::System::Threading::GetCurrentThreadId();
+        let attached = target_thread != 0
+            && target_thread != this
+            && AttachThreadInput(target_thread, this, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(target_thread, this, false);
+        }
+        if !foreground_is_ours() {
+            // Last resort: the Alt tap.
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+            let _ = SetForegroundWindow(hwnd);
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        if !foreground_is_ours() {
+            log_line(&format!(
+                "show: could not take the foreground — {}",
+                foreground_report()
+            ));
+        }
+    }
 }
 
 /// Where the user last dragged the card (AltRun's WinTop/WinLeft).///
@@ -1149,6 +1264,12 @@ fn applied_size_of(hwnd: HWND) -> [f32; 2] {
 /// None (see the README pitfall notes), and `focused` is no more trustworthy.
 /// Anything owned by this process counts as "still ours", so an open dialog or
 /// an IME window does not dismiss the launcher.
+/// Has the card held the foreground since it was last shown?
+///
+/// The focus-loss rule needs it (2026-09-19): hiding a window that never got the
+/// focus is not "the user looked away", it is us giving up before we started.
+static FOCUS_EVER_HELD: AtomicBool = AtomicBool::new(false);
+
 fn foreground_is_ours() -> bool {
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
@@ -5600,6 +5721,11 @@ impl eframe::App for MxRunApp {
         if visible && !self.prev_visible {
             self.want_focus = true;
             self.shown_at = Some(std::time::Instant::now());
+            // A fresh summon has not had the focus yet: the "hide when focus is
+            // lost" rule below must not fire before it does, or a card that
+            // Windows refuses to foreground (see `force_foreground`) would hide
+            // itself 300 ms later — the "typing @ closes the window" report.
+            FOCUS_EVER_HELD.store(false, Ordering::Relaxed);
             // Start the summon animation (fade + a small rise).
             self.anim = (anim_ms() > 0.0).then(std::time::Instant::now);
         }
@@ -5658,19 +5784,29 @@ impl eframe::App for MxRunApp {
         // after ~300 ms and no picture of the UI could be taken (see
         // docs/开发进度.md §7 pitfall 12).
         let keep_open = std::env::var("MXRUN_KEEP_OPEN").is_ok();
+        // Remember that the card really did have the focus, and only hide on
+        // *losing* it. Without this, a card that Windows refused to foreground
+        // (see `force_foreground`) hid itself 300 ms after appearing, which the
+        // user experienced as "typing `@` closes the window" (2026-09-19).
+        if visible && foreground_is_ours() {
+            FOCUS_EVER_HELD.store(true, Ordering::Relaxed);
+        }
         if visible
             && !keep_open
             && !self.view_settings
+            && FOCUS_EVER_HELD.load(Ordering::Relaxed)
             && self
                 .shown_at
                 .is_some_and(|t| t.elapsed() > Duration::from_millis(300))
             && !foreground_is_ours()
         {
-            log_line("hide: lost focus");
+            // Say **who** took the foreground: "lost focus" alone left a user's
+            // report ("typing @ closes the window") undiagnosable, because the
+            // thief is usually another program entirely (2026-09-19).
+            log_line(&format!("hide: lost focus — {}", foreground_report()));
             hide_window(&ctx);
             return;
         }
-
         // Global key handling (order matters: settings capture eats keys first,
         // then the add card, then the parameter prompt — each owns the keyboard
         // while it is open).

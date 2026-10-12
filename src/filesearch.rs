@@ -288,6 +288,17 @@ pub fn search(
 ) -> Result<Vec<FileHit>, String> {
     let fetch = limit.saturating_mul(OVERFETCH).clamp(1, MAX_FETCH);
     let mut cmd = std::process::Command::new(es);
+    // **No console window.** A GUI process that spawns a console program gets a
+    // console allocated for it, and that flash takes the foreground — the
+    // launcher hides itself on focus loss, so searching made the whole card
+    // vanish (user report, 2026-09-19: "输入一个 @ 后窗口就关闭了"; the log line
+    // was `hide: lost focus`, not an execute).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.arg("-n").arg(fetch.to_string());
     // Newest first as the *candidate* order: we re-rank anyway, and recency is
     // the better prior when a query matches thousands of files.
