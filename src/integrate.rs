@@ -73,15 +73,27 @@ pub(crate) fn ensure_com() {
 /// piling up duplicates — and keeps the launch counter attached to it.
 pub fn item_from_path(raw: &str) -> Item {
     let cleaned = raw.trim().trim_matches('"').trim();
-    let target = resolve_target(cleaned);
-    let title = keyword_for(cleaned, &target);
+    // Two different questions, deliberately answered separately: `path` is the
+    // file (`GetPath`) — it names the item — while `command` is the command line
+    // (`GetPath` + `GetArguments`), which is what actually runs.
+    let path = resolve_target(cleaned);
+    let args = lnk_arguments(Path::new(cleaned));
+    let title = keyword_for(cleaned, &path);
+    let action = match &args {
+        // A shortcut that carries arguments is a *command line*, not a file
+        // name: `"chrome.exe" --app=…` handed to `ShellExecuteW` fails with
+        // "file not found". This is the same split the importer already makes
+        // ("target with arguments → run", §2.7).
+        Some(tail) => Action::run(format!("{path} {tail}")),
+        None => Action::open(&path),
+    };
 
     Item {
         id: String::new(), // filled in by `Store::upsert_from_source`
         title: title.clone(),
         subtitle: String::new(),
         keywords: vec![title],
-        actions: vec![Action::open(&target)],
+        actions: vec![action],
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
         source: Source {
@@ -92,8 +104,8 @@ pub fn item_from_path(raw: &str) -> Item {
     }
 }
 
-/// The string that goes into the command line: `.lnk` files are followed to
-/// their target, everything else is used as given.
+/// The **path** a `.lnk` points at (arguments deliberately left out — see
+/// [`lnk_arguments`]); everything that is not a `.lnk` is used as given.
 fn resolve_target(raw: &str) -> String {
     let path = Path::new(raw);
     let is_lnk = path
@@ -160,7 +172,11 @@ fn url_host(raw: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Follow a `.lnk` to the file it points at. `None` when it cannot be read.
+/// Follow a `.lnk` to the file it points at — **the path alone** (`GetPath`).
+///
+/// This is the right answer for questions about the *file* (does it exist? is it
+/// the same program as that other shortcut?), and a wrong answer for a
+/// *command line*. For that, use [`resolve_lnk_command`].
 pub fn resolve_lnk(path: &Path) -> Option<PathBuf> {
     ensure_com();
     let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
@@ -177,14 +193,82 @@ pub fn resolve_lnk(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
+/// The command line a `.lnk` stands for: `Path + ' ' + Arguments`.
+///
+/// This mirrors AltRun exactly — its `ResolveLink` returns the target and then
+/// appends the shortcut's arguments with a single space
+/// (`untUtilities.pas:881-887`):
+///
+/// ```pascal
+/// Result := buf;                                    // GetPath
+/// if Succeeded(link.GetArguments(buf, sizeof(buf))) then
+///   Result := Result + ' ' + buf;                    // + ' ' + arguments
+/// ```
+///
+/// The distinction is not cosmetic: a shortcut whose arguments carry the payload
+/// (`chrome.exe --app=…`) is a *command line*, and following only `GetPath`
+/// throws the payload away.
+///
+/// Two deliberate departures from AltRun:
+/// * the MSI icon-cache exception lives with the caller, because it is about
+///   "is this a usable command", not about how to read a shortcut;
+/// * empty arguments leave the path **unquoted**, exactly like AltRun — even
+///   when the path contains spaces. That is not a trap here: `Effect::Run`
+///   splits the command line the same way Windows does.
+pub fn resolve_lnk_command(path: &Path) -> Option<String> {
+    let target = resolve_lnk(path)?;
+    let target = target.to_string_lossy().into_owned();
+    if is_msi_icon(Path::new(&target)) {
+        return None;
+    }
+    match lnk_arguments(path) {
+        Some(args) if !args.is_empty() => Some(format!("{target} {args}")),
+        _ => Some(target),
+    }
+}
+
+/// The shortcut's command-line tail (`IShellLink::GetArguments`), if any.
+fn lnk_arguments(path: &Path) -> Option<String> {
+    ensure_com();
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let file: IPersistFile = link.cast().ok()?;
+    let path_w = wide(&path.to_string_lossy());
+    unsafe { file.Load(PCWSTR(path_w.as_ptr()), STGM_READ).ok()? };
+
+    let mut buf = [0u16; 1024];
+    unsafe { link.GetArguments(&mut buf) }.ok()?;
+    let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    let text = String::from_utf16_lossy(&buf[..len]);
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Write a shortcut, so `SendTo` (and anything else shell-based) can point here.
 pub fn create_lnk(target: &Path, lnk: &Path, icon: Option<&Path>) -> Result<(), String> {
+    create_lnk_with_args(target, "", lnk, icon)
+}
+
+/// Same, but the shortcut carries a command-line tail. AltRun resolves `.lnk`
+/// files to `Path + ' ' + Arguments` (`untUtilities.pas:881-887`), so anything
+/// that mirrors that behaviour needs to be able to *build* such a shortcut —
+/// both the tests below and `MXRUN_TEST_LNK` use this.
+pub fn create_lnk_with_args(
+    target: &Path,
+    args: &str,
+    lnk: &Path,
+    icon: Option<&Path>,
+) -> Result<(), String> {
     ensure_com();
     let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
         .map_err(|e| format!("创建 ShellLink 失败：{e}"))?;
     let target_w = wide(&target.to_string_lossy());
     unsafe { link.SetPath(PCWSTR(target_w.as_ptr())) }
         .map_err(|e| format!("SetPath 失败：{e}"))?;
+    if !args.is_empty() {
+        let args_w = wide(args);
+        unsafe { link.SetArguments(PCWSTR(args_w.as_ptr())) }
+            .map_err(|e| format!("SetArguments 失败：{e}"))?;
+    }
     // Working directory = the exe's own folder, so relative things still work.
     if let Some(dir) = target.parent() {
         let dir_w = wide(&dir.to_string_lossy());
@@ -702,6 +786,44 @@ mod tests {
             }
             other => panic!("unexpected effect {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.lnk` that carries arguments must survive as `Path + ' ' + Arguments`.
+    ///
+    /// This is AltRun's contract, read straight out of `ResolveLink`
+    /// (`untUtilities.pas:881-887`):
+    ///
+    /// ```pascal
+    /// Result := buf;                                          // GetPath
+    /// if Succeeded(link.GetArguments(buf, sizeof(buf))) then
+    ///   Result := Result + ' ' + buf;                          // + ' ' + args
+    /// ```
+    ///
+    /// It matters for the "发送到" channel: a shortcut like
+    /// `chrome.exe --app=https://example.com` must become a *command line*, not
+    /// just the exe — otherwise the argument the user baked into the shortcut is
+    /// silently lost when they send it to the launcher.
+    #[test]
+    fn shortcut_arguments_survive_into_the_command_line() {
+        let dir = temp_dir("lnk-args");
+        let target = dir.join("real-target.exe");
+        std::fs::write(&target, b"x").unwrap();
+        let lnk = dir.join("With Args.lnk");
+        let args = r#"--app="C:\Program Files\Thing\thing.exe" --flag"#;
+        create_lnk_with_args(&target, args, &lnk, None).expect("create shortcut with args");
+
+        let item = item_from_path(&lnk.to_string_lossy());
+        let command = match &item.default_action().unwrap().effect {
+            crate::store::Effect::Open { target } => target.clone(),
+            crate::store::Effect::Run { line } => line.clone(),
+            other => panic!("unexpected effect {other:?}"),
+        };
+        assert_eq!(
+            command,
+            format!("{} {args}", target.to_string_lossy()),
+            "the shortcut's arguments must be kept, exactly like AltRun does"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

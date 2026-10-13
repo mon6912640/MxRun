@@ -275,6 +275,26 @@
     - **已有实例在跑** → `HandleID`（INI `[DEBUG]` 缓存的窗口句柄，本机 `67572`）→ `IsWindow` 校验 → `SendMessage(WM_SETTEXT, 1, 路径)`；接收端 `:2767-2777` 用 `WParam = 1` 甄别来源后调 `AddFileShortCut`。`SendMessage` **同步阻塞**——第二个进程要等弹窗流程走完才退出；**主窗口不会显示**（只有 `WM_ALTRUN_SHOW_WINDOW` 才显示）。
     - **没有实例在跑** → 自己 `LoadShortCutList` → `AddFileShortCut` → `Application.Terminate`，主界面全程不出现（一次性加项工具）。此分支在单实例互斥体检查（`:2029`）**之前**就 `Exit`，等于**不走单实例保护**。
   - **预填规则**（`ExtractShortCutItemFromFileName`，`untShortCutMan.pas:799-882`）：`.lnk` 先 `ResolveLink` 解真实目标，**两种例外保留 lnk 本身**（解出为空 / 解出 `%windir%\Installer\{...}` 的 MSI 图标 exe）；**关键字 = 文件名去扩展名**（目录不切扩展名；`http://` 取主机名；Chrome `--app=` 型 lnk 另走分支）；**名称 = 关键字**（同一值）；**命令行 = 完整路径**；**参数类型固定 `rgParam.ItemIndex := 0`（无参数）** → 从"发送到"进来的项**永远不带参数**。
+  - **⚠️ `ResolveLink` 会把 `.lnk` 自带的参数拼进结果**（`untUtilities.pas:881-887`，2026-10-13 补查并实测）：
+    ```pascal
+    Result := buf;                                        // GetPath
+    if Succeeded(link.GetArguments(buf, sizeof(buf))) then
+      Result := Result + ' ' + buf;                        // + ' ' + 参数
+    ```
+    所以"命令行 = 完整路径"**只对不带参数的快捷方式成立**；带参数时命令行 = `目标路径 + ' ' + 参数`。
+    注意这跟上面那句"永远不带参数"**不矛盾**——那句说的是 `ParamType`（用户输入参数的机制），
+    这里说的是 `.lnk` 自己烘焙进去的命令行参数，两回事。
+    - **实测**（造一个 `notepad.exe` + 参数 `%windir%\win.ini` 的 lnk，走 SendTo 同一条代码路径）：
+      解析结果 = `C:\Windows\System32\notepad.exe %windir%\win.ini` ✓
+    - **原版的 Chrome 分支是个 bug**（`:856-866`）：注释里那个例子
+      `chrome.exe --app=https://…` 拼完之后 `ExtractFileName` 得到的是 `--app=https://…`，
+      于是"关键字"变成 `www.douban.com/group/topic/4876691`（一长串网址，打不出来）。
+      **MxRun 有意不照搬**：关键字取目标程序名（`chrome`），命令行照旧带全参数（§2.7 修 `.lnk` 参数时一并做掉）。
+    - **两端都没给"路径含空格 + 带参数"加引号**（原版 `Result + ' ' + buf`；MxRun 同形）。
+      实测（2026-10-13）：`CreateProcessW("C:\Program Files\...\chrome.exe" --version)` 与**不带引号**版本
+      **都能起来** —— 它自带"逐段猜测可执行文件边界"的算法兜住了 ✓。
+      原版走 `ShellExecute`、MxRun 走 `CreateProcessW`，实测都没问题，**不作为差异记录**；
+      但仍然依赖平台宽容（引号才是正解），将来要动这段拼接时记得补引号。
   - **对话框 `frmShortCut`**：模态 + `fsStayOnTop` + `poScreenCenter` + `bsDialog`（494×257，标题"快捷项"，不可缩放）；`FormShow` 先 `SetForegroundWindow`，**焦点落在"快捷项"（关键字）输入框**（`frmShortCut.pas:258-262`）；"确定"是默认按钮（回车确认 / Esc 取消）。
   - **点确定后的连锁**（`untShortCutMan.pas:416-482`）：① 关键字或命令行**任一为空** → 弹"空行已添加."并降级成**空行分隔项**（`scBlank`，三字段清空）；② 命令行含 ALTRun 自身目录 → 弹"使用相对路径替换绝对路径吗？这样便于在U盘上使用"（本例几乎不触发）；③ **关键字重名** → 弹"同名快捷项已存在 [关键字 (名称) = 命令行]，是否替换?"（**只按关键字查重**——全字段严格查重那段已被注释掉，`:447-455`）；④ 通过 → `AppendShortCutItem`（`m_ShortCutList.Add`，**追加到列表末尾**、无 Freq）→ `SaveShortCutList` → `LoadShortCutList`，**运行中的实例立刻可搜到**；⑤ 取消 → 不写任何东西。
 - **shell 右键菜单：源码里有，但是死代码（从未生效）**。`untUtilities.pas:300-333` 的 `AddMeToShortCutMenu` 写 `HKEY_CLASSES_ROOT\*\shell\Add To ALTRun\command` = `"<exe>" "%1"`；只注册 `*\shell`（所有文件），**没有** `Directory`/`Folder`/`Drive`。

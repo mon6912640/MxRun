@@ -692,7 +692,12 @@ pub(crate) fn known_targets(store: &mut Store) -> std::collections::HashSet<Stri
 
 /// The item a Start Menu shortcut becomes.
 fn item_for(name: &str, target: &Path, lnk: &Path) -> Item {
-    let command = target.to_string_lossy().into_owned();
+    // The command line, not the bare exe: a Start Menu shortcut may carry
+    // arguments (`chrome.exe --app=…`), and AltRun keeps them
+    // (`untUtilities.pas:881-887`). `target` stays the *path*, because that is
+    // what identity, dedupe and the system-tool filter are about.
+    let command = integrate::resolve_lnk_command(lnk)
+        .unwrap_or_else(|| target.to_string_lossy().into_owned());
     Item {
         id: String::new(), // filled in by the store: `startmenu:<path>`
         title: name.to_string(),

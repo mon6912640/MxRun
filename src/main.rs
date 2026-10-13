@@ -577,6 +577,14 @@ const SCORE_GATE: f64 = 0.15;
 /// self-contained.
 fn log_line(msg: &str) {
     let path = store::default_data_dir().join("mxrun.log");
+    // The directory may not exist yet, and `OpenOptions::open` would then fail
+    // **silently** (the result is deliberately ignored below) — so any code path
+    // that logs before the database has been created lost its log entirely.
+    // Found the hard way: the `MXRUN_TEST_LNK` hook exits before the store is
+    // opened, and its output went nowhere on a fresh data directory.
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -852,6 +860,25 @@ fn main() -> eframe::Result<()> {
             std::thread::sleep(Duration::from_millis(1000));
         }
         log_line("esspawn: done");
+    }
+
+    // Debug: resolve a `.lnk` from the command line and print what the item
+    // would be (`MXRUN_TEST_LNK=<path>`). Exists to compare against a real
+    // AltRun: a shortcut that carries arguments must resolve to
+    // `Path + ' ' + Arguments` (untUtilities.pas:881-887), and this prints the
+    // answer for *any* .lnk on disk — including ones we did not create.
+    if let Ok(lnk) = std::env::var("MXRUN_TEST_LNK") {
+        let item = integrate::item_from_path(&lnk);
+        let command = match item.default_action().map(|a| &a.effect) {
+            Some(store::Effect::Open { target }) => target.clone(),
+            Some(store::Effect::Run { line }) => line.clone(),
+            other => format!("{other:?}"),
+        };
+        log_line(&format!(
+            "lnk: {lnk} -> keyword={:?} command={:?}",
+            item.title, command
+        ));
+        return Ok(());
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
