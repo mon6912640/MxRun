@@ -340,16 +340,28 @@ fn arg_value(arg: &ArgSpec, typed: Option<&str>) -> Result<Option<String>, Outco
 
 /// Build the final command string for an item: insert the argument, expand
 /// environment variables. Returns the command plus an optional working
-/// directory for relative commands.
+/// directory.
+///
+/// Three answers, in order of authority:
+/// 1. **the item's own `working_dir`** — a `.lnk`'s "start in" (see
+///    [`crate::store::Item::working_dir`]). This is the strongest signal there
+///    is, because it is what the shortcut's author actually configured;
+/// 2. the **launcher's** directory, for commands written with `.\` / `..\`
+///    (AltRun's rule — those paths are relative *to the launcher*);
+/// 3. `None` — let Windows decide (inherit ours), which is right for plain
+///    `C:\…\app.exe` entries: a GUI app does not care where it started.
 pub fn build_command(
     target: &str,
     arg: &ArgSpec,
     typed: Option<&str>,
+    working_dir: Option<&str>,
 ) -> Result<(String, Option<String>), Outcome> {
     let value = arg_value(arg, typed)?;
     let inserted = apply_insert(target, value.as_deref(), arg.insert);
     let command = expand_env(&inserted);
-    let workdir = if wants_launcher_dir(&command) {
+    let workdir = if let Some(dir) = working_dir {
+        Some(dir.to_string())
+    } else if wants_launcher_dir(&command) {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
@@ -573,14 +585,18 @@ pub fn run(item: &Item, action: &Action) -> Outcome {
 /// Same, with the text the user typed into the parameter prompt.
 pub fn run_with_arg(item: &Item, action: &Action, typed: Option<&str>) -> Outcome {
     match &action.effect {
-        Effect::Open { target } => match build_command(target, &item.arg, typed) {
-            Ok((cmd, dir)) => shell_execute(&cmd, dir.as_deref(), item.launch),
-            Err(outcome) => outcome,
-        },
-        Effect::Run { line } => match build_command(line, &item.arg, typed) {
-            Ok((cmd, dir)) => create_process(&cmd, dir.as_deref(), item.launch),
-            Err(outcome) => outcome,
-        },
+        Effect::Open { target } => {
+            match build_command(target, &item.arg, typed, item.working_dir.as_deref()) {
+                Ok((cmd, dir)) => shell_execute(&cmd, dir.as_deref(), item.launch),
+                Err(outcome) => outcome,
+            }
+        }
+        Effect::Run { line } => {
+            match build_command(line, &item.arg, typed, item.working_dir.as_deref()) {
+                Ok((cmd, dir)) => create_process(&cmd, dir.as_deref(), item.launch),
+                Err(outcome) => outcome,
+            }
+        }
         Effect::Builtin { verb } => run_builtin(*verb, typed),
         Effect::Reveal { path } => reveal(path),
         Effect::Copy { text } => copy_to_clipboard(&expand_env(text)),
@@ -661,19 +677,43 @@ mod tests {
     #[test]
     fn prompt_source_reports_needs_input() {
         let arg = ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace };
-        assert_eq!(build_command("cmd /k {p}", &arg, None), Err(Outcome::NeedsInput));
+        assert_eq!(build_command("cmd /k {p}", &arg, None, None), Err(Outcome::NeedsInput));
         // An empty prompt is the same as no prompt: asking again beats running
         // `cmd /k ` with nothing after it.
-        assert_eq!(build_command("cmd /k {p}", &arg, Some("")), Err(Outcome::NeedsInput));
+        assert_eq!(build_command("cmd /k {p}", &arg, Some(""), None), Err(Outcome::NeedsInput));
     }
 
     /// Once the prompt hands the text over, it lands in the marker.
     #[test]
     fn prompt_text_fills_the_marker() {
         let arg = ArgSpec { source: ArgSource::Prompt, encode: Encoder::Raw, insert: InsertMode::Replace };
-        let (cmd, dir) = build_command("cmd /k {p}", &arg, Some("ping 127.0.0.1")).unwrap();
+        let (cmd, dir) = build_command("cmd /k {p}", &arg, Some("ping 127.0.0.1"), None).unwrap();
         assert_eq!(cmd, "cmd /k ping 127.0.0.1");
         assert!(dir.is_none());
+    }
+
+    /// An item that carries its own working directory wins over every other
+    /// rule — that is the whole point of reading a `.lnk`'s "start in".
+    ///
+    /// Real case (2026-10-13): `python -m frontends.tui_v3` only resolves its
+    /// module when it starts inside the project folder.
+    #[test]
+    fn the_items_own_working_directory_wins() {
+        let arg = ArgSpec::default();
+        let (cmd, dir) = build_command(
+            r"C:\Program Files\Python312\python.exe -m frontends.tui_v3",
+            &arg,
+            None,
+            Some(r"R:\generic-agent"),
+        )
+        .unwrap();
+        assert_eq!(cmd, r"C:\Program Files\Python312\python.exe -m frontends.tui_v3");
+        assert_eq!(dir.as_deref(), Some(r"R:\generic-agent"));
+
+        // Even a `.\`-style command yields to it (the item knows better than
+        // the naming convention).
+        let (_, dir) = build_command(r".\ALTRun.ini", &arg, None, Some(r"D:\elsewhere")).unwrap();
+        assert_eq!(dir.as_deref(), Some(r"D:\elsewhere"));
     }
 
     /// The search-template shape: no marker, the encoded query is appended.
@@ -684,7 +724,7 @@ mod tests {
             encode: Encoder::UrlQuery,
             insert: InsertMode::Append,
         };
-        let (cmd, _) = build_command("http://www.baidu.com/s?wd=", &arg, Some("rust 教程")).unwrap();
+        let (cmd, _) = build_command("http://www.baidu.com/s?wd=", &arg, Some("rust 教程"), None).unwrap();
         assert_eq!(cmd, "http://www.baidu.com/s?wd=rust+%E6%95%99%E7%A8%8B");
     }
 
@@ -711,7 +751,7 @@ mod tests {
             insert: InsertMode::Replace,
         };
         // Clipboard is empty in a test run, so only the shape is asserted.
-        let (cmd, dir) = build_command("http://x/?q={%c}", &arg, None).expect("no input needed");
+        let (cmd, dir) = build_command("http://x/?q={%c}", &arg, None, None).expect("no input needed");
         assert!(cmd.starts_with("http://x/?q="));
         assert!(dir.is_none());
     }
@@ -741,6 +781,7 @@ mod tests {
                 insert: InsertMode::Replace,
             },
             launch: LaunchMode::Hidden,
+            working_dir: None,
             source: Default::default(),
             health: Default::default(),
         };

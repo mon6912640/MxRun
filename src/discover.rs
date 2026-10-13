@@ -309,6 +309,9 @@ fn uwp_item_for(name: &str, aumid: &str) -> Item {
         actions: vec![Action::open(&command)],
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
+        // A UWP app is launched by AUMID through the shell: it has no working
+        // directory of its own.
+        working_dir: None,
         source: Source {
             provider: UWP_PROVIDER.to_string(),
             external_id: aumid.to_lowercase(),
@@ -708,6 +711,9 @@ fn item_for(name: &str, target: &Path, lnk: &Path) -> Item {
         actions: vec![Action::open(&command)],
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
+        // A Start Menu shortcut can set "start in" too, and a Start Menu entry
+        // is a `.lnk` like any other (`Item::working_dir`).
+        working_dir: integrate::lnk_working_dir(lnk),
         source: Source {
             provider: PROVIDER.to_string(),
             external_id: lnk.to_string_lossy().to_lowercase(),

@@ -333,6 +333,9 @@ pub fn to_decision(row: &RawRow, line_no: usize, curated: bool) -> Decision {
         actions: vec![Action { label: "默认".into(), effect }],
         arg: args,
         launch,
+        // AltRun's list file has no working-directory column, so nothing to
+        // carry over — the executor decides (see `Item::working_dir`).
+        working_dir: None,
         source: Source {
             provider: "shortcutlist".into(),
             external_id: format!("line:{line_no}"),

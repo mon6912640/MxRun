@@ -96,6 +96,9 @@ pub fn item_from_path(raw: &str) -> Item {
         actions: vec![action],
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
+        // The shortcut's own "start in" directory — the thing that makes
+        // `python -m package` work at all (see `Item::working_dir`).
+        working_dir: lnk_working_dir(Path::new(cleaned)),
         source: Source {
             provider: PROVIDER.to_string(),
             external_id: cleaned.to_lowercase(),
@@ -193,6 +196,29 @@ pub fn resolve_lnk(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
+/// The shortcut's start-in directory (`IShellLink::GetWorkingDirectory`).
+///
+/// A `.lnk` is a launch *recipe*, not a path: it carries a target, arguments,
+/// a working directory and a show-command. Reading only the first two loses the
+/// one thing a relative command depends on. Public because the Start-Menu
+/// scanner reads the same field.
+pub fn lnk_working_dir(path: &Path) -> Option<String> {
+    ensure_com();
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let file: IPersistFile = link.cast().ok()?;
+    let path_w = wide(&path.to_string_lossy());
+    unsafe { file.Load(PCWSTR(path_w.as_ptr()), STGM_READ).ok()? };
+
+    let mut buf = [0u16; 1024];
+    unsafe { link.GetWorkingDirectory(&mut buf) }.ok()?;
+    let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    let text = String::from_utf16_lossy(&buf[..len]);
+    let text = text.trim();
+    // A directory that is gone is worse than none: the process would fail to
+    // start at all instead of inheriting a working directory.
+    (!text.is_empty() && Path::new(text).is_dir()).then(|| text.to_string())
+}
+
 /// The command line a `.lnk` stands for: `Path + ' ' + Arguments`.
 ///
 /// This mirrors AltRun exactly — its `ResolveLink` returns the target and then
@@ -282,6 +308,50 @@ pub fn create_lnk_with_args(
     let lnk_w = wide(&lnk.to_string_lossy());
     unsafe { file.Save(PCWSTR(lnk_w.as_ptr()), true) }
         .map_err(|e| format!("写入快捷方式失败：{e}"))
+}
+
+/// Fill in `working_dir` for items whose source is a `.lnk` but which were
+/// added **before** the launcher read that field (2026-10-13).
+///
+/// The same idea as [`repair_if_registered`]: the registration itself is the
+/// record of intent, so it can be re-derived instead of asking the user to add
+/// the shortcut a second time. Deliberately narrow — it only acts when the
+/// source already *is* a shortcut that is still on disk, so nothing has to be
+/// guessed:
+/// * only when `working_dir` is still `None` (never overwrite a known value);
+/// * only when `source.external_id` names an existing `.lnk`;
+/// * one batch write at the end, so this costs one transaction, not N.
+///
+/// Returns a log line when it changed anything.
+pub fn repair_missing_working_dirs(store: &mut crate::store::Store) -> Option<String> {
+    let items = store.load_items().ok()?;
+    let mut fixed = Vec::new();
+    for mut item in items {
+        if item.working_dir.is_some() {
+            continue;
+        }
+        let src = PathBuf::from(&item.source.external_id);
+        let is_lnk = src
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+        if !is_lnk || !src.is_file() {
+            continue;
+        }
+        let Some(dir) = lnk_working_dir(&src) else {
+            continue;
+        };
+        item.working_dir = Some(dir);
+        fixed.push(item);
+    }
+    if fixed.is_empty() {
+        return None;
+    }
+    let n = fixed.len();
+    // One transaction for the whole batch (`save_items`), not one per item.
+    store.save_items(&fixed);
+    Some(format!(
+        "working-dir: 为 {n} 条快捷方式条目补上了「起始目录」"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +895,38 @@ mod tests {
             "the shortcut's arguments must be kept, exactly like AltRun does"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.lnk` is a launch *recipe*: the "start in" directory is part of it and
+    /// must come along. Without this, a shortcut running `python -m package`
+    /// works from Explorer and fails from the launcher (2026-10-13, user's
+    /// "GA TUI v3" shortcut).
+    #[test]
+    fn shortcut_start_in_directory_is_kept() {
+        let dir = temp_dir("lnk-workdir");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let target = dir.join("real-target.exe");
+        std::fs::write(&target, b"x").unwrap();
+        let lnk = dir.join("With Workdir.lnk");
+        create_lnk_with_args(&target, "-m some.module", &lnk, None).expect("create shortcut");
+
+        // `create_lnk_with_args` sets the working directory to the target's own
+        // folder, so that is what must come back.
+        assert_eq!(
+            lnk_working_dir(&lnk).as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "the shortcut's own start-in directory"
+        );
+        assert_eq!(
+            item_from_path(&lnk.to_string_lossy()).working_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+
+        // A directory that no longer exists must not be handed to CreateProcessW
+        // (that would fail the launch outright).
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lnk_working_dir(&lnk), None, "stale path is dropped");
     }
 
     #[test]

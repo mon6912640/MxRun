@@ -63,6 +63,17 @@ pub struct Item {
     pub actions: Vec<Action>,
     pub arg: ArgSpec,
     pub launch: LaunchMode,
+    /// Where the process must start, when it matters.
+    ///
+    /// Comes from a `.lnk`'s `WorkingDirectory` — a shortcut is a shell-level
+    /// *launch recipe*, and its working directory is the only credential a
+    /// relative command has. Real case (2026-10-13): a desktop shortcut running
+    /// `python -m frontends.tui_v3` with its "start in" (起始位置) set to the
+    /// project folder started fine from Explorer and failed from the launcher,
+    /// because `-m` resolves the module against the *current* directory.
+    ///
+    /// `None` = leave it to the executor (see `exec::build_command`).
+    pub working_dir: Option<String>,
     pub source: Source,
     pub health: Health,
 }
@@ -348,6 +359,8 @@ impl LegacyCommand {
             actions: vec![action],
             arg,
             launch: LaunchMode::Normal,
+            // v1 records never carried a working directory.
+            working_dir: None,
             health: Health::Unknown,
         }
     }
@@ -1132,6 +1145,7 @@ pub fn seed_items() -> Vec<Item> {
         actions: vec![action],
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
+        working_dir: None,
         source: Source { provider: "seed".into(), external_id: id.to_string() },
         health: Health::Unknown,
     };
@@ -1202,12 +1216,20 @@ mod tests {
                 insert: InsertMode::Replace,
             },
             launch: LaunchMode::Maximized,
+            // A neutral drive letter on purpose: the pre-commit hook rejects
+            // real-looking user profile paths (pitfall 17).
+            working_dir: Some(r"R:\projects\thing".into()),
             source: Source { provider: "shortcutlist".into(), external_id: "line:7".into() },
             health: Health::Ok,
         };
         let json = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&json).unwrap();
         assert_eq!(item, back);
+        assert_eq!(
+            back.working_dir.as_deref(),
+            Some(r"R:\projects\thing"),
+            "the shortcut's start-in directory must survive the round trip"
+        );
         assert_eq!(back.default_action().unwrap().label, "运行");
         assert!(back.wants_input());
         assert_eq!(back.icon_target(), Some("cmd /k {p}"));
@@ -1615,6 +1637,7 @@ mod tests {
             actions: vec![Action { label: "默认".into(), effect }],
             arg,
             launch: LaunchMode::Normal,
+            working_dir: None,
             source: Source { provider: provider.into(), external_id: ext.into() },
             health: Health::Unknown,
         };

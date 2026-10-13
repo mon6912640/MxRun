@@ -244,6 +244,7 @@ fn file_stub_item(path: &str) -> Item {
         actions: Vec::new(),
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
+        working_dir: None,
         source: Source {
             provider: "file".to_string(),
             external_id: path.to_string(),
@@ -283,6 +284,7 @@ fn file_rows_for(
                 actions: vec![Action::open(&hit.path)],
                 arg: ArgSpec::default(),
                 launch: LaunchMode::Normal,
+                working_dir: None,
                 source: Source {
                     provider: "file".to_string(),
                     external_id: hit.path.clone(),
@@ -875,9 +877,55 @@ fn main() -> eframe::Result<()> {
             other => format!("{other:?}"),
         };
         log_line(&format!(
-            "lnk: {lnk} -> keyword={:?} command={:?}",
-            item.title, command
+            "lnk: {lnk} -> keyword={:?} command={:?} workdir={:?}",
+            item.title, command, item.working_dir
         ));
+        return Ok(());
+    }
+
+    // Debug: dump what the store actually holds (`MXRUN_SELFTEST_ITEMS=1`).
+    // Written to answer "this entry does not start — what *is* it?" without
+    // guessing: it prints the source identity and the working directory next to
+    // the command, which is exactly what is invisible from the UI.
+    if std::env::var_os("MXRUN_SELFTEST_ITEMS").is_some() {
+        log_line(&format!(
+            "items: data_dir={} exists={}",
+            store::default_data_dir().display(),
+            store::default_data_dir().join("mxrun.redb").exists()
+        ));
+        match Store::open() {
+            Ok(mut store) => {
+                let repaired = integrate::repair_missing_working_dirs(&mut store);
+                if let Some(note) = &repaired {
+                    log_line(&format!("items: {note}"));
+                }
+                match store.load_items() {
+                    Ok(items) => {
+                        log_line(&format!("items: {} in the store", items.len()));
+                        for item in &items {
+                            let command = match item.default_action().map(|a| &a.effect) {
+                                Some(store::Effect::Open { target }) => target.clone(),
+                                Some(store::Effect::Run { line }) => line.clone(),
+                                Some(store::Effect::Reveal { path }) => path.clone(),
+                                Some(store::Effect::Copy { text }) => format!("copy:{text}"),
+                                Some(store::Effect::Builtin { verb }) => format!("builtin:{verb:?}"),
+                                None => "(no action)".into(),
+                            };
+                            log_line(&format!(
+                                "item: id={} provider={} source={} workdir={:?} cmd={:?}",
+                                item.id,
+                                item.source.provider,
+                                item.source.external_id,
+                                item.working_dir,
+                                command
+                            ));
+                        }
+                    }
+                    Err(e) => log_line(&format!("items: load failed: {e}")),
+                }
+            }
+            Err(e) => log_line(&format!("items: store open failed: {e}")),
+        }
         return Ok(());
     }
 
@@ -2206,17 +2254,48 @@ fn health_of(item: &Item) -> Health {
     match icon_source(t) {
         Some(path) if path.is_file() || path.is_dir() => Health::Ok,
         Some(_) => Health::Broken,
-        // No path shape at all (an unquoted command line, say): try PATH by the
-        // head token before calling it broken.
+        // No path shape at all (an unquoted command line, say): try the head of
+        // the command before calling it broken.
+        //
+        // ⚠️ Longest prefix first, **not** the text before the first space: an
+        // unquoted `C:\Program Files\Python312\python.exe -m pkg` would otherwise
+        // be cut at `C:\Program`, resolve nowhere, and be reported as 失效
+        // (measured 2026-10-13 on the user's own entry — a false alarm, since the
+        // same task does start). A path that exists only as a *prefix* of an
+        // unquoted command line is not something to execute, which is exactly
+        // why this is the health *check* and not the executor.
         None => {
-            let head = t.split([' ', '\t']).next().unwrap_or(t);
-            if resolve_in_path(head.trim_matches('"')).is_some() {
+            if head_token_resolves(t) {
                 Health::Ok
             } else {
                 Health::Broken
             }
         }
     }
+}
+
+/// Does the command line start with something that exists — a path, or a bare
+/// name found on `PATH`?
+///
+/// Tries the whole string first, then sheds one space-separated token at a time
+/// (right to left) so paths with spaces survive. Same shape as [`icon_source`],
+/// kept as its own function so the two can be unit-tested apart.
+fn head_token_resolves(command: &str) -> bool {
+    let t = command.trim();
+    if std::path::Path::new(t).exists() {
+        return true;
+    }
+    let mut end = t.len();
+    while let Some(cut) = t[..end].rfind(' ') {
+        let head = t[..cut].trim();
+        if !head.is_empty() {
+            if std::path::Path::new(head).exists() || resolve_in_path(head).is_some() {
+                return true;
+            }
+        }
+        end = cut;
+    }
+    false
 }
 
 /// Is any of this process's top-level windows on screen right now?
@@ -3212,7 +3291,7 @@ impl MxRunApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         install_cjk_font(&cc.egui_ctx);
 
-        let store = Store::open().map_err(|e| {
+        let mut store = Store::open().map_err(|e| {
             format!(
                 "无法打开数据文件 mxrun.redb：{e}\n\
                  （可能仍有另一个 MxRun 实例在运行，或文件被其他程序占用）"
@@ -3249,6 +3328,14 @@ impl MxRunApp {
             integrate::autostart_enabled(),
             silent_start()
         ));
+
+        // Items added from a `.lnk` before 2026-10-13 have no start-in
+        // directory, because the launcher did not read that field yet. Re-derive
+        // it from the shortcut that is still sitting there — the user should not
+        // have to right-click the same file twice for a bug fix to reach them.
+        if let Some(note) = integrate::repair_missing_working_dirs(&mut store) {
+            log_line(&format!("integration: {note}"));
+        }
 
         // A machine whose Explorer has never heard of MxRun gets asked once
         // (see `integrate::mark_integration_asked`). Skipped when the window is
@@ -4099,6 +4186,28 @@ impl MxRunApp {
         let mut examples: Vec<String> = Vec::new();
         for indexed in self.items.iter_mut() {
             let health = health_of(&indexed.item);
+        if health == Health::Broken {
+            // Say *why*, not just "broken": diagnosing this by reading the code
+            // again is exactly what went wrong on 2026-10-13, when an unquoted
+            // path with spaces was reported as 失效 while the same task started
+            // fine from a console.
+            log_line(&format!(
+                "health: 失效判定 {} -> {:?}（首段能否解析={}）",
+                indexed.item.title,
+                indexed.item.default_action().map(|a| &a.effect),
+                indexed
+                    .item
+                    .default_action()
+                    .map(|a| match &a.effect {
+                        Effect::Open { target } | Effect::Reveal { path: target } => {
+                            head_token_resolves(&exec::expand_env(target))
+                        }
+                        Effect::Run { line } => head_token_resolves(&exec::expand_env(line)),
+                        _ => true,
+                    })
+                    .unwrap_or(true)
+            ));
+        }
             if health == Health::Broken {
                 broken += 1;
                 if examples.len() < 5 {
@@ -8089,6 +8198,7 @@ mod tests {
             }],
             arg: Default::default(),
             launch: Default::default(),
+            working_dir: None,
             source: Default::default(),
             health: Health::Unknown,
         };
@@ -8120,6 +8230,21 @@ mod tests {
             })),
             Health::Ok
         );
+        // An **unquoted** program path containing spaces, followed by arguments:
+        // `python.exe -m pkg` from a shortcut. Calling this 失效 is a false alarm
+        // — the task starts fine (measured on the user's own entry, 2026-10-13).
+        let python = r"C:\Program Files\Python312\python.exe";
+        if std::path::Path::new(python).is_file() {
+            assert_eq!(
+                health_of(&mk(Effect::Run {
+                    line: format!("{python} -m frontends.tui_v3")
+                })),
+                Health::Ok,
+                "an unquoted path with spaces must not be cut at the first space"
+            );
+            assert!(head_token_resolves(&format!("{python} -m frontends.tui_v3")));
+            assert!(!head_token_resolves(r"C:\Program Files\NoSuchThing\x.exe -m y"));
+        }
         assert_eq!(
             health_of(&mk(Effect::Run {
                 line: "cmd /k echo hi".to_string()
