@@ -24,13 +24,42 @@ $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 if (-not (Test-Path $cargo)) { $cargo = 'cargo' }
 $env:PATH = "D:\work\mingw64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 
+# 仓库里的 .ps1 必须是 UTF-8 with BOM：PowerShell 5.1 读无 BOM 的 UTF-8 会按 GBK 解析，
+# 中文注释当场变成语法错误。这个坑踩过四次（改脚本的编辑工具会把 BOM 剥掉），
+# 所以打包前把 tools\ 整个过一遍 parser —— 别把跑不起来的脚本发出去。
+foreach ($s in (Get-ChildItem (Join-Path $PSScriptRoot '*.ps1'))) {
+  $bytes = [System.IO.File]::ReadAllBytes($s.FullName)
+  $hasBom = $bytes.Length -gt 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+  $err = $null
+  [void][System.Management.Automation.Language.Parser]::ParseFile($s.FullName, [ref]$null, [ref]$err)
+  if ($err -and $err.Count) { throw "脚本语法错误：$($s.Name) —— $($err[0].Message)" }
+  if (-not $hasBom) { throw "脚本缺 UTF-8 BOM（PowerShell 5.1 会按 GBK 解析）：$($s.Name)" }
+}
+Write-Host 'tools\*.ps1：BOM 与语法自检通过' -ForegroundColor DarkGray
+
 if (-not $SkipBuild) {
   Write-Host '先跑测试，再构建 release…' -ForegroundColor Cyan
   Get-Process *mxrun* -ErrorAction SilentlyContinue | Stop-Process -Force   # exe 被占用会 os error 5
-  & $cargo test 2>&1 | Select-String -Pattern 'test result:' | ForEach-Object { Write-Host "   $_" }
-  if ($LASTEXITCODE -ne 0) { throw '测试没全过，不打包（先修好再发）' }
-  & $cargo build --release
-  if ($LASTEXITCODE -ne 0) { throw '构建失败' }
+
+  # ⚠️ 成败只看 `$LASTEXITCODE`，不要开着 `$ErrorActionPreference = 'Stop'` 去调 cargo：
+  # PowerShell 5.1 把子进程写到 **stderr** 的每一行都包成 ErrorRecord（cargo 正常编译
+  # 也往 stderr 写），Stop 会当场把脚本打断 —— 2026-10-13 第一次打包 v0.1.1 就是这么
+  # 在"编译成功"之后自己中止的。原生命令用 `cmd /c` 跑，退出码才是唯一判据。
+  cmd /c "`"$cargo`" test > `"$root\.package-test.log`" 2>&1"
+  if ($LASTEXITCODE -ne 0) {
+    Select-String -Path "$root\.package-test.log" -Pattern 'FAILED|panicked|^error' | Select-Object -First 10 |
+      ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
+    throw '测试没全过，不打包（先修好再发）'
+  }
+  Select-String -Path "$root\.package-test.log" -Pattern 'test result:' |
+    ForEach-Object { Write-Host "   $($_.Line.Trim())" }
+
+  cmd /c "`"$cargo`" build --release > `"$root\.package-build.log`" 2>&1"
+  if ($LASTEXITCODE -ne 0) {
+    Get-Content "$root\.package-build.log" -Tail 15 | ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
+    throw '构建失败'
+  }
+  Get-Content "$root\.package-build.log" -Tail 1 | ForEach-Object { Write-Host "   $($_.Trim())" -ForegroundColor DarkGray }
 }
 
 $exe = Join-Path $root 'target\release\mxrun.exe'
@@ -104,6 +133,13 @@ Ctrl+L          最近用过的列表
 Q: 第一次打开被 Windows 拦了（"Windows 已保护你的电脑"）？
 A: 这是未签名程序的正常提示。点"更多信息" → "仍要运行"。
    杀软误报也一样，加信任即可。
+
+Q: 某个快捷方式双击能用，从 MxRun 里却起不来（窗口一闪就没了）？
+A: 这多半是"起始位置"的问题 —— 例如命令行是
+   `python.exe -m 模块名` 或用了相对路径的快捷方式，必须**在它自己的目录里**启动。
+   现在的版本会自动读取快捷方式的"起始位置"并照它启动。
+   如果你那条是很早以前加的，**把桌面那个快捷方式再"发送到 → MxRun"一次**即可
+   （同一个文件再加一次是"更新"，不会变成两条，启动次数也不会丢）。
 
 Q: 数据在哪？
 A: 便携模式（本包默认）= 程序旁边的 data\ 文件夹。

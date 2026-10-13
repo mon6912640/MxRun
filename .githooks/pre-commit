@@ -46,6 +46,20 @@ if git diff --cached --name-only | grep -q '^docs/ALTRun\.ahk$'; then
     fail=1
 fi
 
+# --- 3. PowerShell scripts must be UTF-8 with BOM ---------------------------
+# Windows PowerShell 5.1 reads a BOM-less UTF-8 script as GBK, which turns
+# Chinese comments into syntax errors ("Missing closing '}'"). Editing tools
+# strip the BOM, so this has happened four times — check the blob, not the
+# working copy, because the working copy is what git is about to store.
+for f in $(git diff --cached --name-only --diff-filter=ACM | grep '\.ps1$'); do
+    bom=$(git cat-file -p ":$f" | head -c 3 | od -An -tx1 | tr -d ' \n')
+    if [ "$bom" != "efbbbf" ]; then
+        echo "pre-commit: 拒绝提交 —— $f 缺 UTF-8 BOM（PowerShell 5.1 会按 GBK 解析）" >&2
+        echo "  修：把 EF BB BF 补回文件开头（字节级操作，别走 Get-Content/Set-Content）" >&2
+        fail=1
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "如果你确认这些内容可以公开，用 git commit --no-verify 跳过。" >&2
