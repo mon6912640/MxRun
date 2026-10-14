@@ -2610,7 +2610,82 @@ enum MenuAction {
     Edit,
     Delete,
     Reveal,
+    /// Copy the command line (`Ctrl+C` outside `@` mode).
+    CopyCommand,
+    /// Show the shell's property sheet (`ShellExecuteEx` + `properties`).
+    Properties,
 }
+
+/// Which list a row belongs to. The two menus share one definition
+/// ([`row_menu`]) and differ only in what makes sense for that list —
+/// previously each was written out by hand, so adding an entry meant editing
+/// five places and remembering both lists (2026-10-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// A launcher result row (an item, or a transient `@` file row).
+    Result,
+    /// A row of 快捷项管理.
+    Manager,
+}
+
+impl MenuAction {
+    /// Menu text, keyboard shortcut included. The hint is the whole point of
+    /// putting a shortcut in a menu.
+    fn label(&self) -> &'static str {
+        match self {
+            MenuAction::Edit => "编辑 (F2)",
+            MenuAction::Delete => "删除 (Delete)",
+            MenuAction::Reveal => "打开所在目录 (Ctrl+D)",
+            MenuAction::CopyCommand => "复制命令行 (Ctrl+C)",
+            MenuAction::Properties => "文件属性",
+        }
+    }
+}
+
+/// The entries of a row's context menu, in order.
+///
+/// Entries that cannot work for *this* row are left out rather than shown
+/// disabled — AltRun did the same (it hid 打开所在目录 unless the target was a
+/// real directory). `has_command` decides whether the command/text entries are
+/// meaningful at all: a separator-only row or a 内建动作 has no command line, and
+/// 属性 needs a path.
+fn row_menu(kind: RowKind, has_command: bool, has_path: bool) -> Vec<MenuAction> {
+    let mut out = vec![MenuAction::Edit, MenuAction::Delete, MenuAction::Reveal];
+    if has_path {
+        out.push(MenuAction::Properties);
+    }
+    if has_command {
+        out.push(MenuAction::CopyCommand);
+    }
+    let _ = kind; // both lists currently offer the same set; kept for future divergence
+    out
+}
+
+/// Render a row's context menu and report the chosen entry.
+///
+/// One function for the launcher and the manager: they may not drift apart.
+fn row_menu_ui(
+    ui: &mut egui::Ui,
+    kind: RowKind,
+    has_command: bool,
+    has_path: bool,
+) -> Option<MenuAction> {
+    let mut chosen = None;
+    let items = row_menu(kind, has_command, has_path);
+    // `into_iter`: `MenuAction` is `Copy`, and `label(self)` takes it by value.
+    for (i, action) in items.into_iter().enumerate() {
+        // A rule before the "what it does with a file" group.
+        if i > 0 && matches!(&action, MenuAction::Properties) {
+            ui.separator();
+        }
+        if ui.button(action.label()).clicked() {
+            chosen = Some(action);
+            ui.close();
+        }
+    }
+    chosen
+}
+
 
 /// The manager's "where did this come from" filter. Auto-discovered items are
 /// the ones worth reviewing in bulk, so they get their own switch.
@@ -4286,7 +4361,7 @@ impl MxRunApp {
             self.file_error = Some(msg.to_string());
             self.file_hits.clear();
             // The status bar says it too: that is where the eye lands first.
-            self.status = format!("文件搜索不可用：{msg}");
+            self.note_status(format!("文件搜索不可用：{msg}"));
             return;
         }
 
@@ -4309,24 +4384,60 @@ impl MxRunApp {
                     modified: 0,
                 })
                 .collect();
-            self.status = if self.file_hits.is_empty() {
+            let status = if self.file_hits.is_empty() {
                 "文件搜索 · 输入关键字开始搜索（Everything 索引）".to_string()
             } else {
                 format!("文件搜索 · 最近打开过的 {} 个文件", self.file_hits.len())
             };
-        } else if self.file_answered == query {
-            // Already have the answer for exactly this text.
-        } else if self.file_job.is_some() {
-            // A search is in flight; keep showing the previous rows for a frame
-            // or two rather than flickering to empty.
-            self.status = format!("文件搜索「{query}」· 搜索中…");
+            self.note_status(status);
         } else {
-            // Start the debounce clock; `poll_file_search` fires it.
-            self.file_pending = Some((query.clone(), std::time::Instant::now()));
-            self.status = format!("文件搜索「{query}」· 搜索中…");
+            // A query that is neither answered nor in flight needs its debounce
+            // clock started. Doing it here as well as in `poll_file_search`
+            // covers the frame where the input changed but the poll ran first.
+            if self.file_answered != query && self.file_job.is_none() {
+                // The previous query's failure says nothing about this one; a
+                // stale error would be shown as this query's answer.
+                self.file_error = None;
+                match &self.file_pending {
+                    Some((pending, _)) if *pending == query => {}
+                    _ => self.file_pending = Some((query.clone(), std::time::Instant::now())),
+                }
+            }
+            // One status for all three cases, derived from the state itself —
+            // see `file_status`. Writing it from two places is what let the bar
+            // stick on 搜索中… (2026-10-13).
+            let status = self.file_status(&query);
+            self.note_status(status);
         }
 
         self.build_file_rows();
+    }
+
+    /// What the status bar says in `@` mode, derived from the search state.
+    fn file_status(&self, query: &str) -> String {
+        if let Some(err) = &self.file_error {
+            return format!("文件搜索失败：{err}");
+        }
+        if self.file_answered == query {
+            return if self.file_hits.is_empty() {
+                "没有匹配的文件（Everything 索引里没找到）".to_string()
+            } else {
+                format!("{} 个结果 · {}", self.file_hits.len(), Prefix::Files.hint())
+            };
+        }
+        format!("文件搜索「{query}」· 搜索中…")
+    }
+
+    /// Assign the status bar and log a transition. The log line is not
+    /// decoration: "the bar is stuck on 搜索中…" is only diagnosable if the
+    /// frames that set it are visible (2026-10-13).
+    fn note_status(&mut self, status: String) {
+        if self.status != status {
+            if self.file_mode {
+                log_line(&format!("status: {:?} -> {:?}", self.status, status));
+            }
+            self.status = status;
+        }
     }
 
     /// Rows for `self.file_hits`, as transient [`Indexed`] entries.
@@ -4356,6 +4467,23 @@ impl MxRunApp {
                     // Drop answers for text the user has already moved past.
                     if Prefix::Files.strip(&self.input) == query {
                         self.apply_file_result(query, result);
+                    } else {
+                        // ⚠️ The answer was for text that is already gone — drop it,
+                        // **but re-arm the debounce for what is in the box now**.
+                        //
+                        // Without this, the current query is never sent: `file_pending`
+                        // is only set from `refresh_file_rows`, which runs when the
+                        // *input changes*, and the input is no longer changing while the
+                        // user waits. The result was a status bar stuck on 搜索中… that
+                        // only resolved after another keystroke or backspace
+                        // (user report 2026-10-13: "打字打得快的话，状态栏会一直显示搜索中").
+                        let current = Prefix::Files.strip(&self.input).to_string();
+                        log_line(&format!(
+                            "files: dropped stale {:?}, re-arming {:?}",
+                            query, current
+                        ));
+                        self.file_pending = Some((current, std::time::Instant::now()));
+                        ctx.request_repaint_after(Duration::from_millis(FILE_DEBOUNCE_MS));
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -4372,6 +4500,7 @@ impl MxRunApp {
             && Prefix::Files.strip(&self.input) == query
         {
             self.file_pending = None;
+            log_line(&format!("files: sending {:?}", query));
             self.start_file_search(ctx, query);
         }
         // While something is in flight, keep the frames coming so the answer is
@@ -4394,7 +4523,16 @@ impl MxRunApp {
         let ctx = ctx.clone();
         let q = query.clone();
         std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
             let result = filesearch::search(&es, &q, FILE_ROWS, &exclusions, exclusions_on, &opened);
+            // Timing matters for this feature: a query that takes seconds is what
+            // makes keystrokes land "while a search is in flight" (2026-10-13).
+            log_line(&format!(
+                "files: worker {:?} took {}ms ({} hits)",
+                q,
+                t0.elapsed().as_millis(),
+                result.as_ref().map(|h| h.len()).unwrap_or(0)
+            ));
             let _ = tx.send((q, result));
             ctx.request_repaint();
         });
@@ -4417,13 +4555,11 @@ impl MxRunApp {
         self.file_answered = query;
         self.selected = 0;
         self.build_file_rows();
-        self.status = if let Some(err) = &self.file_error {
-            format!("文件搜索失败：{err}")
-        } else if self.file_hits.is_empty() {
-            "没有匹配的文件（Everything 索引里没找到）".to_string()
-        } else {
-            format!("{} 个结果 · {}", self.file_hits.len(), Prefix::Files.hint())
-        };
+        // One derivation for the status text (`file_status`), not a second copy
+        // of the same if/else: two writers is how the bar got stuck on 搜索中…
+        // in the first place (2026-10-13).
+        let status = self.file_status(&self.file_answered.clone());
+        self.note_status(status);
     }
 
     /// Ask the icon worker for the icons of whatever the list currently shows.
@@ -5034,8 +5170,7 @@ impl MxRunApp {
     }
 
     /// `Insert`: a blank card, the same one the right-click path uses.
-    fn request_new(&mut self) {
-        log_line("add: open blank card (Insert)");
+    fn request_new(&mut self) {        log_line("add: open blank card (Insert)");
         self.add = Some(AddForm::blank(""));
         self.want_focus = true;
     }
@@ -5087,6 +5222,41 @@ impl MxRunApp {
         }
     }
 
+    /// The row's command line, if it has one (menu: 复制命令行; the file-only
+    /// entries are hidden when it does not).
+    fn row_command(&self, idx: usize) -> Option<String> {
+        let item = &self.row(idx).item;
+        item.default_action()
+            .and_then(action_command)
+            .map(str::to_string)
+    }
+
+    /// The row's on-disk path, if it points at one that exists.
+    ///
+    /// Deliberately stricter than `icon_target`: a URL, a `shell:AppsFolder`
+    /// UWP entry or a CLSID has no property sheet and nothing to reveal, so
+    /// those menu entries simply do not appear.
+    fn row_existing_path(&self, idx: usize) -> Option<String> {
+        let target = self.row(idx).item.icon_target()?.to_string();
+        let path = icon_source(&target)?;
+        path.exists().then(|| path.to_string_lossy().into_owned())
+    }
+
+    /// Menu: 文件属性 — the shell's own property sheet.
+    fn show_properties(&mut self, path: &str) {
+        match exec::show_properties(path) {
+            exec::Outcome::Started => {
+                log_line(&format!("props: {path}"));
+                self.status = format!("已打开属性：{path}");
+            }
+            exec::Outcome::NeedsInput => {}
+            exec::Outcome::Failed(why) => {
+                log_line(&format!("props: failed {path} -> {why}"));
+                self.status = format!("打不开属性：{why}");
+            }
+        }
+    }
+
     /// `Ctrl+L`: show only what has been used recently (AltRun's 最近列表),
     /// most recent first. Pressing it again goes back to the normal list.
     fn toggle_recent(&mut self) {
@@ -5107,8 +5277,7 @@ impl MxRunApp {
 
     /// `Ctrl+D`: open the folder the selected item lives in, with the file
     /// selected — AltRun's "打开所在目录".
-    fn reveal_selected(&mut self) {
-        let Some(sc) = self.results.get(self.selected) else {
+    fn reveal_selected(&mut self) {        let Some(sc) = self.results.get(self.selected) else {
             return;
         };
         let item = self.row(sc.idx).item.clone();
@@ -6779,7 +6948,7 @@ impl MxRunApp {
         // moved, which `scroll_selected` tracks).
         let mut clicked: Option<usize> = None;
         let mut run_now: Option<usize> = None;
-        let mut menu_action: Option<(usize, MenuAction)> = None;
+        let mut menu_action: Option<(usize, MenuAction, Option<String>)> = None;
         let mut drag_now = false;
         let scroll_selected = std::mem::take(&mut self.scroll_selected);
         // Hover is drawn from the previous frame's state: the background has to
@@ -6998,20 +7167,14 @@ impl MxRunApp {
                 run_now = Some(row);
             }
             // AltRun's list had a right-click menu (添加 / 编辑 / 删除 /
-            // 打开所在目录). Add stays on Insert and the tray; the three that
-            // act on *this* row are here.
+            // 打开所在目录). Add stays on Insert and the tray; the rest are here,
+            // from the one shared definition (`row_menu_ui`) so this list and the
+            // manager's can never drift apart.
+            let has_command = self.row_command(sc.idx).is_some();
+            let path = self.row_existing_path(sc.idx);
             resp.context_menu(|ui| {
-                if ui.button("编辑 (F2)").clicked() {
-                    menu_action = Some((row, MenuAction::Edit));
-                    ui.close();
-                }
-                if ui.button("删除 (Delete)").clicked() {
-                    menu_action = Some((row, MenuAction::Delete));
-                    ui.close();
-                }
-                if ui.button("打开所在目录 (Ctrl+D)").clicked() {
-                    menu_action = Some((row, MenuAction::Reveal));
-                    ui.close();
+                if let Some(action) = row_menu_ui(ui, RowKind::Result, has_command, path.is_some()) {
+                    menu_action = Some((row, action, path.clone()));
                 }
             });
         }
@@ -7030,7 +7193,7 @@ impl MxRunApp {
             self.selected = row;
             self.execute_selected(ctx);
         }
-        if let Some((row, action)) = menu_action {
+        if let Some((row, action, path)) = menu_action {
             self.selected = row;
             match action {
                 MenuAction::Edit => self.open_edit(),
@@ -7039,6 +7202,12 @@ impl MxRunApp {
                     self.request_delete(&ctx);
                 }
                 MenuAction::Reveal => self.reveal_selected(),
+                MenuAction::CopyCommand => self.copy_command(),
+                MenuAction::Properties => {
+                    if let Some(path) = path {
+                        self.show_properties(&path);
+                    }
+                }
             }
         }
 
@@ -7330,7 +7499,7 @@ impl MxRunApp {
         // --- rows ---
         let mut clicked: Option<usize> = None;
         let mut double: Option<usize> = None;
-        let mut menu_action: Option<MenuAction> = None;
+        let mut menu_action: Option<(MenuAction, Option<String>)> = None;
         let armed = self.pending_delete.clone();
         let selected = self.selected;
         // The keyboard arrows move this; hover no longer does.
@@ -7489,18 +7658,14 @@ impl MxRunApp {
                     if resp.double_clicked() {
                         double = Some(row);
                     }
+                    // Same shared definition as the launcher's rows.
+                    let has_command = self.row_command(sc.idx).is_some();
+                    let row_path = self.row_existing_path(sc.idx);
                     resp.context_menu(|ui| {
-                        if ui.button("编辑 (F2)").clicked() {
-                            menu_action = Some(MenuAction::Edit);
-                            ui.close();
-                        }
-                        if ui.button("删除 (Delete)").clicked() {
-                            menu_action = Some(MenuAction::Delete);
-                            ui.close();
-                        }
-                        if ui.button("打开所在目录 (Ctrl+D)").clicked() {
-                            menu_action = Some(MenuAction::Reveal);
-                            ui.close();
+                        if let Some(action) =
+                            row_menu_ui(ui, RowKind::Manager, has_command, row_path.is_some())
+                        {
+                            menu_action = Some((action, row_path.clone()));
                         }
                     });
                 }
@@ -7517,7 +7682,7 @@ impl MxRunApp {
             self.selected = row;
             self.open_edit();
         }
-        if let Some(action) = menu_action {
+        if let Some((action, path)) = menu_action {
             match action {
                 MenuAction::Edit => self.open_edit(),
                 MenuAction::Delete => {
@@ -7525,6 +7690,12 @@ impl MxRunApp {
                     self.request_delete(&ctx);
                 }
                 MenuAction::Reveal => self.reveal_selected(),
+                MenuAction::CopyCommand => self.copy_command(),
+                MenuAction::Properties => {
+                    if let Some(path) = path {
+                        self.show_properties(&path);
+                    }
+                }
             }
         }
         self.check_status_overlap(status_rect, manager_area.inner_rect);
@@ -7864,6 +8035,48 @@ fn build_tray_icon() -> tray_icon::Icon {
 mod tests {
     use super::*;
     use store::{Action, Item, seed_items};
+
+    /// The row menu is derived, not hand-written twice (`row_menu`), so an entry
+    /// that cannot work for a row is **absent** rather than present-and-useless.
+    #[test]
+    fn row_menu_only_offers_what_works_for_that_row() {
+        let full = row_menu(RowKind::Result, true, true);
+        assert_eq!(
+            full,
+            vec![
+                MenuAction::Edit,
+                MenuAction::Delete,
+                MenuAction::Reveal,
+                MenuAction::Properties,
+                MenuAction::CopyCommand,
+            ]
+        );
+        // A 内建动作 ("显示桌面"): no command line to copy, no file to show
+        // properties for.
+        let builtin = row_menu(RowKind::Result, false, false);
+        assert_eq!(
+            builtin,
+            vec![MenuAction::Edit, MenuAction::Delete, MenuAction::Reveal]
+        );
+        // A URL: a command line exists, a property sheet does not — which is why
+        // 属性 is gated on the path *existing*, not on the target being a string.
+        let url = row_menu(RowKind::Result, true, false);
+        assert!(url.contains(&MenuAction::CopyCommand));
+        assert!(!url.contains(&MenuAction::Properties));
+        // Both lists offer the same set today; the parameter exists for future
+        // divergence and this assertion is what would notice it.
+        assert_eq!(row_menu(RowKind::Manager, true, true), full);
+        // Every entry carries its shortcut in the label — discovery is the whole
+        // reason these entries exist.
+        for a in &full {
+            assert!(!a.label().is_empty());
+        }
+        let mut labels: Vec<&str> = full.iter().map(|a| a.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two entries share a label");
+    }
 
     /// Build an indexed item the way `rebuild_index` does, without egui.
     fn index_for(item: Item) -> Indexed {

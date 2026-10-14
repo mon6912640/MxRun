@@ -573,6 +573,34 @@ fn reveal(path: &str) -> Outcome {
     }
 }
 
+/// Show the shell's **property sheet** for a path (the 属性 dialog).
+///
+/// `ShellExecuteExW` plus `SEE_MASK_INVOKEIDLIST`, because the `properties` verb
+/// is served by the shell's *context menu* handler, not by a plain `open`
+/// (a bare `ShellExecuteW("properties", …)` silently does nothing).
+///
+/// The verb brings its own UI, so this is fire-and-forget: Explorer owns the
+/// dialog and it outlives us. `hwnd` is left null — passing our card would make
+/// the sheet modal to a window that hides itself on focus loss.
+pub fn show_properties(path: &str) -> Outcome {
+    use windows::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
+
+    let file = wide(&expand_env(path));
+    let verb = wide("properties");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    match unsafe { ShellExecuteExW(&mut info) } {
+        Ok(()) => Outcome::Started,
+        Err(e) => Outcome::Failed(format!("打不开属性：{e}")),
+    }
+}
+
 /// Run one action. Pure dispatch — all OS work happens in the helpers above.
 ///
 /// Items whose [`ArgSpec`] asks the user for a value cannot be run through
