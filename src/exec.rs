@@ -579,10 +579,18 @@ fn reveal(path: &str) -> Outcome {
 /// is served by the shell's *context menu* handler, not by a plain `open`
 /// (a bare `ShellExecuteW("properties", …)` silently does nothing).
 ///
-/// The verb brings its own UI, so this is fire-and-forget: Explorer owns the
-/// dialog and it outlives us. `hwnd` is left null — passing our card would make
-/// the sheet modal to a window that hides itself on focus loss.
-pub fn show_properties(path: &str) -> Outcome {
+/// **`owner` matters, and passing null was a bug** (found 2026-10-14 from a user
+/// report: "属性弹出来了，但 MxRun 的界面没有消失"). Windows only lets the process
+/// that *currently owns the foreground* hand the foreground on. MxRun is woken by
+/// a hotkey from the background, so a sheet opened with a null owner never became
+/// active — it stayed behind other windows, and the card never saw a focus change
+/// to hide on. Passing our card gives the sheet an owner that legitimately holds
+/// the foreground, which is what makes it come to the front.
+///
+/// The owner also keeps the sheet alive when the card hides: an owned window is
+/// *hidden with* its owner, not destroyed, and it comes straight back when the
+/// card is shown again (verified on the real card before this was written).
+pub fn show_properties(path: &str, owner: Option<HWND>) -> Outcome {
     use windows::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
 
     let file = wide(&expand_env(path));
@@ -590,6 +598,7 @@ pub fn show_properties(path: &str) -> Outcome {
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_INVOKEIDLIST,
+        hwnd: owner.unwrap_or_default(),
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         nShow: SW_SHOWNORMAL.0,

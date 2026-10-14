@@ -5252,11 +5252,26 @@ impl MxRunApp {
     }
 
     /// Menu: 文件属性 — the shell's own property sheet.
-    fn show_properties(&mut self, path: &str) {
-        match exec::show_properties(path) {
+    ///
+    /// Three steps, and the order is what makes it work (2026-10-14):
+    /// 1. **take the foreground for our card** — Windows only lets the process
+    ///    that currently owns the foreground hand it on, and a hotkey wake-up
+    ///    leaves us without it, so the sheet would open *behind* other windows;
+    /// 2. open the sheet with the card as its `owner`;
+    /// 3. **hide the card** — same as every other action ("execute and get out of
+    ///    the way"). The sheet is not destroyed by that: an owned window is
+    ///    hidden with its owner and returns with it, so Alt+F1 brings back both.
+    fn show_properties(&mut self, path: &str, ctx: &egui::Context) {
+        let hwnd = main_hwnd();
+        if let Some(h) = hwnd {
+            force_foreground(h);
+        }
+        let outcome = exec::show_properties(path, hwnd);
+        match outcome {
             exec::Outcome::Started => {
                 log_line(&format!("props: {path}"));
                 self.status = format!("已打开属性：{path}");
+                hide_window(ctx);
             }
             exec::Outcome::NeedsInput => {}
             exec::Outcome::Failed(why) => {
@@ -7214,7 +7229,7 @@ impl MxRunApp {
                 MenuAction::CopyCommand => self.copy_command(),
                 MenuAction::Properties => {
                     if let Some(path) = path {
-                        self.show_properties(&path);
+                        self.show_properties(&path, ctx);
                     }
                 }
             }
@@ -7702,7 +7717,7 @@ impl MxRunApp {
                 MenuAction::CopyCommand => self.copy_command(),
                 MenuAction::Properties => {
                     if let Some(path) = path {
-                        self.show_properties(&path);
+                        self.show_properties(&path, ui.ctx());
                     }
                 }
             }
