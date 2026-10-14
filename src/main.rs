@@ -8010,6 +8010,14 @@ impl MxRunApp {
 /// egui's bundled fonts cover Latin only — without this every Chinese
 /// character shows as an empty box.
 fn install_cjk_font(ctx: &egui::Context) {
+    // Debug: skip the CJK font (`MXRUN_NO_FONT=1`). Exists to *measure* what the
+    // font costs — it is the largest thing we load ourselves (msyh.ttc is
+    // 18.8 MB), and "why is the launcher bigger than AltRun" needs numbers, not
+    // guesses (2026-10-14).
+    if std::env::var_os("MXRUN_NO_FONT").is_some() {
+        log_line("fonts: CJK font skipped (MXRUN_NO_FONT)");
+        return;
+    }
     const CANDIDATES: [&str; 3] = [
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
