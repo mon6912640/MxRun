@@ -3412,6 +3412,15 @@ impl MxRunApp {
             log_line(&format!("integration: {note}"));
         }
 
+        // Give a list that already exists any seed rows it is missing. Deliberately
+        // *after* the repair above and before the index is built; a row the user
+        // deleted is left out (its tombstone is checked) and one they edited is
+        // left untouched (its id is already there).
+        let seeded = store::ensure_seed_items(&mut store);
+        if !seeded.is_empty() {
+            log_line(&format!("seed: added {}", seeded.join(", ")));
+        }
+
         // A machine whose Explorer has never heard of MxRun gets asked once
         // (see `integrate::mark_integration_asked`). Skipped when the window is
         // opening for a right-click add — the user is busy with a card — and

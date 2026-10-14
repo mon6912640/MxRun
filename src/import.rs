@@ -682,7 +682,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mxrun-imp-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::open_at(dir.clone()).unwrap();
-        assert_eq!(store.load_items().unwrap().len(), 6, "fresh db is seeded");
+        // Compare against `seed_items()` rather than a literal: the count is not
+        // the point of this test, and hard-coding it turns adding a seed row into
+        // a spurious failure (it did, when 我的电脑 was added on 2026-10-14).
+        assert_eq!(
+            store.load_items().unwrap().len(),
+            crate::store::seed_items().len(),
+            "fresh db is seeded"
+        );
 
         // Make it look like the user's database: v1 rows migrate with the
         // `legacy` provider, not `seed`.
@@ -699,7 +706,13 @@ mod tests {
         .unwrap();
         let report = import_file(&mut store, &file, true).unwrap();
         assert_eq!(report.imported, 1);
-        assert_eq!(report.removed_seed, 6, "demo items are dropped");
+        // Every demo row that was present went away — count them from
+        // `seed_items()` for the same reason as above.
+        assert_eq!(
+            report.removed_seed,
+            crate::store::seed_items().len(),
+            "demo items are dropped"
+        );
 
         let items = store.load_items().unwrap();
         assert_eq!(items.len(), 1);

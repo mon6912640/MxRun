@@ -1146,6 +1146,10 @@ pub fn seed_items() -> Vec<Item> {
         arg: ArgSpec::default(),
         launch: LaunchMode::Normal,
         working_dir: None,
+        // `external_id` is the id, not empty: a deleted seed row leaves a
+        // tombstone under `(provider, external_id)`, and an empty id would make
+        // that tombstone unrecognisable — the row would come back on the next
+        // start (2026-10-14, when `ensure_seed_items` made that reachable).
         source: Source { provider: "seed".into(), external_id: id.to_string() },
         health: Health::Unknown,
     };
@@ -1156,10 +1160,92 @@ pub fn seed_items() -> Vec<Item> {
         mk("seed-3", "文件资源管理器", "Windows Explorer", &["explorer"], Action::run("explorer.exe")),
         mk("seed-4", "Bing", "搜索引擎", &["bing"], Action::open("https://www.bing.com")),
         mk("seed-5", "GitHub", "代码托管平台", &["github"], Action::open("https://github.com")),
+        // 我的电脑. A CLSID rather than a path, because that is what the shell
+        // itself uses for this folder — no drive letter, no user name, and it
+        // has not changed since Vista (`shell:MyComputerFolder` is the same
+        // object and also works; the CLSID is what AltRun's list stored, and it
+        // goes through `ShellExecuteW` like any other namespace target).
+        //
+        // It cannot be auto-discovered: this folder is not in the Start Menu.
+        // `health_of` returns Ok for `::` targets by design ("cannot check it,
+        // never call it broken"), which is what keeps it out of 失效.
+        mk(
+            "seed-6",
+            "我的电脑",
+            "此电脑 · 驱动器与设备",
+            &["pc", "wodediannao", "wdn", "我的电脑"],
+            Action::open("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+        ),
     ]
 }
 
-/// Frecency bonus: frequency with ~14-day half-life decay.
+/// Meta key: this database has been populated once, so it must never be seeded
+/// again (see [`ensure_seed_items`]).
+const SEEDED_KEY: &str = "seeded";
+
+/// Hand a list that already exists the seed rows it is missing.
+///
+/// `seed_items()` only runs when the database is **created**, so adding a row to
+/// it reaches fresh installs and nobody else — an existing list would never see
+/// 我的电脑 (2026-10-14). This closes that gap per id, which means:
+///
+/// * a row the user **deleted** stays gone (the tombstone is checked first) —
+///   that is the difference between a built-in and a booby trap;
+/// * a row the user **edited** is left alone: the id is already there, so it is
+///   skipped and its keywords / launch count survive;
+/// * inserting by id (not by source) keeps `frec:<id>` attached, so a launch
+///   count never resets.
+///
+/// **And a list that came from somewhere else is never touched.** Someone who
+/// ran `--import` has their own 72 commands; the demo rows were dropped on
+/// purpose and must not reappear next to them. The importer cannot leave a
+/// tombstone for them ("these were never the user's own entries"), so the signal
+/// is a one-way flag instead: once this database has held anything at all, the
+/// seeder is done with it forever.
+///
+/// Returns the titles it added, for the log.
+pub fn ensure_seed_items(store: &mut Store) -> Vec<String> {
+    let Ok(items) = store.load_items() else {
+        return Vec::new();
+    };
+
+    if store.read_meta(SEEDED_KEY).is_none() {
+        // First look at this database under the new rule. It has been populated
+        // from elsewhere if it holds anything that discovery or seeding did not
+        // put there (an imported command, a hand-made row) — from then on this
+        // list is the user's, not ours.
+        let from_elsewhere = items
+            .iter()
+            .any(|i| !matches!(i.source.provider.as_str(), "seed" | "legacy"));
+        store.write_meta(SEEDED_KEY, if from_elsewhere { "foreign" } else { "1" });
+        if from_elsewhere {
+            return Vec::new();
+        }
+    } else if store.read_meta(SEEDED_KEY).as_deref() == Some("foreign") {
+        // Decided once, on the first start after the upgrade. Permanent: an
+        // imported list must never grow demo rows, however many restarts follow.
+        return Vec::new();
+    }
+
+    let mut have: std::collections::HashSet<String> =
+        items.into_iter().map(|i| i.id).collect();
+    let mut added = Vec::new();
+    for item in seed_items() {
+        if have.contains(&item.id) {
+            continue;
+        }
+        if store.is_deleted(&item.source.provider, &item.source.external_id) {
+            continue; // the user deleted it: not ours to re-add
+        }
+        if store.upsert_item(&item).is_ok() {
+            added.push(item.title.clone());
+            have.insert(item.id);
+        }
+    }
+    added
+}
+
+
 /// Returns a value roughly in 0..100 to be added on top of the match score.
 pub fn frecency_bonus(f: &Frecency) -> f64 {
     if f.count == 0 {
@@ -1182,6 +1268,97 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mxrun-test-{tag}-{nanos}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A row added to `seed_items()` after a list already exists must reach it —
+    /// but only if the user has not already made a decision about that row.
+    #[test]
+    fn new_seed_rows_reach_an_existing_list_without_undoing_the_users_choices() {
+        let dir = temp_dir("seed-ensure");
+        let mut store = Store::open_at(dir.clone()).unwrap();
+        let all = seed_items();
+        let target = all.last().unwrap().clone(); // 我的电脑
+
+        // Start from a list that predates this seed row: drop it, then ask.
+        store.delete_item_by_id(&target.id).unwrap();
+        assert!(
+            store.load_items().unwrap().iter().all(|i| i.id != target.id),
+            "precondition: the row is gone"
+        );
+        let added = ensure_seed_items(&mut store);
+        assert_eq!(added, vec![target.title.clone()], "the missing row came back");
+        assert_eq!(
+            store.load_items().unwrap().len(),
+            all.len(),
+            "and nothing else changed"
+        );
+        // Now the user deletes it on purpose. A tombstone must keep it out —
+        // "a built-in that returns after you delete it" is the failure mode this
+        // guard exists for.
+        let stored = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == target.id)
+            .unwrap();
+        store.delete_item(&stored).unwrap();
+        assert!(ensure_seed_items(&mut store).is_empty(), "deleted stays deleted");
+        assert!(store.load_items().unwrap().iter().all(|i| i.id != target.id));
+
+        // An edited row is not "missing": same id, so it is skipped and its
+        // custom keyword survives.
+        let mut edited = target.clone();
+        edited.title = "自定义名字".into();
+        edited.keywords = vec!["mine".into()];
+        store.upsert_item(&edited).unwrap();
+        assert!(ensure_seed_items(&mut store).is_empty(), "an edited row is left alone");
+        let after = store
+            .load_items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == target.id)
+            .unwrap();
+        assert_eq!(after.keywords, vec!["mine".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A list that came from an import has its own commands; the demo rows were
+    /// dropped on purpose and must not come back next to them.
+    ///
+    /// The importer removes them **without** a tombstone ("these were never the
+    /// user's own entries"), so the seeder needs a different signal — and this is
+    /// the test that would catch it reappearing (2026-10-14: adding 我的电脑 to
+    /// `seed_items()` made this reachable, and it would have re-added 计算器 and
+    /// Bing to an imported list on every start).
+    #[test]
+    fn an_imported_list_never_gets_demo_rows_back() {
+        let dir = temp_dir("seed-imported");
+        let store = Store::open_at(dir.clone()).unwrap();
+        // An imported command, exactly as `--import` leaves one behind…
+        store.delete_item_by_id("seed-0").unwrap();
+        store
+            .upsert_item(&Item {
+                id: "shortcutlist:line:23".into(),
+                title: "百度 搜索引擎".into(),
+                keywords: vec!["b".into()],
+                actions: vec![Action::open("http://www.baidu.com/s?wd=")],
+                source: Source {
+                    provider: "shortcutlist".into(),
+                    external_id: "line:23".into(),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let mut store = store;
+
+        // …so the seeder must now leave this database entirely alone, even
+        // though `seed-0` is missing.
+        assert!(ensure_seed_items(&mut store).is_empty(), "an imported list is not ours");
+        let ids: Vec<String> = store.load_items().unwrap().into_iter().map(|i| i.id).collect();
+        assert!(!ids.contains(&"seed-0".to_string()), "the dropped demo row stayed gone");
+        // And it stays decided across restarts.
+        assert!(ensure_seed_items(&mut store).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn legacy_json(id: &str, kind: &str, path: &str, name: &str, desc: &str) -> String {

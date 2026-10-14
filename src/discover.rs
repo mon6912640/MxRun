@@ -51,7 +51,12 @@ pub fn is_discovered_provider(provider: &str) -> bool {
 
 /// Bump when the filtering rules change: the cache key includes it, so a new
 /// rule set re-examines the shortcuts instead of trusting old decisions.
-const SCAN_GEN: u32 = 1;
+///
+/// **gen 2 (2026-10-14)**: titles now come from the shell's localised display
+/// name instead of the `.lnk` file stem. That is a *naming* change, and without
+/// the bump every already-scanned shortcut would keep its English file name
+/// forever (`unchanged()` short-circuits before the name is ever computed).
+const SCAN_GEN: u32 = 2;
 
 /// Names that are never what somebody wants in a launcher, in three flavours
 /// because vendors name things differently:
@@ -108,15 +113,86 @@ pub struct ScanReport {
     pub removed_filtered: usize,
     /// Ambiguously named entries that got a folder hint appended.
     pub renamed_ambiguous: usize,
+    /// Entries whose name was refreshed to the shell's current localised name.
+    pub retitled: usize,
     /// How long the scan took, in milliseconds.
     pub millis: u128,
+}
+
+/// Re-read the shell's name for entries whose title **is still the scanned
+/// name**, and update it when the shell now says something else.
+///
+/// Needed because [`Store::insert_scanned`] deliberately never touches an item
+/// that already exists — "the user may have renamed it, changed its keyword, or
+/// edited its command line, and a periodic scan must not undo that". That rule is
+/// right, but it also means a change to the *naming rule* can never reach a list
+/// that was already scanned (2026-10-14: titles moved from the `.lnk` file stem
+/// to the shell's localised display name, so `Task Manager` should become
+/// 任务管理器).
+///
+/// The safety test is exact equality rather than a flag, and it needs no new
+/// field: **a title that still equals the first keyword is untouched by the
+/// user** — editing a row changes the title and leaves the keyword, which is
+/// exactly the signal to keep hands off.
+///
+/// Everything else about the item (id, actions, arg spec, launch mode, source,
+/// health, and therefore its launch count) is preserved: the clone is edited in
+/// place and written back through `upsert_item`.
+pub fn refresh_localised_titles(store: &mut Store) -> usize {
+    let items = store.load_items().unwrap_or_default();
+    let mut retitled = 0usize;
+    for item in items {
+        // Only what a scan put there, and only if the user never renamed it.
+        if !is_discovered_provider(&item.source.provider) {
+            continue;
+        }
+        if item.keywords.first().map(String::as_str) != Some(item.title.as_str()) {
+            continue;
+        }
+        let fresh = if item.source.provider == UWP_PROVIDER {
+            // UWP titles already come from `SIGDN_NORMALDISPLAY`; the only
+            // reason to re-read one is a language change, so it is read back
+            // from the same enumeration the scan uses.
+            uwp_display_name(&item.source.external_id)
+        } else {
+            let path = std::path::PathBuf::from(&item.source.external_id);
+            path.is_file().then(|| display_name_for(&path)).flatten()
+        };
+        let Some(fresh) = fresh else {
+            continue;
+        };
+        let fresh = fresh.trim().to_string();
+        if fresh.is_empty() || fresh == item.title {
+            continue;
+        }
+        let old = item.title.clone();
+        let mut updated = item.clone();
+        // Keywords are replaced, not appended: this title *is* the keyword
+        // (that is how it passed the guard above).
+        updated.keywords = vec![fresh.clone()];
+        updated.title = fresh;
+        if store.upsert_item(&updated).is_ok() {
+            retitled += 1;
+            crate::log_line(&format!("discover: retitled {old:?} -> {:?}", updated.title));
+        }
+    }
+    retitled
+}
+
+/// The shell's name for a UWP app, looked up by AUMID. `None` when the app is
+/// no longer installed.
+fn uwp_display_name(aumid: &str) -> Option<String> {
+    enumerate_apps_folder()
+        .into_iter()
+        .find(|e| e.parsing.eq_ignore_ascii_case(aumid))
+        .map(|e| e.name)
 }
 
 impl ScanReport {
     /// One line for the log.
     pub fn summary(&self) -> String {
         format!(
-            "seen={} cached={} added={} existing={} tombstoned={} dropped(dupes={} filtered={}) renamed={} skipped(junk={} web={} missing={} system={}) uwp(seen={} existing={} in {}ms) in {}ms",
+            "seen={} cached={} added={} existing={} tombstoned={} dropped(dupes={} filtered={}) renamed={} retitled={} skipped(junk={} web={} missing={} system={}) uwp(seen={} existing={} in {}ms) in {}ms",
             self.seen,
             self.cached,
             self.added,
@@ -125,6 +201,7 @@ impl ScanReport {
             self.removed_duplicates,
             self.removed_filtered,
             self.renamed_ambiguous,
+            self.retitled,
             self.skipped_junk,
             self.skipped_web,
             self.skipped_missing,
@@ -135,6 +212,7 @@ impl ScanReport {
             self.millis
         )
     }
+
     /// Wording for the status line / settings page.
     pub fn human(&self) -> String {
         if self.added == 0 {
@@ -296,9 +374,54 @@ fn enumerate_apps_folder() -> Vec<AppEntry> {
     out
 }
 
-/// The item a UWP app becomes: it launches through its AUMID, and the icon comes
-/// from the same shell path (the icon worker resolves anything through
-/// `SHCreateItemFromParsingName`, which handles app entries too).
+/// What the shell calls this file — **localised**, and often quite different
+/// from its name on disk.
+///
+/// This matters more than it looks. A Start Menu shortcut is stored under its
+/// *English* file name on every Windows build, and the localisation lives in the
+/// shell's display name:
+///
+/// ```text
+/// 文件名     : Task Manager.lnk
+/// 系统显示名 : 任务管理器
+/// ```
+///
+/// Discovery used `file_stem`, so the item was titled `Task Manager` with only
+/// that as a keyword — typing 任务管理器 found nothing, even though the shortcut
+/// the user sees in their Start Menu *is* called 任务管理器 (2026-10-14). The UWP
+/// pass already read `SIGDN_NORMALDISPLAY`; this brings the Start Menu pass in
+/// line with it.
+///
+/// Falls back to the file stem: a display name can be empty, and a `.lnk` whose
+/// shell item cannot be created is still worth offering by its file name.
+fn display_name_for(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY};
+    use windows::core::PCWSTR;
+
+    let from_shell = (|| {
+        crate::integrate::ensure_com();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let item = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+                .ok()?;
+            let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?.to_string().ok()?;
+            let name = name.trim().to_string();
+            (!name.is_empty()).then_some(name)
+        }
+    })();
+    from_shell.or_else(|| {
+        path.file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+    })
+}
+
+
 fn uwp_item_for(name: &str, aumid: &str) -> Item {
     let command = format!("{UWP_TARGET_PREFIX}{aumid}");
     Item {
@@ -543,8 +666,12 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
 
     for root in start_menu_roots() {
         walk(&root, &mut |path| {
-            let name = match path.file_stem() {
-                Some(n) => n.to_string_lossy().into_owned(),
+            // The shell's name, not the file's: on a Chinese Windows the file is
+            // `Task Manager.lnk` but the user's Start Menu shows 任务管理器, and a
+            // launcher has to answer to the name the user knows (see
+            // `display_name_for`).
+            let name = match display_name_for(&path) {
+                Some(n) => n,
                 None => return,
             };
             let ext = path
@@ -658,6 +785,9 @@ pub fn apply(store: &mut Store, mut out: ScanOutput) -> ScanReport {
     out.report.removed_duplicates = cleanup_duplicate_titles(store);
     out.report.removed_filtered += cleanup_filtered_discovered(store);
     out.report.renamed_ambiguous = disambiguate_titles(store);
+    // After disambiguation: the fresh name is the plain one, and the folder hint
+    // (if any) is appended by the pass above.
+    out.report.retitled = refresh_localised_titles(store);
     out.report
 }
 
