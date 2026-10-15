@@ -34,6 +34,7 @@
 use crate::store::{
     Action, ArgSource, ArgSpec, BuiltinVerb, Effect, Encoder, InsertMode, Item, LaunchMode,
 };
+use std::path::Path;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
@@ -348,8 +349,18 @@ fn arg_value(arg: &ArgSpec, typed: Option<&str>) -> Result<Option<String>, Outco
 ///    is, because it is what the shortcut's author actually configured;
 /// 2. the **launcher's** directory, for commands written with `.\` / `..\`
 ///    (AltRun's rule — those paths are relative *to the launcher*);
-/// 3. `None` — let Windows decide (inherit ours), which is right for plain
-///    `C:\…\app.exe` entries: a GUI app does not care where it started.
+/// 3. the **program's own** directory — AltRun's default, and the one that keeps
+///    a program's relative paths meaning what they mean when you double-click it
+///    (`frmALTRun.pas:806-810`).
+///
+/// ⚠️ Step 3 was missing until 2026-10-14 and its absence was visible: a
+/// PyInstaller tool (`PsdExporter.exe`) launched from MxRun wrote its output next
+/// to **MxRun**, because a child with no working directory inherits the parent's
+/// — and the parent is wherever the launcher itself was started from. AltRun set
+/// it to the program's folder, so the same program behaved.
+///
+/// Only `None` when there is no directory to speak of: a URL, a `shell:AppsFolder`
+/// entry, a CLSID, a bare name that is not on disk.
 pub fn build_command(
     target: &str,
     arg: &ArgSpec,
@@ -366,9 +377,56 @@ pub fn build_command(
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
     } else {
-        None
+        program_dir(&command)
     };
     Ok((command, workdir))
+}
+
+/// The directory of the program a command line starts with — AltRun's default
+/// working directory.
+///
+/// * `"C:\Program Files\App\app.exe" --flag` → `C:\Program Files\App`
+/// * `C:\dir\app.exe` → `C:\dir`
+/// * `C:\dir` (the target *is* a folder) → `C:\dir`
+/// * `C:\Windows\System32\notepad.exe` → `C:\Windows\System32`(a GUI app does not
+///   care, but a portable one that looks next to itself does)
+/// * `cmd.exe`, `http://…`, `::{CLSID}`, `shell:…` → `None`, nothing to derive
+fn program_dir(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Quoted form first: the quoting exists precisely because the path has spaces.
+    let first = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else {
+        // Unquoted: take the whole string first (a path with spaces that exists),
+        // then shed tokens from the right until something exists.
+        let mut candidate = trimmed;
+        loop {
+            if Path::new(candidate).exists() {
+                break;
+            }
+            match candidate.rfind(' ') {
+                Some(cut) if cut > 0 => candidate = &candidate[..cut],
+                _ => return None,
+            }
+        }
+        candidate
+    };
+    // Namespaces have no folder on disk (`shell:AppsFolder\…`, `::{CLSID}`, URLs).
+    if first.is_empty() || first.contains("://") || first.starts_with("::") || first.starts_with("shell:") {
+        return None;
+    }
+    let path = Path::new(first);
+    if path.is_dir() {
+        return Some(first.to_string());
+    }
+    let dir = path.parent()?;
+    if dir.as_os_str().is_empty() {
+        return None; // a bare name: wherever Windows resolves it, not our business
+    }
+    Some(dir.to_string_lossy().into_owned())
 }
 
 fn shell_execute(target: &str, workdir: Option<&str>, mode: LaunchMode) -> Outcome {
@@ -709,6 +767,80 @@ mod tests {
         assert!(!wants_launcher_dir(r"C:\Windows\notepad.exe"));
     }
 
+    /// AltRun's default working directory: the program's own folder.
+    ///
+    /// This was missing until 2026-10-14, and the gap was visible — a PyInstaller
+    /// tool wrote its output next to **MxRun** instead of next to itself, because
+    /// a child with no working directory inherits the parent's (`frmALTRun.pas:806-810`
+    /// is where AltRun sets it).
+    #[test]
+    fn a_command_runs_in_its_own_program_directory() {
+        // A path with spaces, quoted and unquoted: both must survive.
+        let spaced = r"C:\Program Files\Git\cmd\git.exe";
+        if std::path::Path::new(spaced).is_file() {
+            assert_eq!(program_dir(spaced).as_deref(), Some(r"C:\Program Files\Git\cmd"));
+            assert_eq!(
+                program_dir(&format!("\"{spaced}\" --version")).as_deref(),
+                Some(r"C:\Program Files\Git\cmd")
+            );
+            assert_eq!(
+                program_dir(&format!("{spaced} --version")).as_deref(),
+                Some(r"C:\Program Files\Git\cmd"),
+                "an unquoted path with spaces keeps its whole directory"
+            );
+        }
+        // Without spaces the plain form is simplest.
+        let plain = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(program_dir(plain).as_deref(), Some(r"C:\Windows\System32"));
+        assert_eq!(
+            program_dir(r"C:\Windows\System32\notepad.exe -x").as_deref(),
+            Some(r"C:\Windows\System32")
+        );
+        // A folder target is its own working directory.
+        assert_eq!(program_dir(r"C:\Windows").as_deref(), Some(r"C:\Windows"));
+        // Nothing to derive from: no folder, no working directory. Passing the
+        // launcher's own directory here would be the bug this test guards.
+        for none in [
+            "cmd.exe",
+            "http://example.com/x",
+            "https://example.com",
+            r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            "",
+        ] {
+            assert_eq!(program_dir(none), None, "{none} has no program directory");
+        }
+    }
+
+    /// And the default is what `build_command` reaches when nothing else applies.
+    #[test]
+    fn build_command_falls_back_to_the_program_directory() {
+        let arg = ArgSpec::default();
+        let (_, dir) = build_command(
+            r"C:\Windows\System32\notepad.exe",
+            &arg,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dir.as_deref(), Some(r"C:\Windows\System32"));
+
+        // The item's own value still outranks it…
+        let (_, dir) = build_command(
+            r"C:\Windows\System32\notepad.exe",
+            &arg,
+            None,
+            Some(r"D:\elsewhere"),
+        )
+        .unwrap();
+        assert_eq!(dir.as_deref(), Some(r"D:\elsewhere"));
+
+        // …and a `.\` command still belongs to the launcher.
+        let (_, dir) = build_command(r".\ALTRun.ini", &arg, None, None).unwrap();
+        assert!(dir.is_some(), "relative commands run in the launcher's directory");
+        assert_ne!(dir.as_deref(), Some(r"C:\Windows\System32"));
+    }
+
     /// The full path an imported AltRun row takes: `cmd /k %p` needs input, so
     /// it must report NeedsInput rather than silently running the marker.
     #[test]
@@ -729,9 +861,8 @@ mod tests {
         assert!(dir.is_none());
     }
 
-    /// An item that carries its own working directory wins over every other
-    /// rule — that is the whole point of reading a `.lnk`'s "start in".
-    ///
+    /// The item's own "start in" wins over every other rule — that is the whole
+    /// point of reading a `.lnk`'s "start in".
     /// Real case (2026-10-13): `python -m frontends.tui_v3` only resolves its
     /// module when it starts inside the project folder.
     #[test]

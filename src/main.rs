@@ -911,12 +911,38 @@ fn main() -> eframe::Result<()> {
                                 Some(store::Effect::Builtin { verb }) => format!("builtin:{verb:?}"),
                                 None => "(no action)".into(),
                             };
+                            // What the executor will actually use, not just what
+                            // the item carries: the effective working directory is
+                            // the item's own, else the launcher's for `.\`, else
+                            // the program's folder — and "which one won" is the
+                            // question that matters when a program writes its
+                            // output in an unexpected place.
+                            let effective = item
+                                .default_action()
+                                .map(|a| match &a.effect {
+                                    store::Effect::Open { target } => exec::build_command(
+                                        target,
+                                        &item.arg,
+                                        None,
+                                        item.working_dir.as_deref(),
+                                    ),
+                                    store::Effect::Run { line } => exec::build_command(
+                                        line,
+                                        &item.arg,
+                                        None,
+                                        item.working_dir.as_deref(),
+                                    ),
+                                    _ => Ok((String::new(), None)),
+                                })
+                                .and_then(|r| r.ok())
+                                .and_then(|(_, dir)| dir);
                             log_line(&format!(
-                                "item: id={} provider={} source={} workdir={:?} cmd={:?}",
+                                "item: id={} provider={} source={} workdir={:?} effective_cwd={:?} cmd={:?}",
                                 item.id,
                                 item.source.provider,
                                 item.source.external_id,
                                 item.working_dir,
+                                effective,
                                 command
                             ));
                         }
