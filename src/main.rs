@@ -53,6 +53,13 @@ use tray_icon::{
 const MAX_ROWS: usize = 8;
 const DEFAULT_HOTKEY: &str = "Alt+F1";
 
+/// Where this thing can be downloaded from — **the only place**.
+///
+/// The portable zip is attached to a GitHub release and there is no winget /
+/// scoop / mirror, so the settings page shows this and nothing else would be
+/// honest (user's ask, 2026-10-17: "当前 git 地址是唯一下载的地址，写在设置页").
+const DOWNLOAD_URL: &str = "https://github.com/mon6912640/MxRun";
+
 /// When was the running `mxrun.exe` built?
 ///
 /// Added after a user reported "typing `@` closes the window" (2026-09-19) — it
@@ -5957,12 +5964,72 @@ impl MxRunApp {
         self.render_integration(ui);
 
         ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.render_about(ui);
+
+        ui.add_space(16.0);
         if ui.button("返回 (Esc)").clicked() {
             self.view_settings = false;
             self.capturing_hotkey = false;
             self.pending_hotkey = None;
             self.reset_status();
         }
+    }
+
+    /// 关于：版本从哪来、在哪下载。
+    ///
+    /// Deliberately at the very bottom: the address is reference material, not a
+    /// setting. The version line at the top already says *which* build this is;
+    /// this says *where to get the next one*.
+    fn render_about(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("关于").size(15.0));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("下载地址").size(13.0));
+            ui.add_space(8.0);
+            let link = ui.add(
+                egui::Label::new(
+                    RichText::new(DOWNLOAD_URL)
+                        .size(12.0)
+                        .color(pal().accent),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if link.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if link.on_hover_text("点击在浏览器里打开").clicked() {
+                match open::that(DOWNLOAD_URL) {
+                    Ok(()) => {
+                        log_line("about: opened the download url");
+                        self.status = "已在浏览器打开下载地址".to_string();
+                    }
+                    Err(e) => {
+                        log_line(&format!("about: open url failed: {e}"));
+                        self.status = format!("打不开浏览器：{e}");
+                    }
+                }
+            }
+            // A deliberate target: the stock button is ~34×18, a small thing to
+            // hit right next to a long link (measured 2026-10-17 — an automated
+            // click aimed at the button landed on the link instead).
+            let copy = ui.add(
+                egui::Button::new(RichText::new("复制").size(12.0))
+                    .min_size(egui::vec2(52.0, 20.0)),
+            );
+            if copy.clicked() {
+                ui.ctx().copy_text(DOWNLOAD_URL.to_string());
+                log_line("about: copied the download url");
+                self.status = "已复制下载地址".to_string();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("便携包只在这个仓库的 Releases 页发布，没有其他分发渠道。")
+                .size(11.0)
+                .color(pal().text_faint),
+        );
     }
 
     /// Auto-discovery (P0-4) in the settings page.
