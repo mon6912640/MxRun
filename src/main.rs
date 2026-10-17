@@ -6916,7 +6916,24 @@ impl MxRunApp {
         // the user asked for it: flush right looked stray, and next to the name
         // read like punctuation.
         const GRIP_W: f32 = 26.0;
+        let logo = self.logo_texture(ui.ctx());
         ui.horizontal(|ui| {
+            // The app mark, to the left of the name (2026-10-17, user asked):
+            // this strip *is* the card's title bar, and a nameplate with a logo
+            // reads as a product rather than a stray word.
+            //
+            // Sized to the label's own row height, not bigger: the card's height
+            // is a constant (`LIST_CHROME` + rows × `ROW_HEIGHT`), so growing
+            // this row would eat into the list for no reason.
+            //
+            // `Sense::hover` on purpose: the whole card is the drag handle, and
+            // an image that sensed clicks would take the ground away under the
+            // pointer for those 14 points (踩坑 23 is the same class of bug).
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(logo, egui::vec2(14.0, 14.0)))
+                    .sense(egui::Sense::hover()),
+            );
+            ui.add_space(2.0);
             let title = ui.label(
                 RichText::new("MxRun")
                     .size(12.0)
