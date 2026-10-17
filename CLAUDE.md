@@ -39,6 +39,11 @@ cargo test                    # 单元测试（模型/迁移/搜索/执行器/�
 
 ## 约定
 
+- **发版由用户说了算（2026-10-17 明确要求）**：平时改完只 `cargo build --release` 自测 + 提交，
+  **不动 `Cargo.toml` 的 `version`、不跑 `tools/package-portable.ps1`、不产 `dist/` 的 zip**。
+  用户说"发版 / 打个包"时才做，一次跳号、一次交付（`version` 只在那一刻改）。
+  理由：改一次发一版会让版本号爆炸，他要攒一波再发。开发中想区分构建，看设置页的
+  `构建时间`（`exe_build_stamp`）就够了，不需要版本号
 - `mxrun.log`（`%APPDATA%\MxRun\`）是排查主力：`wake:` 呼出延迟、`hide:` 隐藏原因、`prompt:` 参数输入、`execute:` 执行记录。加功能时顺手往里加事件
 - 判断窗口可见性用 Win32 `IsWindowVisible`，不要用 `Get-Process` 的 `MainWindowHandle`
 - egui 空闲时不跑 `ui()`，轮询式检查必须配 `ctx.request_repaint_after(...)`

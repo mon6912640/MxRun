@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "mxrun"
-version = "0.1.6"
+version = "0.1.4"
 dependencies = [
  "eframe",
  "embed-resource",
