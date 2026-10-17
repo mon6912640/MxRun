@@ -66,9 +66,8 @@ try {
 
     $running = @(Get-Process *mxrun* -ErrorAction SilentlyContinue)
     if ($running.Count -gt 0) {
-        Info "关掉运行中的实例（$($running.Count) 个，否则 exe 被锁）"
-        $running | Stop-Process -Force
-        Start-Sleep -Milliseconds 600
+        # 只在真打包前关；干跑、以及人还没确认的时候不动别人的程序
+        Info "有 $($running.Count) 个实例在跑（真发版会在打包前关掉，否则 exe 被锁）"
     }
 
     # ---------- 2) 算出版本号 ----------
@@ -163,6 +162,9 @@ try {
 
     # ---------- 5) 打包（测试 + 构建 + 图标校验 + zip） ----------
     Step '打包（会先跑测试和真实构建，几分钟）'
+    # 运行中的实例会锁住 exe，cargo 报 os error 5 —— 到这一步才关（前面只是提示）
+    Get-Process *mxrun* -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 600
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'package-portable.ps1')
     if ($LASTEXITCODE -ne 0) { Die '打包失败 —— 仓库停在"版本号已改、未提交"的状态，修好后重跑本脚本' }
     if (-not (Test-Path $zipPath)) { Die "打包脚本没产出 $zipPath" }
