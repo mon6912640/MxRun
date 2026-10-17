@@ -137,10 +137,26 @@ pub struct ScanReport {
 ///
 /// Everything else about the item (id, actions, arg spec, launch mode, source,
 /// health, and therefore its launch count) is preserved: the clone is edited in
-/// place and written back through `upsert_item`.
-pub fn refresh_localised_titles(store: &mut Store) -> usize {
+/// place and written back in one transaction.
+///
+/// **No shell calls in here** (2026-10-17). This pass used to ask the shell for
+/// every item's display name, one call per item; it runs on the UI thread, where
+/// such a call costs ~120 ms instead of the ~1.8 ms it costs on the scan thread
+/// (the UI thread is a blocked STA, so every call has to re-enter it). With 100
+/// items that was a **12 s freeze right after startup** — the window looked
+/// alive but rendered nothing and swallowed input, which is what made three
+/// key/mouse self-tests fail. The names now come from the scan
+/// (`ScanOutput::names`); an item the scan did not look at simply keeps its
+/// title.
+pub fn refresh_localised_titles(
+    store: &mut Store,
+    names: &std::collections::HashMap<String, String>,
+) -> usize {
+    if names.is_empty() {
+        return 0;
+    }
     let items = store.load_items().unwrap_or_default();
-    let mut retitled = 0usize;
+    let mut updates: Vec<Item> = Vec::new();
     for item in items {
         // Only what a scan put there, and only if the user never renamed it.
         if !is_discovered_provider(&item.source.provider) {
@@ -149,16 +165,7 @@ pub fn refresh_localised_titles(store: &mut Store) -> usize {
         if item.keywords.first().map(String::as_str) != Some(item.title.as_str()) {
             continue;
         }
-        let fresh = if item.source.provider == UWP_PROVIDER {
-            // UWP titles already come from `SIGDN_NORMALDISPLAY`; the only
-            // reason to re-read one is a language change, so it is read back
-            // from the same enumeration the scan uses.
-            uwp_display_name(&item.source.external_id)
-        } else {
-            let path = std::path::PathBuf::from(&item.source.external_id);
-            path.is_file().then(|| display_name_for(&path)).flatten()
-        };
-        let Some(fresh) = fresh else {
+        let Some(fresh) = names.get(&item.source.external_id) else {
             continue;
         };
         let fresh = fresh.trim().to_string();
@@ -166,26 +173,16 @@ pub fn refresh_localised_titles(store: &mut Store) -> usize {
             continue;
         }
         let old = item.title.clone();
-        let mut updated = item.clone();
+        let mut updated = item;
         // Keywords are replaced, not appended: this title *is* the keyword
         // (that is how it passed the guard above).
         updated.keywords = vec![fresh.clone()];
         updated.title = fresh;
-        if store.upsert_item(&updated).is_ok() {
-            retitled += 1;
-            crate::log_line(&format!("discover: retitled {old:?} -> {:?}", updated.title));
-        }
+        crate::log_line(&format!("discover: retitled {old:?} -> {:?}", updated.title));
+        updates.push(updated);
     }
-    retitled
-}
-
-/// The shell's name for a UWP app, looked up by AUMID. `None` when the app is
-/// no longer installed.
-fn uwp_display_name(aumid: &str) -> Option<String> {
-    enumerate_apps_folder()
-        .into_iter()
-        .find(|e| e.parsing.eq_ignore_ascii_case(aumid))
-        .map(|e| e.name)
+    store.save_items(&updates);
+    updates.len()
 }
 
 impl ScanReport {
@@ -294,6 +291,16 @@ pub struct ScanInput {
 pub struct ScanOutput {
     pub items: Vec<Item>,
     pub cache_updates: Vec<(String, String)>,
+    /// `external_id` -> the name the shell shows for it.
+    ///
+    /// Filled for **every** shortcut and UWP entry the scan looked at, including
+    /// the ones it skipped as duplicates or filtered, because
+    /// [`refresh_localised_titles`] needs those names too. Carrying them over
+    /// from here is what keeps that pass free of shell calls: the same lookup on
+    /// the UI thread costs ~120 ms each there (it has to re-enter the blocked
+    /// STA), and 100 of them froze the app for 12 s right after startup
+    /// (measured 2026-10-17).
+    pub names: std::collections::HashMap<String, String>,
     pub report: ScanReport,
 }
 
@@ -690,6 +697,13 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
                 return;
             }
 
+            // Keep the name even when the item is skipped below (junk / cached /
+            // duplicate / filtered): `refresh_localised_titles` looks up names
+            // here instead of asking the shell on the UI thread. Keyed exactly
+            // like `Item::source.external_id` (see `item_for`).
+            out.names
+                .insert(path.to_string_lossy().to_lowercase(), name.clone());
+
             // Cheap checks before the 1.8 ms COM call.
             if is_junk_name(&name) {
                 out.report.skipped_junk += 1;
@@ -751,6 +765,9 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
         if !is_uwp_aumid(&entry.parsing) {
             continue;
         }
+        // Same map as the Start Menu pass, same reason (see the walk above).
+        out.names
+            .insert(entry.parsing.to_lowercase(), entry.name.clone());
         out.report.uwp_seen += 1;
         if is_junk_name(&entry.name) {
             out.report.skipped_junk += 1;
@@ -771,6 +788,7 @@ pub fn collect(input: &ScanInput, force: bool) -> ScanOutput {
 
 /// Store what the scan found. Runs on the thread that owns the `Store`.
 pub fn apply(store: &mut Store, mut out: ScanOutput) -> ScanReport {
+    let started = std::time::Instant::now();
     store.set_meta_many(&out.cache_updates);
     match store.insert_scanned(std::mem::take(&mut out.items)) {
         Ok((added, existing, tombstoned)) => {
@@ -787,7 +805,13 @@ pub fn apply(store: &mut Store, mut out: ScanOutput) -> ScanReport {
     out.report.renamed_ambiguous = disambiguate_titles(store);
     // After disambiguation: the fresh name is the plain one, and the folder hint
     // (if any) is appended by the pass above.
-    out.report.retitled = refresh_localised_titles(store);
+    out.report.retitled = refresh_localised_titles(store, &out.names);
+    // This number was missing exactly when it mattered: the pass above ran on
+    // the UI thread and took 12 s without a single log line to show for it.
+    crate::log_line(&format!(
+        "discover: apply in {}ms",
+        started.elapsed().as_millis()
+    ));
     out.report
 }
 
@@ -1278,6 +1302,50 @@ mod tests {
         // Touching the file (new content, new size) invalidates it.
         std::fs::write(&file, b"second, longer").unwrap();
         assert!(!unchanged(&input, &file), "content changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retitle pass must be **pure bookkeeping**: every name it needs comes
+    /// from the scan (2026-10-17 — asking the shell in here froze the app for 12
+    /// seconds, because this runs on the UI thread and the window stopped
+    /// rendering *and* swallowing input while it waited).
+    #[test]
+    fn retitles_come_from_the_scan_map_not_from_the_shell() {
+        let dir = temp_dir("retitle");
+        let mut store = Store::open_at(dir.join("data")).unwrap();
+        let lnk = r"r:\menu\task manager.lnk".to_string();
+        let item = Item {
+            id: format!("{PROVIDER}:{lnk}"),
+            title: "Task Manager".into(),
+            keywords: vec!["Task Manager".into()],
+            actions: vec![Action::open(r"r:\apps\taskmgr.exe")],
+            source: Source { provider: PROVIDER.into(), external_id: lnk.clone() },
+            ..Default::default()
+        };
+        store.upsert_item(&item).unwrap();
+
+        // No map (the scan saw nothing) -> nothing happens. No shell call is
+        // made on the pass's behalf either, which is the whole point.
+        assert_eq!(refresh_localised_titles(&mut store, &Default::default()), 0);
+
+        let mut names = std::collections::HashMap::new();
+        names.insert(lnk.clone(), "任务管理器".to_string());
+        assert_eq!(refresh_localised_titles(&mut store, &names), 1);
+        let after = store.load_items().unwrap();
+        let got = after.iter().find(|i| i.id == item.id).unwrap();
+        assert_eq!(got.title, "任务管理器");
+        assert_eq!(got.keywords, vec!["任务管理器".to_string()]);
+
+        // Idempotent: the next scan has nothing to do.
+        assert_eq!(refresh_localised_titles(&mut store, &names), 0);
+
+        // A title the user edited keeps winning over the shell's name.
+        let mut renamed = got.clone();
+        renamed.title = "我的任务管理器".into();
+        store.upsert_item(&renamed).unwrap();
+        let mut moved = std::collections::HashMap::new();
+        moved.insert(lnk, "Task Manager (new)".to_string());
+        assert_eq!(refresh_localised_titles(&mut store, &moved), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
