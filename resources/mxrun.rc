@@ -1,0 +1,6 @@
+// Resource table of mxrun.exe. One icon group (ordinal 1) with 10 sizes
+// (16..256, see tools/derive-icon-assets.py) — Explorer picks the best match for
+// list / details / large / extra-large views instead of resampling one bitmap.
+// The path is relative to the include dir build.rs passes (`-I icon`): windres does
+// not search the .rc's own directory for ICON sources.
+1 ICON "mxrun.ico"

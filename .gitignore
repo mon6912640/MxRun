@@ -27,3 +27,8 @@ ShortCutList*.txt
 
 # 打包产物（便携 zip 等）：不进仓库，改用 GitHub Release 分发
 dist/
+
+# 图标设计的过程稿（豆包的工作目录：多轮候选图、派生脚本、白底母版的旁支变体）。
+# 15 MB，且脚本里写着本机绝对路径（会把 pre-commit 钩子点着），只留在磁盘上；
+# 入库的是 `icon/`（母版 + 生成的尺寸集 + .ico）和 `assets/`（构建真正 include 的 raw）。
+.creative-design/

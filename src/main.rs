@@ -1054,6 +1054,10 @@ fn main() -> eframe::Result<()> {
             // (eframe defaults to the crate name), but that would silently
             // follow a rename of the binary.
             .with_title("MxRun")
+            // Without this eframe installs the **egui logo** as the window icon
+            // (it treats an absent icon as "use mine"), so the taskbar and Alt+Tab
+            // showed egui's mark until 2026-10-17.
+            .with_icon(window_icon())
             .with_always_on_top()
             .with_inner_size(start_size)
             .with_min_inner_size([480.0, 200.0])
@@ -3383,6 +3387,8 @@ struct MxRunApp {
     file_opened: std::collections::HashMap<String, u32>,
     /// One-off log of when the first frame rendered (cold-start breakdown).
     first_frame_logged: bool,
+    /// The app mark on the settings page, uploaded the first time that page opens.
+    logo: Option<egui::TextureHandle>,
 }
 
 impl MxRunApp {
@@ -3476,14 +3482,26 @@ impl MxRunApp {
         // out to be an *older* exe still resident in the tray (2026-09-19).
         log_line(&format!("startup: exe built {}", exe_build_stamp()));
         if !registered {
-            // The configured hotkey is taken by another program (or invalid):
-            // fall back to the default instead of leaving no way to summon.
-            startup_note = Some(format!(
-                "快捷键 {hotkey_str} 注册失败（可能被其他程序占用），已回退为 {DEFAULT_HOTKEY}"
-            ));
-            hotkey_str = DEFAULT_HOTKEY.to_string();
-            if let Some(hk) = parse_hotkey(&hotkey_str) {
-                let _ = manager.register(hk);
+            // The configured hotkey is taken by another program (or invalid).
+            // Falling back only helps when the default is a *different* hotkey:
+            // on 2026-10-17 the original AltRun was running and held Alt+F1, so
+            // the old code re-tried the very same combination and still claimed
+            // "已回退为 Alt+F1". Report what actually happened instead.
+            let fallback = if hotkey_str == DEFAULT_HOTKEY {
+                None
+            } else {
+                parse_hotkey(DEFAULT_HOTKEY).filter(|hk| manager.register(*hk).is_ok())
+            };
+            startup_note = Some(match fallback {
+                Some(_) => format!(
+                    "快捷键 {hotkey_str} 注册失败（被其他程序占用），已回退为 {DEFAULT_HOTKEY}"
+                ),
+                None => format!(
+                    "快捷键 {hotkey_str} 被其他程序占用（原版 AltRun 也默认用 Alt+F1），请在设置里换一个组合键"
+                ),
+            });
+            if fallback.is_some() {
+                hotkey_str = DEFAULT_HOTKEY.to_string();
             }
         }
 
@@ -3698,6 +3716,7 @@ impl MxRunApp {
             pending_hotkey: None,
             status: String::new(),
             first_frame_logged: false,
+            logo: None,
             store,
             hotkey_manager: manager,
             hotkey_str,
@@ -5820,14 +5839,42 @@ impl MxRunApp {
             .show(ui, |ui| self.render_settings_body(ui));
     }
 
+    /// The app mark for the settings page: uploaded the first time that page is
+    /// drawn, then reused (a per-frame `load_texture` would re-upload 16 KB each
+    /// time).
+    fn logo_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        self.logo
+            .get_or_insert_with(|| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], ICON_LOGO_64);
+                ctx.load_texture("mxrun-logo", image, egui::TextureOptions::LINEAR)
+            })
+            .id()
+    }
+
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("⚙ 设置").size(20.0));
-        // Which build is running — the answer to "did my fix actually take?".
-        ui.label(
-            RichText::new(format!("构建时间：{}", exe_build_stamp()))
-                .size(11.0)
-                .color(pal().text_faint),
-        );
+        // The mark sits where the user looks for "which program is this / which
+        // build is it" — the same place the version line lives.
+        let logo = self.logo_texture(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                logo,
+                egui::vec2(30.0, 30.0),
+            )));
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.heading(RichText::new("设置").size(20.0));
+                // Which build is running — the answer to "did my fix actually take?".
+                ui.label(
+                    RichText::new(format!(
+                        "MxRun {} · 构建时间：{}",
+                        env!("CARGO_PKG_VERSION"),
+                        exe_build_stamp()
+                    ))
+                    .size(11.0)
+                    .color(pal().text_faint),
+                );
+            });
+        });
         ui.add_space(12.0);
 
         // --- hotkey row ---
@@ -8070,23 +8117,64 @@ fn install_cjk_font(ctx: &egui::Context) {
     eprintln!("warning: no CJK font found, Chinese text will not render");
 }
 
-/// Generate a simple 32x32 tray icon (blue disc) without shipping an asset.
+// ---------- the app mark ----------
+//
+// The same icon reaches the user through four surfaces, and each one wants a
+// different shape of the data (2026-10-17, artwork by 豆包):
+//
+//   1. the **exe resource** — Explorer, shortcuts, 发送到, the 属性 dialog. Baked
+//      into the binary at build time (`resources/mxrun.rc` + `icon/mxrun.ico`, see
+//      build.rs), and the only surface that exists while MxRun is not running.
+//   2. the **window icon** — taskbar button and Alt+Tab. eframe sets both
+//      `ICON_BIG` and `ICON_SMALL` for us, but only from
+//      `ViewportBuilder::with_icon`; with no icon it installs *the egui logo*.
+//   3. the **tray icon** — Explorer asks for `SM_CXSMICON` pixels (16/20/24/32 at
+//      100/125/150/200% DPI) and resamples whatever it is handed, so the bitmaps
+//      are pre-rendered per size instead of one 32px blob (that was the old blue
+//      disc).
+//   4. the **settings page**, where the mark sits next to the version.
+//
+// All of them are raw RGBA from `tools/derive-icon-assets.py`, not PNG: no decoder
+// on the startup path, and `include_bytes!` costs nothing until the bytes are used.
+
+/// 256×256: eframe Lanczos-scales it down to `SM_CXICON` / `SM_CXSMICON`, so the
+/// source has to be large. 262 KB of `.rodata` is the price of a crisp taskbar.
+const ICON_WINDOW_256: &[u8] = include_bytes!("../assets/window-256.rgba");
+/// Tray bitmaps, one per Windows small-icon size (`SM_CXSMICON`).
+const ICON_TRAY: &[(u32, &[u8])] = &[
+    (16, include_bytes!("../assets/tray-16.rgba")),
+    (20, include_bytes!("../assets/tray-20.rgba")),
+    (24, include_bytes!("../assets/tray-24.rgba")),
+    (32, include_bytes!("../assets/tray-32.rgba")),
+    (48, include_bytes!("../assets/tray-48.rgba")),
+];
+/// 64×64 for the settings page (draws at ~30pt, so 64 covers 200% scaling).
+const ICON_LOGO_64: &[u8] = include_bytes!("../assets/logo-64.rgba");
+
+fn window_icon() -> Arc<egui::IconData> {
+    Arc::new(egui::IconData {
+        rgba: ICON_WINDOW_256.to_vec(),
+        width: 256,
+        height: 256,
+    })
+}
+
+/// The notification-area icon, at the pixel size Windows itself uses.
 fn build_tray_icon() -> tray_icon::Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let (dx, dy) = (x - 16, y - 16);
-            if dx * dx + dy * dy <= 13 * 13 {
-                let i = ((y as u32 * w + x as u32) * 4) as usize;
-                rgba[i] = 90; // R
-                rgba[i + 1] = 140; // G
-                rgba[i + 2] = 255; // B
-                rgba[i + 3] = 255; // A
-            }
-        }
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    // SAFETY: reads a system constant; no side effects, no handle.
+    let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+    let (size, rgba) = ICON_TRAY
+        .iter()
+        .min_by_key(|(size, _)| (*size as i32 - want as i32).abs())
+        .copied()
+        .expect("ICON_TRAY is never empty");
+    if rgba.len() != (size * size * 4) as usize {
+        // A mis-derived asset should not take the tray down with it.
+        return tray_icon::Icon::from_rgba(vec![0u8; 16 * 16 * 4], 16, 16)
+            .expect("16x16 blank icon");
     }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("invalid tray icon")
+    tray_icon::Icon::from_rgba(rgba.to_vec(), size, size).expect("invalid tray icon")
 }
 
 #[cfg(test)]

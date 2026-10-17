@@ -65,6 +65,15 @@ if (-not $SkipBuild) {
 $exe = Join-Path $root 'target\release\mxrun.exe'
 if (-not (Test-Path $exe)) { throw "找不到 $exe" }
 
+# 图标资源是"静默失败"型缺陷：build.rs 缺 windres 时只发一条 cargo:warning，exe 照样能编出来。
+# 所以发之前必须读一遍 exe 的资源表（§2.50）。
+$iconCheck = Join-Path $root 'tools\verify-icon.ps1'
+if (Test-Path $iconCheck) {
+  Write-Host '校验 exe 里的图标资源…' -ForegroundColor Cyan
+  powershell -NoProfile -ExecutionPolicy Bypass -File $iconCheck -Exe $exe | ForEach-Object { Write-Host "   $_" }
+  if ($LASTEXITCODE -ne 0) { throw '图标没进 exe（检查 windres/rc.exe 是否在 PATH 上），不打包' }
+}
+
 # 版本号从 Cargo.toml 读，别手写（手写迟早和代码不一致）
 $version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 $built = (Get-Item $exe).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
