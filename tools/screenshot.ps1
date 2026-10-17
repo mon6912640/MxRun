@@ -51,7 +51,9 @@ public class MxShot {
       RECT r; if (!GetWindowRect(h, out r)) return true;
       int w = r.Right - r.Left, ht = r.Bottom - r.Top;
       if (w < 100 || ht < 60) return true;      // 过滤真正的辅助小窗
-      if (w <= ht) return true;                 // 卡片/列表都是宽大于高
+      // ⚠️ 不要用"宽 > 高"筛卡片（2026-10-17 踩）：`@` 模式是 14 行的高卡片
+      //    （实测 680×882），宽高比规则会把它当辅助窗丢掉，脚本报"没有可见的卡片窗口"。
+      //    可见 + 有标题 + 够大 + 取面积最大，才是稳的判据。
       long area = (long)w * ht;
       if (area > bestArea) { bestArea = area; best = h; bestW = w; bestH = ht; }
       return true;

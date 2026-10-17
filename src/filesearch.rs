@@ -161,6 +161,70 @@ fn decode_with_codepage(bytes: &[u8], codepage: u32) -> Option<String> {
     }
 }
 
+/// Everything-side negation terms for the configured exclusions.
+///
+/// Two rules come from driving `es.exe` by hand (2026-10-17):
+///
+/// * each term must be its **own argv** — one argument containing spaces is taken
+///   as a single literal phrase (`es "temp !x"` returns 0 rows, while
+///   `es temp "!x"` filters properly);
+/// * a term that itself contains a space kills the whole query
+///   (`!\system volume information\` → 0 rows even next to other negations), so
+///   those fragments are left to the client-side filter.
+///
+/// Regex mode (`-r`, used for `-`-leading queries) cannot carry `!term` at all.
+pub fn query_exclusions(exclusions: &[String], on: bool) -> Vec<String> {
+    if !on {
+        return Vec::new();
+    }
+    exclusions
+        .iter()
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty() && !e.contains(' '))
+        .map(|e| format!("!{e}"))
+        .collect()
+}
+
+/// Split a query into the search terms `es.exe` wants.
+///
+/// `es.exe` takes the search text as **several arguments** and reads a *single*
+/// argument containing spaces as one literal phrase — measured 2026-10-17:
+///
+/// ```text
+/// es "report template"   -> 0 rows                     (what Command::arg sends)
+/// es  report template    -> the rows one would expect
+/// ```
+///
+/// Rust's `Command::arg` always quotes an argument that contains spaces, so
+/// passing the query as one string silently broke **every multi-word search** in
+/// `@` mode. Quotes the user types keep a group together (Everything's phrase
+/// syntax); unbalanced quotes are forgiven.
+pub fn split_query_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for ch in query.trim().chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                if !quoted && !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Is this path something the user almost certainly did not mean?
 ///
 /// Matching is case-insensitive substring work on the whole path, because the
@@ -312,12 +376,29 @@ pub fn search(
         // "recently opened" instead, so nothing to do here.
         return Ok(Vec::new());
     }
-    if query.starts_with('-') {
-        // A leading dash is read as a switch ("Error 6: Unknown switch"), so
-        // take the regex route, where the text is the switch's argument.
+    let terms = split_query_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    if terms.iter().any(|t| t.starts_with('-')) {
+        // A dash-leading word would be read as a switch ("Error 6: Unknown
+        // switch"), so take the regex route, where the text is the switch's
+        // argument. Regex mode cannot carry `!term` exclusions or AND terms —
+        // the client-side filter still applies.
         cmd.arg("-r").arg(regex_escape(query));
     } else {
-        cmd.arg(query);
+        // One argv per term: see `split_query_terms`.
+        for term in &terms {
+            cmd.arg(term);
+        }
+        // Push the noise filter into Everything as well, so the row limit applies
+        // to **clean** results. Client-side filtering alone is too late: for
+        // `temp` the newest 56 matches were all `$RECYCLE.BIN\*.temp-archive`,
+        // every one of them was dropped afterwards, and the list came back empty
+        // while Everything held thousands of usable rows (user report, 2026-10-17).
+        for term in query_exclusions(exclusions, exclusions_on) {
+            cmd.arg(term);
+        }
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -447,6 +528,52 @@ mod tests {
         assert_eq!(decode_console(utf8), "D:\\tmp\\测试.txt\r\n");
 
         assert_eq!(decode_console(b""), "");
+    }
+
+    /// Multi-word queries must reach `es.exe` as **separate arguments**; sent as
+    /// one they are read as a literal phrase and match nothing (measured
+    /// 2026-10-17: `es "report template"` → 0 rows, `es report template` → hits).
+    #[test]
+    fn query_terms_are_split_so_multi_word_searches_work() {
+        assert_eq!(split_query_terms("temp"), vec!["temp"]);
+        assert_eq!(
+            split_query_terms("  report   template "),
+            vec!["report", "template"]
+        );
+        // Quotes the user typed keep a group together (Everything's phrase form).
+        assert_eq!(
+            split_query_terms("\"final report\" template"),
+            vec!["final report", "template"]
+        );
+        // Unbalanced quotes are forgiven rather than dropping the word.
+        assert_eq!(split_query_terms("\"unbalanced"), vec!["unbalanced"]);
+        assert!(split_query_terms("   ").is_empty());
+    }
+
+    /// The exclusions have to reach Everything as separate `!term` arguments.
+    /// Both "rules" below were measured against `es.exe` directly (2026-10-17):
+    /// a space inside one argument makes it a literal phrase, and a space inside
+    /// the *term* makes the whole query match nothing.
+    #[test]
+    fn exclusions_become_negation_terms_where_es_accepts_them() {
+        let ex: Vec<String> = vec![
+            "\\node_modules\\".to_string(),
+            "   ".to_string(),
+            String::new(),
+            "\\system volume information\\".to_string(),
+            "\\appdata\\local\\temp\\".to_string(),
+        ];
+        assert_eq!(
+            query_exclusions(&ex, true),
+            vec![
+                "!\\node_modules\\".to_string(),
+                "!\\appdata\\local\\temp\\".to_string(),
+            ],
+            "empty fragments and the one with spaces stay client-side only"
+        );
+        assert!(query_exclusions(&ex, false).is_empty(), "filter off = no terms");
+        // The app must never hand es.exe a term it answers by returning nothing.
+        assert!(query_exclusions(&ex, true).iter().all(|t| !t.contains(' ')));
     }
 
     #[test]
