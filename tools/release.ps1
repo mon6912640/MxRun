@@ -88,7 +88,10 @@ try {
 
     $authOut = (Invoke-Native $gh @('auth', 'status')).Text
     if ($authOut -notmatch 'Logged in to') { Die 'gh 未登录：先执行 gh auth login' }
-    $account = ($authOut | Select-String -Pattern 'account (\S+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+    # gh 的两种写法都认："Logged in to github.com account X" 与 "Logged in to github.com as X"
+    # （2026-10-20 本机 gh 输出的是后者，只认前者时这里会 "Cannot index into a null array"）
+    $acctMatch = $authOut | Select-String -Pattern '(?:account|as) (\S+)' | Select-Object -First 1
+    $account = if ($acctMatch) { $acctMatch.Matches[0].Groups[1].Value } else { '?' }
     Info "gh 已登录：$account"
 
     $running = @(Get-Process *mxrun* -ErrorAction SilentlyContinue)
