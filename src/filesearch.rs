@@ -1,6 +1,16 @@
-//! File search for `@` mode: Everything's `es.exe` behind a small, testable API.
+//! File search for `@` mode: Everything's `es.exe` behind a small, testable API,
+//! with anything's `ae.exe` as the fallback when `es.exe` is missing or fails.
 //!
-//! Measured facts this module is built on (2026-09-19, `docs/开发进度.md` §2.31):
+//! `ae.exe` (anything's CLI, measured 2026-10-20) speaks the same query
+//! language for everything `@` mode sends — one argv per term, `!term`
+//! negation, a term containing `\` matches the full path — with three
+//! differences the argument builders account for:
+//!
+//! * it writes **UTF-8** when piped (`decode_console` tries UTF-8 first);
+//! * `--` ends the switches, so a `-`-leading word needs no regex detour;
+//! * its complaints go to **stderr** as `ae: …`, exit 1 (usage) or 2 (no index).
+//!
+//! Measured facts about `es.exe` (2026-09-19, `docs/开发进度.md` §2.31):
 //!
 //! * `es.exe` writes **GBK** (codepage 936) to its stdout — `b2 e2 ca d4` is
 //!   "测试" — and `-utf8-bom` is accepted but **ignored** by 1.1.0.30.
@@ -61,39 +71,98 @@ const MAX_FETCH: usize = 400;
 /// an instance that never answers).
 const TIMEOUT_MS: u64 = 2_000;
 
+/// `ae.exe` gets a little longer: with anything not running it loads the saved
+/// index file itself before answering.
+const AE_TIMEOUT_MS: u64 = 3_000;
+
+/// After `es.exe` fails, ask `ae.exe` first for this long. Without it a hung
+/// Everything would cost the full [`TIMEOUT_MS`] on **every** keystroke before
+/// the fallback got its turn.
+const ES_COOLDOWN_MS: u64 = 30_000;
+
+/// Which command-line search tool answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// Everything's `es.exe` — the preferred one.
+    Es,
+    /// anything's `ae.exe` — the fallback.
+    Ae,
+}
+
+impl Engine {
+    pub fn exe_name(self) -> &'static str {
+        match self {
+            Engine::Es => "es.exe",
+            Engine::Ae => "ae.exe",
+        }
+    }
+
+    fn timeout_ms(self) -> u64 {
+        match self {
+            Engine::Es => TIMEOUT_MS,
+            Engine::Ae => AE_TIMEOUT_MS,
+        }
+    }
+
+    /// The program behind the CLI, for "is it running?" hints.
+    fn app_name(self) -> &'static str {
+        match self {
+            Engine::Es => "Everything",
+            Engine::Ae => "anything",
+        }
+    }
+}
+
+/// The search CLIs found on this machine. `es.exe` is asked first; `ae.exe`
+/// answers when `es.exe` is missing or fails (user request, 2026-10-20).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchTools {
+    pub es: Option<PathBuf>,
+    pub ae: Option<PathBuf>,
+}
+
+impl SearchTools {
+    /// Discover both tools; `es_cfg` / `ae_cfg` are the paths set in settings.
+    pub fn discover(es_cfg: Option<&str>, ae_cfg: Option<&str>) -> Self {
+        SearchTools {
+            es: discover_engine(Engine::Es, es_cfg),
+            ae: discover_engine(Engine::Ae, ae_cfg),
+        }
+    }
+
+    /// Is there anything at all to search with?
+    pub fn any(&self) -> bool {
+        self.es.is_some() || self.ae.is_some()
+    }
+
+    pub fn path(&self, engine: Engine) -> Option<&PathBuf> {
+        match engine {
+            Engine::Es => self.es.as_ref(),
+            Engine::Ae => self.ae.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, engine: Engine, path: Option<PathBuf>) {
+        match engine {
+            Engine::Es => self.es = path,
+            Engine::Ae => self.ae = path,
+        }
+    }
+}
+
+/// Discover one tool from its configured path.
+pub fn discover_engine(engine: Engine, configured: Option<&str>) -> Option<PathBuf> {
+    match engine {
+        Engine::Es => discover_es(configured),
+        Engine::Ae => discover_ae(configured),
+    }
+}
+
 /// Find `es.exe`: the configured path first, then `PATH`, then the usual spots.
 ///
 /// Pure filesystem work; returns `None` when Everything's CLI is not installed,
 /// which the UI reports as "装/指定 es.exe" rather than showing an empty list.
 pub fn discover_es(configured: Option<&str>) -> Option<PathBuf> {
-    // A test/power-user override, in the spirit of the other `MXRUN_*` switches.
-    if let Some(from_env) = std::env::var_os("MXRUN_ES_PATH") {
-        let path = PathBuf::from(from_env);
-        // Deliberately *not* falling through to auto-detection: the point of the
-        // override is to be able to say "there is no es.exe here" and watch the
-        // error path behave.
-        return path.is_file().then_some(path);
-    }
-    if let Some(p) = configured.map(str::trim).filter(|p| !p.is_empty()) {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-        // Also accept a directory, because that is what people copy out of a
-        // folder window.
-        let inside = path.join("es.exe");
-        if inside.is_file() {
-            return Some(inside);
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join("es.exe");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
     let mut guesses: Vec<PathBuf> = Vec::new();
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let base = PathBuf::from(local);
@@ -111,7 +180,117 @@ pub fn discover_es(configured: Option<&str>) -> Option<PathBuf> {
     ] {
         guesses.push(PathBuf::from(cand));
     }
+    discover_tool("es.exe", "MXRUN_ES_PATH", configured, guesses)
+}
+
+/// Find `ae.exe`: the configured path, `PATH`, next to MxRun itself, the
+/// usual spots — and last, next to a **running** `anything.exe`, because
+/// anything is a portable app that rarely lives anywhere predictable, and ae.exe
+/// ships in the same folder.
+pub fn discover_ae(configured: Option<&str>) -> Option<PathBuf> {
+    let mut guesses: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        guesses.push(dir.join("ae.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let base = PathBuf::from(local);
+        guesses.push(base.join("bin").join("ae.exe"));
+        guesses.push(base.join("Programs").join("anything").join("ae.exe"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let base = PathBuf::from(profile);
+        guesses.push(base.join(".local").join("bin").join("ae.exe"));
+        guesses.push(base.join("scoop").join("shims").join("ae.exe"));
+    }
+    discover_tool("ae.exe", "MXRUN_AE_PATH", configured, guesses).or_else(|| {
+        // An env override that names nothing means "no ae.exe", on purpose.
+        if std::env::var_os("MXRUN_AE_PATH").is_some() {
+            return None;
+        }
+        running_exe_dir("anything.exe")
+            .map(|dir| dir.join("ae.exe"))
+            .filter(|p| p.is_file())
+    })
+}
+
+/// The shared lookup order: env override, configured path (file or folder),
+/// `PATH`, then `guesses`.
+fn discover_tool(exe: &str, env_var: &str, configured: Option<&str>, guesses: Vec<PathBuf>) -> Option<PathBuf> {
+    // A test/power-user override, in the spirit of the other `MXRUN_*` switches.
+    if let Some(from_env) = std::env::var_os(env_var) {
+        let path = PathBuf::from(from_env);
+        // Deliberately *not* falling through to auto-detection: the point of the
+        // override is to be able to say "there is no es.exe here" and watch the
+        // error path behave.
+        return path.is_file().then_some(path);
+    }
+    if let Some(p) = configured.map(str::trim).filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+        // Also accept a directory, because that is what people copy out of a
+        // folder window.
+        let inside = path.join(exe);
+        if inside.is_file() {
+            return Some(inside);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(exe);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     guesses.into_iter().find(|p| p.is_file())
+}
+
+/// Folder of the first running process whose image is named `name`.
+///
+/// One Toolhelp snapshot (a few ms), only reached when every cheaper lookup
+/// came up empty.
+fn running_exe_dir(name: &str) -> Option<PathBuf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        let mut more = Process32FirstW(snap, &mut entry).is_ok();
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if exe.eq_ignore_ascii_case(name) {
+                if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, entry.th32ProcessID) {
+                    let mut buf = [0u16; 1024];
+                    let mut size = buf.len() as u32;
+                    let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size).is_ok();
+                    let _ = CloseHandle(process);
+                    if ok {
+                        let image = PathBuf::from(String::from_utf16_lossy(&buf[..size as usize]));
+                        found = image.parent().map(Path::to_path_buf);
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            more = Process32NextW(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
 }
 
 /// Decode what a console program wrote.
@@ -337,21 +516,75 @@ fn hit_score(hit: &FileHit, query: &str, opened: &std::collections::HashMap<Stri
     score
 }
 
-/// Ask Everything. Blocking; the caller runs it off the UI thread.
-///
-/// Returns `Err` with a human-readable reason when the tool is missing, when it
-/// fails, or when it takes too long — the UI shows that instead of an empty
-/// list, because "nothing found" and "the search is broken" must not look alike.
-pub fn search(
-    es: &Path,
-    query: &str,
-    limit: usize,
-    exclusions: &[String],
-    exclusions_on: bool,
-    opened: &std::collections::HashMap<String, u32>,
-) -> Result<Vec<FileHit>, String> {
-    let fetch = limit.saturating_mul(OVERFETCH).clamp(1, MAX_FETCH);
-    let mut cmd = std::process::Command::new(es);
+/// Unix milliseconds until which `es.exe` waits behind `ae.exe` (see
+/// [`ES_COOLDOWN_MS`]). `0` = no cooldown.
+static ES_COOLDOWN_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The order to ask the tools in: `es.exe` first, unless it failed recently
+/// and `ae.exe` is there to stand in for it.
+fn engine_order(tools: &SearchTools, es_cooling: bool) -> Vec<Engine> {
+    let mut order: Vec<Engine> = [Engine::Es, Engine::Ae]
+        .into_iter()
+        .filter(|e| tools.path(*e).is_some())
+        .collect();
+    if es_cooling && order.len() == 2 {
+        order.reverse();
+    }
+    order
+}
+
+/// Command-line arguments for `es.exe`.
+fn es_args(query: &str, terms: &[String], fetch: usize, exclusions: &[String], exclusions_on: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-n".into(), fetch.to_string()];
+    // Newest first as the *candidate* order: we re-rank anyway, and recency is
+    // the better prior when a query matches thousands of files.
+    args.extend(["-sort".into(), "date-modified".into(), "-sort-descending".into()]);
+    if terms.iter().any(|t| t.starts_with('-')) {
+        // A dash-leading word would be read as a switch ("Error 6: Unknown
+        // switch"), so take the regex route, where the text is the switch's
+        // argument. Regex mode cannot carry `!term` exclusions or AND terms —
+        // the client-side filter still applies.
+        args.push("-r".into());
+        args.push(regex_escape(query));
+    } else {
+        // One argv per term: see `split_query_terms`.
+        args.extend(terms.iter().cloned());
+        // Push the noise filter into Everything as well, so the row limit applies
+        // to **clean** results. Client-side filtering alone is too late: for
+        // `temp` the newest 56 matches were all `$RECYCLE.BIN\*.temp-archive`,
+        // every one of them was dropped afterwards, and the list came back empty
+        // while Everything held thousands of usable rows (user report, 2026-10-17).
+        args.extend(query_exclusions(exclusions, exclusions_on));
+    }
+    args
+}
+
+/// Command-line arguments for `ae.exe`. `--` ends the switches, so dashed
+/// words are plain terms and the exclusions always apply.
+fn ae_args(terms: &[String], fetch: usize, exclusions: &[String], exclusions_on: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-n".into(), fetch.to_string(), "-sort-date".into(), "-desc".into(), "--".into()];
+    args.extend(terms.iter().cloned());
+    args.extend(query_exclusions(exclusions, exclusions_on));
+    args
+}
+
+/// What a finished tool run printed.
+struct ToolOutput {
+    stdout: String,
+    stderr: String,
+}
+
+/// Run one search CLI with a timeout. `Err` is a human-readable reason.
+fn run_tool(engine: Engine, exe: &Path, args: &[String]) -> Result<ToolOutput, String> {
+    let name = engine.exe_name();
+    let mut cmd = std::process::Command::new(exe);
     // **No console at all.** `es.exe` is a console-subsystem binary (PE
     // subsystem 3, verified), so a plain spawn allocates a console: invisible with
     // `CREATE_NO_WINDOW`, but still there. A user reported "every keystroke in `@`
@@ -359,68 +592,38 @@ pub fn search(
     // (`tools/probe-es-sound.ps1`) could not reproduce it with *any* flag, the
     // console is the only `@`-specific side effect we control — so it goes.
     // `DETACHED_PROCESS` gives the child no console at all; the pipes we pass
-    // explicitly keep stdout working.
+    // explicitly keep stdout working. `ae.exe` is a console binary too.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    cmd.arg("-n").arg(fetch.to_string());
-    // Newest first as the *candidate* order: we re-rank anyway, and recency is
-    // the better prior when a query matches thousands of files.
-    cmd.arg("-sort").arg("date-modified").arg("-sort-descending");
-    let query = query.trim();
-    if query.is_empty() {
-        // Empty query: Everything would list the whole index. The UI shows
-        // "recently opened" instead, so nothing to do here.
-        return Ok(Vec::new());
-    }
-    let terms = split_query_terms(query);
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
-    if terms.iter().any(|t| t.starts_with('-')) {
-        // A dash-leading word would be read as a switch ("Error 6: Unknown
-        // switch"), so take the regex route, where the text is the switch's
-        // argument. Regex mode cannot carry `!term` exclusions or AND terms —
-        // the client-side filter still applies.
-        cmd.arg("-r").arg(regex_escape(query));
-    } else {
-        // One argv per term: see `split_query_terms`.
-        for term in &terms {
-            cmd.arg(term);
-        }
-        // Push the noise filter into Everything as well, so the row limit applies
-        // to **clean** results. Client-side filtering alone is too late: for
-        // `temp` the newest 56 matches were all `$RECYCLE.BIN\*.temp-archive`,
-        // every one of them was dropped afterwards, and the list came back empty
-        // while Everything held thousands of usable rows (user report, 2026-10-17).
-        for term in query_exclusions(exclusions, exclusions_on) {
-            cmd.arg(term);
-        }
-    }
+    cmd.args(args);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("无法启动 es.exe（{}）：{e}", es.display()))?;
+        .map_err(|e| format!("无法启动 {name}（{}）：{e}", exe.display()))?;
 
-    // Read the pipe on its own thread: a child that fills the buffer while we
+    // Read both pipes on their own threads: a child that fills a buffer while we
     // poll for the timeout would otherwise deadlock.
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut out) = stdout {
-            use std::io::Read;
-            let _ = out.read_to_end(&mut buf);
-        }
-        buf
-    });
+    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut out) = pipe {
+                let _ = out.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_MS);
+    let timeout = engine.timeout_ms();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -428,41 +631,129 @@ pub fn search(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = reader.join();
-                    return Err(format!("es.exe 超时（{}ms）——Everything 是否在运行？", TIMEOUT_MS));
+                    let _ = out_reader.join();
+                    let _ = err_reader.join();
+                    return Err(format!("{name} 超时（{timeout}ms）——{} 是否在运行？", engine.app_name()));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
             Err(e) => {
-                let _ = reader.join();
-                return Err(format!("等待 es.exe 失败：{e}"));
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("等待 {name} 失败：{e}"));
             }
         }
     };
 
-    let bytes = reader.join().unwrap_or_default();
+    let stdout = decode_console(&out_reader.join().unwrap_or_default());
+    let stderr = decode_console(&err_reader.join().unwrap_or_default());
     let code = status.code().unwrap_or(-1);
-    let text = decode_console(&bytes);
     if code != 0 {
-        // es.exe prints its complaints on stdout, not stderr.
-        let first = text
-            .lines()
-            .find(|l| l.contains("Error"))
-            .unwrap_or("(无说明)")
-            .trim()
-            .to_string();
-        return Err(format!("es.exe 返回 {code}：{first}"));
+        return Err(format!("{name} 返回 {code}：{}", failure_reason(engine, &stdout, &stderr)));
     }
+    Ok(ToolOutput { stdout, stderr })
+}
 
-    let hits = parse_hits(&text);
-    let filtered: Vec<FileHit> = if exclusions_on {
-        hits.into_iter()
-            .filter(|h| !is_noise(&h.path, exclusions))
-            .collect()
-    } else {
-        hits
+/// The line that explains a failed run: `es.exe` prints its complaints on
+/// stdout (`Error 8: …`), `ae.exe` on stderr (`ae: …`).
+fn failure_reason(engine: Engine, stdout: &str, stderr: &str) -> String {
+    let line = match engine {
+        Engine::Es => stdout.lines().find(|l| l.contains("Error")),
+        Engine::Ae => stderr
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.strip_prefix("ae:").unwrap_or(l)),
     };
-    Ok(rank(filtered, query, opened).into_iter().take(limit).collect())
+    line.map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or("(无说明)")
+        .to_string()
+}
+
+/// Ask Everything (or anything). Blocking; the caller runs it off the UI thread.
+///
+/// `es.exe` goes first; when it is missing or fails, `ae.exe` answers. Returns
+/// the hits plus which tool produced them, or `Err` with a human-readable
+/// reason when no tool is there, or every one failed or took too long — the UI
+/// shows that instead of an empty list, because "nothing found" and "the search
+/// is broken" must not look alike.
+pub fn search(
+    tools: &SearchTools,
+    query: &str,
+    limit: usize,
+    exclusions: &[String],
+    exclusions_on: bool,
+    opened: &std::collections::HashMap<String, u32>,
+) -> Result<(Vec<FileHit>, Engine), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        // Empty query: Everything would list the whole index. The UI shows
+        // "recently opened" instead, so nothing to do here.
+        return Ok((Vec::new(), Engine::Es));
+    }
+    let terms = split_query_terms(query);
+    if terms.is_empty() {
+        return Ok((Vec::new(), Engine::Es));
+    }
+    let fetch = limit.saturating_mul(OVERFETCH).clamp(1, MAX_FETCH);
+
+    let es_cooling = ES_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) > now_ms();
+    let order = engine_order(tools, es_cooling);
+    if order.is_empty() {
+        return Err("找不到 es.exe 或 ae.exe".to_string());
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for engine in order {
+        let Some(exe) = tools.path(engine) else { continue };
+        let args = match engine {
+            Engine::Es => es_args(query, &terms, fetch, exclusions, exclusions_on),
+            Engine::Ae => ae_args(&terms, fetch, exclusions, exclusions_on),
+        };
+        match run_tool(engine, exe, &args) {
+            Ok(out) => {
+                if engine == Engine::Es {
+                    ES_COOLDOWN_UNTIL.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                let hits = parse_hits(&out.stdout);
+                let filtered: Vec<FileHit> = if exclusions_on {
+                    hits.into_iter()
+                        .filter(|h| !is_noise(&h.path, exclusions))
+                        .collect()
+                } else {
+                    hits
+                };
+                let ranked = rank(filtered, query, opened).into_iter().take(limit).collect();
+                return Ok((ranked, engine));
+            }
+            Err(why) => {
+                if engine == Engine::Es {
+                    ES_COOLDOWN_UNTIL.store(now_ms() + ES_COOLDOWN_MS, std::sync::atomic::Ordering::Relaxed);
+                }
+                errors.push(why);
+            }
+        }
+    }
+    Err(errors.join("；"))
+}
+
+/// Check that a tool really answers a search, for the settings page's
+/// 测试 button: "the file exists" is not "the search works" (Everything not
+/// running is the classic case). `Ok` carries a one-line verdict.
+pub fn probe(engine: Engine, exe: &Path) -> Result<String, String> {
+    let args: Vec<String> = match engine {
+        Engine::Es => vec!["-n".into(), "1".into(), "windows".into()],
+        Engine::Ae => vec!["-n".into(), "1".into(), "--".into(), "windows".into()],
+    };
+    let t0 = std::time::Instant::now();
+    let out = run_tool(engine, exe, &args)?;
+    let ms = t0.elapsed().as_millis();
+    // ae.exe answers from the saved index file when anything is not running,
+    // and says so on stderr. Usable, but no longer live.
+    if engine == Engine::Ae && out.stderr.contains("没有运行") {
+        return Ok(format!("可用（{ms}ms）· anything 没在运行，结果来自上次保存的索引，建议让 anything 常驻"));
+    }
+    Ok(format!("可用（{ms}ms）"))
 }
 
 /// Spawn `es.exe` once, for the "does spawning it make a sound?" A/B.
@@ -672,6 +963,88 @@ mod tests {
         assert_eq!(regex_escape("plain-name.txt"), r"plain-name\.txt");
         assert_eq!(regex_escape("a(b)[c]"), r"a\(b\)\[c\]");
         assert_eq!(regex_escape(""), "");
+    }
+
+    /// es.exe is asked first; after it failed, ae.exe goes first for a while —
+    /// but es.exe is still tried if ae.exe fails too.
+    #[test]
+    fn es_goes_first_unless_it_failed_recently() {
+        let both = SearchTools {
+            es: Some(PathBuf::from("es.exe")),
+            ae: Some(PathBuf::from("ae.exe")),
+        };
+        assert_eq!(engine_order(&both, false), vec![Engine::Es, Engine::Ae]);
+        assert_eq!(engine_order(&both, true), vec![Engine::Ae, Engine::Es]);
+        let es_only = SearchTools { es: both.es.clone(), ae: None };
+        assert_eq!(engine_order(&es_only, true), vec![Engine::Es], "nothing to stand in");
+        let ae_only = SearchTools { es: None, ae: both.ae.clone() };
+        assert_eq!(engine_order(&ae_only, false), vec![Engine::Ae]);
+        assert!(engine_order(&SearchTools::default(), false).is_empty());
+        assert!(!SearchTools::default().any());
+    }
+
+    /// ae.exe takes `--` and then the same terms and `!exclusions` es.exe gets
+    /// (verified against the real ae.exe 0.2.0 on 2026-10-20), so a dashed word
+    /// needs no regex detour there and the exclusions still apply.
+    #[test]
+    fn ae_gets_terms_after_a_double_dash() {
+        let ex = vec!["\\node_modules\\".to_string()];
+        let terms = split_query_terms("-foo bar");
+        assert_eq!(
+            ae_args(&terms, 40, &ex, true),
+            vec!["-n", "40", "-sort-date", "-desc", "--", "-foo", "bar", "!\\node_modules\\"]
+        );
+        // es.exe still takes the regex route for the same query, without `!terms`.
+        assert_eq!(
+            es_args("-foo bar", &terms, 40, &ex, true),
+            vec!["-n", "40", "-sort", "date-modified", "-sort-descending", "-r", "-foo bar"]
+        );
+        let plain = split_query_terms("report");
+        assert_eq!(
+            es_args("report", &plain, 40, &ex, true),
+            vec!["-n", "40", "-sort", "date-modified", "-sort-descending", "report", "!\\node_modules\\"]
+        );
+    }
+
+    #[test]
+    fn failure_reasons_come_from_the_right_stream() {
+        assert_eq!(
+            failure_reason(Engine::Es, "Error 8: Everything IPC not found.\r\n", ""),
+            "Error 8: Everything IPC not found."
+        );
+        assert_eq!(
+            failure_reason(Engine::Ae, "", "\r\nae: anything 没有运行，且无法读取索引文件\r\n"),
+            "anything 没有运行，且无法读取索引文件"
+        );
+        assert_eq!(failure_reason(Engine::Ae, "Error x", ""), "(无说明)");
+    }
+
+    /// The whole fallback against real binaries: an "es.exe" that fails, then
+    /// `ae.exe` answering. Needs `MXRUN_TEST_AE` (a working ae.exe) and
+    /// `MXRUN_TEST_QUERY` (a name it can find).
+    #[test]
+    #[ignore = "needs a real ae.exe: set MXRUN_TEST_AE and MXRUN_TEST_QUERY"]
+    fn live_fallback_to_ae() {
+        let (Ok(ae), Ok(query)) = (std::env::var("MXRUN_TEST_AE"), std::env::var("MXRUN_TEST_QUERY")) else {
+            eprintln!("set MXRUN_TEST_AE and MXRUN_TEST_QUERY");
+            return;
+        };
+        // `where.exe` exits non-zero for these arguments: a stand-in broken es.exe.
+        let broken_es = PathBuf::from(r"C:\Windows\System32\where.exe");
+        let tools = SearchTools { es: Some(broken_es.clone()), ae: Some(PathBuf::from(&ae)) };
+        let opened = std::collections::HashMap::new();
+        let (hits, engine) = search(&tools, &query, 10, &[], false, &opened).expect("ae.exe should answer");
+        eprintln!("{} hits via {:?}: {:?}", hits.len(), engine, hits.iter().map(|h| &h.path).collect::<Vec<_>>());
+        assert_eq!(engine, Engine::Ae);
+        assert!(!hits.is_empty());
+        // Both broken: the error names both tools.
+        let none = SearchTools { es: Some(broken_es.clone()), ae: Some(broken_es) };
+        ES_COOLDOWN_UNTIL.store(0, std::sync::atomic::Ordering::Relaxed);
+        let err = search(&none, &query, 10, &[], false, &opened).unwrap_err();
+        eprintln!("both broken: {err}");
+        assert!(err.contains("es.exe") && err.contains("ae.exe"));
+        eprintln!("probe ae: {:?}", probe(Engine::Ae, Path::new(&ae)));
+        eprintln!("discover_ae(None): {:?}", discover_ae(None));
     }
 
     /// A leading dash is a switch to `es.exe` ("Error 6: Unknown switch.", exit

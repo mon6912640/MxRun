@@ -60,6 +60,11 @@ const DEFAULT_HOTKEY: &str = "Alt+F1";
 /// honest (user's ask, 2026-10-17: "当前 git 地址是唯一下载的地址，写在设置页").
 const DOWNLOAD_URL: &str = "https://github.com/mon6912640/MxRun";
 
+/// Where the settings guide sends people for anything (whose `ae.exe` stands
+/// in for `es.exe`) and for Everything.
+const ANYTHING_DOWNLOAD_URL: &str = "https://github.com/mon6912640/anything/releases/latest";
+const EVERYTHING_DOWNLOAD_URL: &str = "https://www.voidtools.com/zh-cn/downloads/";
+
 /// When was the running `mxrun.exe` built?
 ///
 /// Added after a user reported "typing `@` closes the window" (2026-09-19) — it
@@ -2971,7 +2976,8 @@ const LIST_CHROME: f32 = 168.0;
 /// and gives the calculator a discoverable way in.
 const CALC_PREFIX: char = '=';
 
-/// `@`: file search through Everything (`es.exe`).
+/// `@`: file search through Everything (`es.exe`), or anything (`ae.exe`) when
+/// `es.exe` is missing or fails.
 const FILE_PREFIX: char = '@';
 
 /// A leading character that switches the box into a **mode** instead of a plain
@@ -3384,9 +3390,20 @@ struct MxRunApp {
     file_pending: Option<(String, std::time::Instant)>,
     /// In-flight search: a background thread that cannot be cancelled, only
     /// ignored (the query it was asked for travels with the answer).
-    file_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<filesearch::FileHit>, String>)>>,
-    /// Where `es.exe` is, or `None` when Everything's CLI is not installed.
-    es_path: Option<std::path::PathBuf>,
+    file_job: Option<std::sync::mpsc::Receiver<(String, Result<(Vec<filesearch::FileHit>, filesearch::Engine), String>)>>,
+    /// Where `es.exe` / `ae.exe` are; `es.exe` is asked first, `ae.exe` when it
+    /// is missing or fails.
+    search_tools: filesearch::SearchTools,
+    /// Which tool answered the last file query (the status bar names `ae.exe`
+    /// so a silent fallback is not a mystery).
+    file_engine: Option<filesearch::Engine>,
+    /// The settings page's 测试 verdicts, one per tool found.
+    tool_checks: Vec<(filesearch::Engine, Result<String, String>)>,
+    /// Probe running in the background for the settings page.
+    tool_check_job: Option<std::sync::mpsc::Receiver<Vec<(filesearch::Engine, Result<String, String>)>>>,
+    /// The settings page's manual-path boxes, kept across frames.
+    es_path_edit: String,
+    ae_path_edit: String,
     /// Noise-exclusion fragments and whether the filter is on (settings).
     file_exclusions: Vec<String>,
     file_exclusions_on: bool,
@@ -3645,7 +3662,15 @@ impl MxRunApp {
             file_answered: String::new(),
             file_pending: None,
             file_job: None,
-            es_path: filesearch::discover_es(store.get_config("es_path").as_deref()),
+            search_tools: filesearch::SearchTools::discover(
+                store.get_config("es_path").as_deref(),
+                store.get_config("ae_path").as_deref(),
+            ),
+            file_engine: None,
+            tool_checks: Vec::new(),
+            tool_check_job: None,
+            es_path_edit: store.get_config("es_path").unwrap_or_default().to_string(),
+            ae_path_edit: store.get_config("ae_path").unwrap_or_default().to_string(),
             file_exclusions: store
                 .get_config("file_exclude")
                 .map(|s| split_exclusions(&s))
@@ -4417,8 +4442,8 @@ impl MxRunApp {
         self.results.clear();
         let query = Prefix::Files.strip(&self.input).to_string();
 
-        if self.es_path.is_none() {
-            let msg = "找不到 es.exe —— 装一个 Everything（含命令行工具），或在设置里指定 es.exe 路径";
+        if !self.search_tools.any() {
+            let msg = "找不到 es.exe 或 ae.exe —— 设置 → 文件搜索 里有下载和设置指引";
             self.file_error = Some(msg.to_string());
             self.file_hits.clear();
             // The status bar says it too: that is where the eye lands first.
@@ -4446,7 +4471,7 @@ impl MxRunApp {
                 })
                 .collect();
             let status = if self.file_hits.is_empty() {
-                "文件搜索 · 输入关键字开始搜索（Everything 索引）".to_string()
+                format!("文件搜索 · 输入关键字开始搜索（{} 索引）", self.file_index_name())
             } else {
                 format!("文件搜索 · 最近打开过的 {} 个文件", self.file_hits.len())
             };
@@ -4475,13 +4500,24 @@ impl MxRunApp {
     }
 
     /// What the status bar says in `@` mode, derived from the search state.
+    /// Whose index `@` mode searches, for the status texts: anything's when
+    /// `ae.exe` answered last or is the only tool, Everything's otherwise.
+    fn file_index_name(&self) -> &'static str {
+        let ae = self.file_engine == Some(filesearch::Engine::Ae)
+            || (self.search_tools.es.is_none() && self.search_tools.ae.is_some());
+        if ae { "anything" } else { "Everything" }
+    }
+
     fn file_status(&self, query: &str) -> String {
         if let Some(err) = &self.file_error {
             return format!("文件搜索失败：{err}");
         }
         if self.file_answered == query {
             return if self.file_hits.is_empty() {
-                "没有匹配的文件（Everything 索引里没找到）".to_string()
+                format!("没有匹配的文件（{} 索引里没找到）", self.file_index_name())
+            } else if self.file_engine == Some(filesearch::Engine::Ae) && self.search_tools.es.is_some() {
+                // es.exe is there but failed: say who stood in for it.
+                format!("{} 个结果 · es.exe 不可用，来自 ae.exe · {}", self.file_hits.len(), Prefix::Files.hint())
             } else {
                 format!("{} 个结果 · {}", self.file_hits.len(), Prefix::Files.hint())
             };
@@ -4574,9 +4610,10 @@ impl MxRunApp {
     /// Hand a query to a background thread: `es.exe` blocks for tens of
     /// milliseconds, which is far too long for the UI thread.
     fn start_file_search(&mut self, ctx: &egui::Context, query: String) {
-        let Some(es) = self.es_path.clone() else {
+        if !self.search_tools.any() {
             return;
-        };
+        }
+        let tools = self.search_tools.clone();
         let exclusions = self.file_exclusions.clone();
         let exclusions_on = self.file_exclusions_on;
         let opened = self.file_opened.clone();
@@ -4585,14 +4622,15 @@ impl MxRunApp {
         let q = query.clone();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let result = filesearch::search(&es, &q, FILE_ROWS, &exclusions, exclusions_on, &opened);
+            let result = filesearch::search(&tools, &q, FILE_ROWS, &exclusions, exclusions_on, &opened);
             // Timing matters for this feature: a query that takes seconds is what
             // makes keystrokes land "while a search is in flight" (2026-10-13).
             log_line(&format!(
-                "files: worker {:?} took {}ms ({} hits)",
+                "files: worker {:?} took {}ms ({} hits via {})",
                 q,
                 t0.elapsed().as_millis(),
-                result.as_ref().map(|h| h.len()).unwrap_or(0)
+                result.as_ref().map(|(h, _)| h.len()).unwrap_or(0),
+                result.as_ref().map(|(_, e)| e.exe_name()).unwrap_or("-")
             ));
             let _ = tx.send((q, result));
             ctx.request_repaint();
@@ -4600,11 +4638,12 @@ impl MxRunApp {
         self.file_job = Some(rx);
     }
 
-    fn apply_file_result(&mut self, query: String, result: Result<Vec<filesearch::FileHit>, String>) {
+    fn apply_file_result(&mut self, query: String, result: Result<(Vec<filesearch::FileHit>, filesearch::Engine), String>) {
         match result {
-            Ok(hits) => {
-                log_line(&format!("files: {:?} -> {} hits", query, hits.len()));
+            Ok((hits, engine)) => {
+                log_line(&format!("files: {:?} -> {} hits ({})", query, hits.len(), engine.exe_name()));
                 self.file_error = None;
+                self.file_engine = Some(engine);
                 self.file_hits = hits;
             }
             Err(why) => {
@@ -6033,75 +6072,110 @@ impl MxRunApp {
     }
 
     /// Auto-discovery (P0-4) in the settings page.
-    /// 文件搜索（`@` 模式）：es.exe 位置 + 噪音排除规则。
+    /// 文件搜索（`@` 模式）：es.exe / ae.exe 位置与检测、设置指引、噪音排除规则。
     ///
     /// Both were the user's explicit asks on 2026-09-19: "默认排除，可在设置中设置".
+    /// The ae.exe fallback and its guide: 2026-10-20 ("es.exe 不行的时候引导下载和设置 ae.exe").
     fn render_file_settings(&mut self, ui: &mut egui::Ui) {
+        use filesearch::Engine;
         ui.label(RichText::new("文件搜索（@）").size(15.0));
-        ui.add_space(6.0);
-
-        // --- es.exe ---
-        let found = self
-            .es_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "未找到".to_string());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("es.exe").size(13.0));
-            ui.add_space(8.0);
-            let ok = self.es_path.is_some();
-            ui.label(
-                RichText::new(truncate_chars(&found, 58))
-                    .size(12.0)
-                    .color(if ok { pal().text_dim } else { pal().danger }),
-            );
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("重新检测").clicked() {
-                let configured = self.store.get_config("es_path");
-                self.es_path = filesearch::discover_es(configured.as_deref());
-                self.status = match &self.es_path {
-                    Some(p) => format!("找到 es.exe：{}", p.display()),
-                    None => "仍未找到 es.exe（Everything 的命令行工具）".to_string(),
-                };
-                log_line(&format!("files: es detect -> {:?}", self.es_path));
-            }
-            if self.es_path.is_some() && ui.button("清除指定路径").clicked() {
-                self.store.set_config("es_path", "");
-                self.es_path = filesearch::discover_es(None);
-                self.status = "已清除指定路径，改回自动检测".to_string();
-            }
-        });
         ui.add_space(4.0);
         ui.label(
-            RichText::new("把 es.exe 拖进来或粘贴路径也可以：在下面输入框里改完按回车生效")
+            RichText::new("优先用 Everything 的 es.exe；es.exe 找不到或调用失败时，自动改用 anything 的 ae.exe")
                 .size(11.0)
                 .color(pal().text_faint),
         );
-        let mut manual = self
-            .store
-            .get_config("es_path")
-            .unwrap_or_default()
-            .to_string();
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut manual)
-                    .hint_text("例如 D:\\Tools\\Everything\\es.exe")
-                    .desired_width(420.0),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                let trimmed = manual.trim().to_string();
-                self.store.set_config("es_path", &trimmed);
-                self.es_path = filesearch::discover_es(Some(&trimmed));
-                self.status = if self.es_path.is_some() {
-                    format!("已指定 es.exe：{}", trimmed)
-                } else {
-                    format!("这个路径下没有 es.exe：{trimmed}")
+        ui.add_space(6.0);
+
+        // The first look at this page tests both tools, so the guide below is
+        // based on "does it search", not just "is the file there".
+        if self.tool_checks.is_empty() && self.tool_check_job.is_none() && self.search_tools.any() {
+            self.start_tool_check(ui.ctx());
+        }
+        self.poll_tool_check(ui.ctx());
+
+        // --- one row per tool: where it is, and whether it answers ---
+        for engine in [Engine::Es, Engine::Ae] {
+            let path = self.search_tools.path(engine).cloned();
+            let check = self
+                .tool_checks
+                .iter()
+                .find(|(e, _)| *e == engine)
+                .map(|(_, r)| r.clone());
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [52.0, 18.0],
+                    egui::Label::new(RichText::new(engine.exe_name()).size(13.0)),
+                );
+                let (text, color) = match &path {
+                    Some(p) => (truncate_chars(&p.display().to_string(), 58), pal().text_dim),
+                    None => ("未找到".to_string(), pal().danger),
                 };
-                log_line(&format!("files: es configured {:?} -> {:?}", trimmed, self.es_path));
+                ui.label(RichText::new(text).size(12.0).color(color));
+            });
+            let verdict = match (&path, &check) {
+                (None, _) => None,
+                (Some(_), None) if self.tool_check_job.is_some() => {
+                    Some(("测试中…".to_string(), pal().text_faint))
+                }
+                (Some(_), None) => None,
+                (Some(_), Some(Ok(msg))) => Some((format!("✓ {msg}"), pal().ok)),
+                (Some(_), Some(Err(why))) => Some((format!("✗ {why}"), pal().danger)),
+            };
+            if let Some((text, color)) = verdict {
+                ui.horizontal(|ui| {
+                    ui.add_space(60.0);
+                    ui.label(RichText::new(truncate_chars(&text, 90)).size(11.0).color(color));
+                });
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let busy = self.tool_check_job.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("重新检测并测试"))
+                .clicked()
+            {
+                self.rediscover_tools();
+                self.start_tool_check(ui.ctx());
+                self.status = match (&self.search_tools.es, &self.search_tools.ae) {
+                    (None, None) => "仍未找到 es.exe 或 ae.exe —— 按下面的指引装一个".to_string(),
+                    _ => "已重新检测，正在测试…".to_string(),
+                };
             }
         });
+
+        // --- the guide: shown while es.exe cannot search and ae.exe is not
+        // ready to stand in for it ---
+        let works = |engine: Engine| {
+            self.search_tools.path(engine).is_some()
+                && !matches!(
+                    self.tool_checks.iter().find(|(e, _)| *e == engine),
+                    Some((_, Err(_)))
+                )
+        };
+        let es_ok = works(Engine::Es);
+        let ae_ok = works(Engine::Ae);
+        ui.add_space(8.0);
+        if !es_ok && ae_ok {
+            ui.label(
+                RichText::new("es.exe 用不了，@ 搜索会改用 ae.exe ✓")
+                    .size(12.0)
+                    .color(pal().ok),
+            );
+        } else if !es_ok {
+            self.render_ae_guide(ui);
+        }
+
+        // --- manual paths ---
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("也可以手动指定路径（粘贴 exe 或所在文件夹，回车生效）：")
+                .size(11.0)
+                .color(pal().text_faint),
+        );
+        self.render_tool_path_input(ui, Engine::Es, "es_path", "例如 C:\\Program Files\\Everything\\es.exe");
+        self.render_tool_path_input(ui, Engine::Ae, "ae_path", "例如 D:\\Tools\\anything\\ae.exe");
 
         ui.add_space(10.0);
         ui.separator();
@@ -6157,6 +6231,217 @@ impl MxRunApp {
                     .size(11.0)
                     .color(pal().text_faint),
             );
+        });
+    }
+
+    /// Re-run discovery for both tools from the configured paths.
+    fn rediscover_tools(&mut self) {
+        self.search_tools = filesearch::SearchTools::discover(
+            self.store.get_config("es_path").as_deref(),
+            self.store.get_config("ae_path").as_deref(),
+        );
+        log_line(&format!("files: tools detect -> {:?}", self.search_tools));
+    }
+
+    /// Test every tool found, off the UI thread (a broken es.exe can take the
+    /// whole 2 s timeout to say so).
+    fn start_tool_check(&mut self, ctx: &egui::Context) {
+        let tools = self.search_tools.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            for engine in [filesearch::Engine::Es, filesearch::Engine::Ae] {
+                if let Some(path) = tools.path(engine) {
+                    out.push((engine, filesearch::probe(engine, path)));
+                }
+            }
+            let _ = tx.send(out);
+            ctx.request_repaint();
+        });
+        self.tool_checks.clear();
+        self.tool_check_job = Some(rx);
+    }
+
+    fn poll_tool_check(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.tool_check_job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(checks) => {
+                for (engine, verdict) in &checks {
+                    log_line(&format!("files: check {} -> {:?}", engine.exe_name(), verdict));
+                }
+                self.tool_checks = checks;
+                self.tool_check_job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // egui idles without input; keep frames coming until the answer lands.
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.tool_check_job = None;
+            }
+        }
+    }
+
+    /// Step-by-step guide to setting up ae.exe, for when es.exe cannot search.
+    fn render_ae_guide(&mut self, ui: &mut egui::Ui) {
+        let es_found = self.search_tools.es.is_some();
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let headline = if es_found {
+                    "es.exe 用不了（多半是 Everything 没在运行）？可以改用 anything 的 ae.exe"
+                } else {
+                    "没有 es.exe？可以改用 anything 的 ae.exe"
+                };
+                ui.label(RichText::new(headline).size(13.0).color(pal().text));
+                ui.label(
+                    RichText::new("anything 是类似 Everything 的文件名搜索，不需要管理员权限、不用安装，适合内网/离线机器")
+                        .size(11.0)
+                        .color(pal().text_faint),
+                );
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("① 下载 anything 便携版（zip 里有 anything.exe 和 ae.exe）：").size(12.0).color(pal().text_dim));
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    self.render_link(ui, ANYTHING_DOWNLOAD_URL);
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new("内网机器：在能上网的电脑上下载，再把 zip 拷过去")
+                            .size(11.0)
+                            .color(pal().text_faint),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("② 解压到任意文件夹（如 D:\\Tools\\anything），双击 anything.exe 运行")
+                        .size(12.0)
+                        .color(pal().text_dim),
+                );
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new("第一次运行会建索引，每个盘扫完就能搜；建议在它的“文件 → 开机自动启动”里勾上，让它常驻")
+                            .size(11.0)
+                            .color(pal().text_faint),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("③ 回来点").size(12.0).color(pal().text_dim));
+                    let busy = self.tool_check_job.is_some();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("重新检测并测试"))
+                        .clicked()
+                    {
+                        self.rediscover_tools();
+                        self.start_tool_check(ui.ctx());
+                        self.status = match &self.search_tools.ae {
+                            Some(p) => format!("找到 ae.exe：{}，正在测试…", p.display()),
+                            None => "还没找到 ae.exe —— anything 在运行吗？也可以在下面手动指定".to_string(),
+                        };
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new("anything 在运行时会自动找到它旁边的 ae.exe；没找到就在下面填 ae.exe 的路径")
+                            .size(11.0)
+                            .color(pal().text_faint),
+                    );
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(if es_found {
+                        "想继续用 Everything：先把 Everything 本身运行起来，es.exe 只是它的命令行接口"
+                    } else {
+                        "想用 Everything：装好 Everything 并运行，再下载它单独提供的命令行工具 es.exe（ES-*.zip）"
+                    })
+                    .size(11.0)
+                    .color(pal().text_faint),
+                );
+                if !es_found {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        self.render_link(ui, EVERYTHING_DOWNLOAD_URL);
+                    });
+                }
+            });
+    }
+
+    /// A clickable URL that opens in the browser.
+    fn render_link(&mut self, ui: &mut egui::Ui, url: &str) {
+        let link = ui.add(
+            egui::Label::new(RichText::new(url).size(12.0).color(pal().accent))
+                .sense(egui::Sense::click()),
+        );
+        if link.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if link.on_hover_text("点击在浏览器里打开").clicked() {
+            match open::that(url) {
+                Ok(()) => {
+                    log_line(&format!("settings: opened {url}"));
+                    self.status = "已在浏览器打开下载页".to_string();
+                }
+                Err(e) => {
+                    log_line(&format!("settings: open {url} failed: {e}"));
+                    self.status = format!("打不开浏览器：{e}");
+                }
+            }
+        }
+    }
+
+    /// The manual-path box for one tool. The text lives in `self`, not in a
+    /// fresh read of the config each frame, so typing and pasting survive the
+    /// next repaint.
+    fn render_tool_path_input(&mut self, ui: &mut egui::Ui, engine: filesearch::Engine, key: &str, hint: &str) {
+        let configured = self.store.get_config(key).unwrap_or_default().to_string();
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [52.0, 18.0],
+                egui::Label::new(RichText::new(engine.exe_name()).size(12.0).color(pal().text_dim)),
+            );
+            let edit = match engine {
+                filesearch::Engine::Es => &mut self.es_path_edit,
+                filesearch::Engine::Ae => &mut self.ae_path_edit,
+            };
+            let resp = ui.add(
+                egui::TextEdit::singleline(edit)
+                    .hint_text(hint)
+                    .desired_width(360.0),
+            );
+            let mut apply: Option<String> = None;
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                apply = Some(edit.trim().to_string());
+            }
+            if !configured.is_empty() && ui.button("清除").clicked() {
+                apply = Some(String::new());
+            }
+            if let Some(value) = apply {
+                self.store.set_config(key, &value);
+                match engine {
+                    filesearch::Engine::Es => self.es_path_edit = value.clone(),
+                    filesearch::Engine::Ae => self.ae_path_edit = value.clone(),
+                }
+                let found = filesearch::discover_engine(engine, Some(&value));
+                let name = engine.exe_name();
+                self.status = match (&found, value.is_empty()) {
+                    (_, true) => format!("已清除 {name} 的指定路径，改回自动检测"),
+                    (Some(p), false) => format!("已指定 {name}：{}，正在测试…", p.display()),
+                    (None, false) => format!("这个路径下没有 {name}：{value}"),
+                };
+                log_line(&format!("files: {key} configured {:?} -> {:?}", value, found));
+                self.search_tools.set(engine, found);
+                self.start_tool_check(ui.ctx());
+            }
         });
     }
 
@@ -7097,11 +7382,11 @@ impl MxRunApp {
                 match &self.file_error {
                     Some(err) => (err.clone(), pal().danger),
                     None if Prefix::Files.strip(&self.input).is_empty() => (
-                        "文件搜索 · 输入关键字搜索本机文件（Everything 索引）".to_string(),
+                        format!("文件搜索 · 输入关键字搜索本机文件（{} 索引）", self.file_index_name()),
                         pal().text_dim,
                     ),
                     None => (
-                        "没有匹配的文件（Everything 索引里没找到）".to_string(),
+                        format!("没有匹配的文件（{} 索引里没找到）", self.file_index_name()),
                         pal().text_dim,
                     ),
                 }
@@ -7115,7 +7400,7 @@ impl MxRunApp {
             if self.file_mode && self.file_error.is_some() {
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("设置 → 文件搜索 里可以指定 es.exe 的位置")
+                    RichText::new("设置 → 文件搜索 里有指引：es.exe 用不了时可以改用 anything 的 ae.exe")
                         .size(12.0)
                         .color(pal().text_faint),
                 );
@@ -7703,11 +7988,11 @@ impl MxRunApp {
                 match &self.file_error {
                     Some(err) => (err.clone(), pal().danger),
                     None if Prefix::Files.strip(&self.input).is_empty() => (
-                        "文件搜索 · 输入关键字开始搜索（Everything 索引）".to_string(),
+                        format!("文件搜索 · 输入关键字开始搜索（{} 索引）", self.file_index_name()),
                         pal().text_dim,
                     ),
                     None => (
-                        "没有匹配的文件（Everything 索引里没找到）".to_string(),
+                        format!("没有匹配的文件（{} 索引里没找到）", self.file_index_name()),
                         pal().text_dim,
                     ),
                 }
@@ -7718,7 +8003,7 @@ impl MxRunApp {
             if self.file_mode && self.file_error.is_some() {
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("设置 → 文件搜索 里可以指定 es.exe 的位置")
+                    RichText::new("设置 → 文件搜索 里有指引：es.exe 用不了时可以改用 anything 的 ae.exe")
                         .size(12.0)
                         .color(pal().text_faint),
                 );
